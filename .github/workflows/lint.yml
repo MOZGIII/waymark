@@ -18,15 +18,26 @@ jobs:
         run: uvx ruff check python
 
       - name: Ty type checking
-        run: uvx --with protobuf ty check python
+        working-directory: python
+        run: uv run ty check .
+
+      - name: Python tests
+        working-directory: python
+        run: uv run pytest tests
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
 
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Cargo fmt
         run: cargo fmt -- --check
 
       - name: Cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Cargo test
+        run: cargo test
