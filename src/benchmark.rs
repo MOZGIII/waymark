@@ -5,8 +5,11 @@ use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tracing::info;
 
 use crate::{
+    db::Database,
     messages::MessageError,
-    python_worker::{PythonWorker, PythonWorkerConfig, RoundTripMetrics},
+    python_worker::{
+        ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -14,6 +17,8 @@ pub struct HarnessConfig {
     pub total_messages: usize,
     pub in_flight: usize,
     pub payload_size: usize,
+    pub partition_id: i32,
+    pub progress_interval: Option<Duration>,
 }
 
 impl Default for HarnessConfig {
@@ -22,43 +27,130 @@ impl Default for HarnessConfig {
             total_messages: 10_000,
             in_flight: 32,
             payload_size: 4096,
+            partition_id: 0,
+            progress_interval: None,
         }
     }
 }
 
 pub struct BenchmarkHarness {
-    worker: PythonWorker,
+    workers: PythonWorkerPool,
+    database: Database,
 }
 
 impl BenchmarkHarness {
-    pub async fn new(config: PythonWorkerConfig) -> Result<Self> {
-        let worker = PythonWorker::spawn(config).await?;
-        Ok(Self { worker })
+    pub async fn new(
+        config: PythonWorkerConfig,
+        worker_count: usize,
+        database: Database,
+    ) -> Result<Self> {
+        let workers = PythonWorkerPool::new(config, worker_count).await?;
+        Ok(Self { workers, database })
     }
 
     pub async fn run(&self, config: &HarnessConfig) -> Result<BenchmarkSummary> {
+        self.database.reset_partition(config.partition_id).await?;
+        self.database
+            .seed_actions(
+                config.partition_id,
+                config.total_messages,
+                config.payload_size,
+            )
+            .await?;
+
         let total = config.total_messages;
         let mut completed = Vec::with_capacity(total);
         let mut inflight: FuturesUnordered<BoxFuture<'_, Result<RoundTripMetrics, MessageError>>> =
             FuturesUnordered::new();
-        let mut issued = 0usize;
+        let mut dispatched = 0usize;
         let start = Instant::now();
-        let worker = &self.worker;
-        let max_inflight = config.in_flight.max(1);
+        let worker_count = self.workers.len().max(1);
+        let max_inflight = config.in_flight.max(1) * worker_count;
+        let mut last_report = start;
 
-        while issued < total || !inflight.is_empty() {
-            while inflight.len() < max_inflight && issued < total {
-                let sequence = issued as u32;
-                let payload = config.payload_size;
-                let fut: BoxFuture<'_, Result<RoundTripMetrics, MessageError>> =
-                    Box::pin(async move { worker.send_benchmark_command(sequence, payload).await });
-                inflight.push(fut);
-                issued += 1;
+        while completed.len() < total {
+            while inflight.len() < max_inflight && dispatched < total {
+                let needed = (max_inflight - inflight.len()).min(total - dispatched);
+                let actions = self
+                    .database
+                    .dispatch_actions(config.partition_id, needed as i64)
+                    .await?;
+                if actions.is_empty() {
+                    break;
+                }
+
+                for action in actions {
+                    let payload = ActionDispatchPayload {
+                        action_id: action.id,
+                        instance_id: action.instance_id,
+                        sequence: action.action_seq,
+                        payload: action.payload,
+                    };
+                    let worker = self.workers.next_worker();
+                    let fut: BoxFuture<'_, Result<RoundTripMetrics, MessageError>> =
+                        Box::pin(async move {
+                            let span = tracing::info_span!(
+                                "dispatch",
+                                action_id = payload.action_id,
+                                instance_id = payload.instance_id,
+                                sequence = payload.sequence
+                            );
+                            let _guard = span.enter();
+                            worker.send_action(payload).await
+                        });
+                    inflight.push(fut);
+                    dispatched += 1;
+                }
             }
 
-            if let Some(result) = inflight.next().await {
-                let metrics = result?;
-                completed.push(BenchmarkResult::from(metrics));
+            match inflight.next().await {
+                Some(Ok(metrics)) => {
+                    self.database
+                        .record_delivery(metrics.action_id, metrics.delivery_id)
+                        .await?;
+                    self.database.mark_action_acked(metrics.action_id).await?;
+                    self.database
+                        .mark_action_completed(
+                            metrics.action_id,
+                            metrics.success,
+                            &metrics.response_payload,
+                        )
+                        .await?;
+                    tracing::debug!(
+                        action_id = metrics.action_id,
+                        round_trip_ms = %format!("{:.3}", metrics.round_trip.as_secs_f64() * 1000.0),
+                        ack_ms = %format!("{:.3}", metrics.ack_latency.as_secs_f64() * 1000.0),
+                        worker_ms = %format!("{:.3}", metrics.worker_duration.as_secs_f64() * 1000.0),
+                        "action completed"
+                    );
+                    completed.push(BenchmarkResult::from(metrics));
+                    if let Some(interval) = config.progress_interval {
+                        let now = Instant::now();
+                        if now.duration_since(last_report) >= interval {
+                            let elapsed = now.duration_since(start);
+                            let throughput =
+                                completed.len() as f64 / elapsed.as_secs_f64().max(1e-9);
+                            info!(
+                                processed = completed.len(),
+                                total,
+                                elapsed = %format!("{:.1}s", elapsed.as_secs_f64()),
+                                throughput = %format!("{:.0} msg/s", throughput),
+                                in_flight = inflight.len(),
+                                worker_count,
+                                db_queue = dispatched - completed.len(),
+                                dispatched,
+                                "benchmark progress",
+                            );
+                            last_report = now;
+                        }
+                    }
+                }
+                Some(Err(err)) => return Err(err.into()),
+                None => {
+                    if dispatched >= total {
+                        break;
+                    }
+                }
             }
         }
 
@@ -68,7 +160,7 @@ impl BenchmarkHarness {
     }
 
     pub async fn shutdown(self) -> Result<()> {
-        self.worker.shutdown().await?;
+        self.workers.shutdown().await?;
         Ok(())
     }
 }
