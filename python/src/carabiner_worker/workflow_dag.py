@@ -16,6 +16,7 @@ class DagNode:
     action: str
     kwargs: Dict[str, Any]
     depends_on: List[str] = field(default_factory=list)
+    wait_for_sync: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -86,6 +87,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self._action_names = action_names
         self._module_index = module_index
         self._source = source
+        self._last_node_id: Optional[str] = None
 
     # pylint: disable=too-many-return-statements
     def visit_Assign(self, node: ast.Assign) -> Any:
@@ -95,7 +97,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             dag_node = self._build_node(action_call, target)
             if target:
                 self._var_to_node[target] = dag_node.id
-            self.nodes.append(dag_node)
+            self._append_node(dag_node)
             return
         gather = self._match_gather_call(node.value)
         if gather is not None:
@@ -109,7 +111,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
     def visit_Expr(self, node: ast.Expr) -> Any:
         action_call = self._extract_action_call(node.value)
         if action_call is not None:
-            self.nodes.append(self._build_node(action_call, target=None))
+            self._append_node(self._build_node(action_call, target=None))
             return
         gather = self._match_gather_call(node.value)
         if gather is not None:
@@ -183,7 +185,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             dag_node = self._build_node(action_call, target_name)
             if target_name:
                 self._var_to_node[target_name] = dag_node.id
-            self.nodes.append(dag_node)
+            self._append_node(dag_node)
 
     def _is_complex_block(self, expr: ast.AST) -> bool:
         return (
@@ -211,7 +213,13 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         )
         for name in self._collect_mutated_names(node):
             self._var_to_node[name] = block_id
-        self.nodes.append(block_node)
+        self._append_node(block_node)
+
+    def _append_node(self, node: DagNode) -> None:
+        if self._last_node_id is not None:
+            node.wait_for_sync = [self._last_node_id]
+        self.nodes.append(node)
+        self._last_node_id = node.id
 
     def _flatten_targets(self, targets: List[ast.expr]) -> List[Optional[str]]:
         flat: List[Optional[str]] = []

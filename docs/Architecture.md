@@ -7,6 +7,18 @@ DB -> Rust Workflow Runner -> Python action runners
 
 ## python: client library
 
+Parse what users intend to run via their Workflow instances, send the DAG definition to the database for execution.
+
 ## rust: client bridge
 
+While the Python client library could be in charge of upserting to the database by itself, all our other database management logic is stored in rust. So it makes more sense architecturally for it to manage both the client and worker db interactions. This also allows us to more easily support different runner languages in the future.
+
+Takes care of versioning the workflow instance implementations. If the logic has changed we will automatically create a new version of the workflow instance - users will have to manually migrate old ones to the new version otherwise they will continue attempting to run with the older flow.
+
 ## rust: workflow runner
+
+Launch python interpreters in parallel, by default 1 per core so we can work around the blocking limitations in the process bound GIL
+
+## python: worker runners
+
+Handling for the individual actions

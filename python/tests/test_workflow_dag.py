@@ -61,3 +61,6 @@ def test_build_workflow_dag_with_python_block() -> None:
     ]
     summarize_node = next(node for node in dag.nodes if node.action == "summarize")
     assert summarize_node.depends_on == [python_block.id]
+    assert dag.nodes[0].wait_for_sync == []
+    assert dag.nodes[1].wait_for_sync == [dag.nodes[0].id]
+    assert dag.nodes[2].wait_for_sync == [dag.nodes[1].id]

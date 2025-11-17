@@ -14,6 +14,7 @@ class Workflow:
     """Base class for workflow definitions."""
 
     name: ClassVar[Optional[str]] = None
+    concurrent: ClassVar[bool] = False
     _workflow_dag: ClassVar[Optional[WorkflowDag]] = None
     _dag_lock: ClassVar[RLock] = RLock()
 

@@ -116,5 +116,5 @@ if __name__ == "__main__":
     print("Workflow DAG:")
     for node in dag.nodes:
         print(
-            f"- {node.id}: action={node.action} kwargs={node.kwargs} depends_on={node.depends_on}"
+            f"- {node.id}: action={node.action} kwargs={node.kwargs} depends_on={node.depends_on} wait_for_sync={node.wait_for_sync}"
         )
