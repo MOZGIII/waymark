@@ -2,6 +2,7 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -20,9 +21,8 @@ use crate::{
     db::{CompletionRecord, Database},
     instances,
     messages::{MessageError, proto::WorkflowRegistration},
-    python_worker::{
-        ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics,
-    },
+    server_worker::WorkerBridgeServer,
+    worker::{ActionDispatchPayload, PythonWorkerConfig, PythonWorkerPool, RoundTripMetrics},
 };
 
 #[derive(Debug, Clone)]
@@ -49,6 +49,7 @@ impl Default for WorkflowBenchmarkConfig {
 }
 
 pub struct WorkflowBenchmarkHarness {
+    worker_server: Arc<WorkerBridgeServer>,
     database: Database,
     workers: PythonWorkerPool,
     completion_tx: mpsc::Sender<CompletionRecord>,
@@ -96,7 +97,9 @@ impl WorkflowBenchmarkHarness {
             .context("register workflow version")?;
         worker_config.user_module = user_module.clone();
         worker_config.extra_python_paths = vec![temp_dir.path().to_path_buf()];
-        let workers = PythonWorkerPool::new(worker_config, worker_count).await?;
+        let worker_server = WorkerBridgeServer::start(None).await?;
+        let workers =
+            PythonWorkerPool::new(worker_config, worker_count, Arc::clone(&worker_server)).await?;
         let (completion_tx, completion_handle) = spawn_completion_worker(database.clone());
         let dag_node_count = registration
             .dag
@@ -104,6 +107,7 @@ impl WorkflowBenchmarkHarness {
             .map(|dag| dag.nodes.len())
             .unwrap_or(0);
         Ok(Self {
+            worker_server,
             database,
             workers,
             completion_tx,
@@ -222,6 +226,7 @@ impl WorkflowBenchmarkHarness {
 
     pub async fn shutdown(self) -> Result<()> {
         let WorkflowBenchmarkHarness {
+            worker_server,
             workers,
             completion_tx,
             completion_handle,
@@ -229,6 +234,7 @@ impl WorkflowBenchmarkHarness {
         } = self;
         drop(completion_tx);
         workers.shutdown().await?;
+        worker_server.shutdown().await;
         if let Err(err) = completion_handle.await {
             warn!(?err, "completion worker failed");
         }
