@@ -23,14 +23,14 @@ lint: python-lint rust-lint
 lint-verify: python-lint-verify rust-lint-verify
 
 python-lint:
-	uv run --project python ruff format python
-	uv run --project python ruff check python --fix
-	uv run --project python ty check python --exclude python/proto/messages_pb2_grpc.py
+	cd python && uv run ruff format .
+	cd python && uv run ruff check . --fix
+	cd python && uv run ty check . --exclude proto/messages_pb2_grpc.py
 
 python-lint-verify:
-	uv run --project python ruff format --check python
-	uv run --project python ruff check python
-	uv run --project python ty check python --exclude python/proto/messages_pb2_grpc.py
+	cd python && uv run ruff format --check .
+	cd python && uv run ruff check .
+	cd python && uv run ty check . --exclude proto/messages_pb2_grpc.py
 
 rust-lint:
 	cargo fmt

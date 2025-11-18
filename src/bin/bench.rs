@@ -1,7 +1,7 @@
 use std::{env, process, time::Duration};
 
 use anyhow::{Result, anyhow};
-use carabiner::{BenchmarkHarness, Database, HarnessConfig, PythonWorkerConfig};
+use carabiner::{AppConfig, BenchmarkHarness, Database, HarnessConfig, PythonWorkerConfig};
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -9,7 +9,6 @@ struct Options {
     total_messages: usize,
     payload_size: usize,
     concurrency: usize,
-    database_url: String,
     partition_id: i32,
     log_interval_secs: Option<u64>,
     worker_count: usize,
@@ -22,7 +21,6 @@ impl Default for Options {
             total_messages: 10_000,
             payload_size: 4096,
             concurrency: 32,
-            database_url: default_database_url(),
             partition_id: 0,
             log_interval_secs: Some(30),
             worker_count: 1,
@@ -59,12 +57,6 @@ impl Options {
                 "--help" | "-h" => {
                     print_usage();
                     process::exit(0);
-                }
-                "--database-url" | "-d" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--database-url requires a value"))?;
-                    opts.database_url = value;
                 }
                 "--partition" => {
                     let value = args
@@ -103,23 +95,18 @@ impl Options {
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --bin bench -- [--messages N] [--payload BYTES] [--concurrency N] [--database-url URL] [--partition ID] [--log-interval seconds] [--workers N] [--user-module MODULE]"
+        "Usage: cargo run --bin bench -- [--messages N] [--payload BYTES] [--concurrency N] [--partition ID] [--log-interval seconds] [--workers N] [--user-module MODULE]"
     );
-}
-
-fn default_database_url() -> String {
-    env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://mountaineer:mountaineer@localhost:5433/mountaineer_daemons".to_string()
-    })
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let options = Options::parse()?;
+    let app_config = AppConfig::load()?;
 
     info!(?options, "starting benchmark");
-    let database = Database::connect(&options.database_url).await?;
+    let database = Database::connect(&app_config.database_url).await?;
     let worker_config = PythonWorkerConfig {
         user_module: options.user_module.clone(),
         ..PythonWorkerConfig::default()

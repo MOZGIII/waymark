@@ -10,6 +10,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use carabiner::{
+    AppConfig,
     db::{Database, WorkflowVersionDetail, WorkflowVersionSummary},
     instances,
     messages::proto::{
@@ -42,9 +43,6 @@ struct Args {
     /// gRPC address to bind, defaults to HTTP port + 1 when omitted.
     #[arg(long)]
     grpc_addr: Option<SocketAddr>,
-    /// Database URL used for dashboard pages. Falls back to DATABASE_URL.
-    #[arg(long, env = "DATABASE_URL")]
-    database_url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -137,23 +135,25 @@ async fn main() -> Result<()> {
     let Args {
         http_addr,
         grpc_addr,
-        database_url,
     } = Args::parse();
     tracing_subscriber::fmt::init();
 
-    let http_addr = http_addr.unwrap_or_else(server::default_http_addr);
+    let app_config = AppConfig::load()?;
+    let http_addr = http_addr
+        .or(app_config.http_addr)
+        .unwrap_or_else(server::default_http_addr);
     let grpc_addr = grpc_addr
+        .or(app_config.grpc_addr)
         .unwrap_or_else(|| SocketAddr::new(http_addr.ip(), http_addr.port().saturating_add(1)));
 
-    let database = match database_url {
-        Some(url) => {
-            let db = Database::connect(&url)
-                .await
-                .with_context(|| format!("failed to connect to dashboard database at {url}"))?;
-            Some(db)
-        }
-        None => None,
-    };
+    let database = Database::connect(&app_config.database_url)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to connect to dashboard database at {}",
+                app_config.database_url
+            )
+        })?;
     let mut templates = Tera::new("templates/**/*.html")
         .context("failed to initialize templates from templates/ directory")?;
     templates.autoescape_on(vec![".html", ".tera"]);
@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
     let http_state = HttpState {
         http_addr,
         grpc_addr,
-        database,
+        database: Some(database),
         templates,
     };
 
@@ -433,7 +433,7 @@ fn render_database_missing_page(templates: &Tera) -> String {
     render_error_page(
         templates,
         "Database not configured",
-        "Set the DATABASE_URL (or pass --database-url) so the dashboard can query workflow versions.",
+        "Set DATABASE_URL in the environment or a nearby .env file so the dashboard can query workflow versions.",
     )
 }
 

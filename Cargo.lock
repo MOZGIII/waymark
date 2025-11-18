@@ -329,6 +329,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "dotenvy",
  "futures",
  "once_cell",
  "prost",
