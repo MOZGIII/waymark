@@ -1,4 +1,4 @@
-name: Lint
+name: CI
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
   pull_request:
 
 jobs:
-  lint:
+  python-lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,9 +20,30 @@ jobs:
       - name: Python lint
         run: make python-lint-verify
 
+  python-tests:
+    runs-on: ubuntu-latest
+    needs: python-lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v1
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Python tests
         working-directory: python
         run: uv run pytest tests
+
+  rust-lint:
+    runs-on: ubuntu-latest
+    needs: python-lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
@@ -32,12 +53,26 @@ jobs:
       - name: Rust lint
         run: make rust-lint-verify
 
+  rust-tests:
+    runs-on: ubuntu-latest
+    needs: [python-tests, rust-lint]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
       - name: Cargo test
         run: cargo test
 
   integration:
     runs-on: ubuntu-latest
-    needs: lint
+    needs: [python-tests, rust-tests]
     if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
     services:
       postgres:
@@ -61,6 +96,10 @@ jobs:
 
       - name: Install protoc & clients
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler postgresql-client
+
+      - name: Prepare Python worker environment
+        working-directory: python
+        run: uv sync
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
