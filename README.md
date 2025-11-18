@@ -126,5 +126,6 @@ $ cargo run --bin boot-carabiner-singleton
 24117
 ```
 
-The Python bridge automatically shells out to the helper unless you provide `CARABINER_SERVER_URL` or `CARABINER_SERVER_PORT`
-environment overrides. This keeps the development story lightweight without any maturin-built extensions.
+The Python bridge automatically shells out to the helper unless you provide `CARABINER_SERVER_URL`
+(`CARABINER_GRPC_ADDR` for direct sockets) overrides. Once the ports are known it opens a gRPC channel to the
+`WorkflowService`, keeping the development story lightweight and free of PyO3 wheels.

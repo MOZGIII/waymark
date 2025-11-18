@@ -131,7 +131,7 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         version = cls._workflow_version_id
         if version is None:
             payload = cls._build_registration_payload()
-            version = bridge.run_instance(cls.database_dsn(), payload.SerializeToString())
+            version = await bridge.run_instance(cls.database_dsn(), payload.SerializeToString())
             cls._workflow_version_id = version
         return version
 
