@@ -1,7 +1,9 @@
 use std::{env, process, time::Duration};
 
 use anyhow::{Result, anyhow};
-use carabiner::{Database, PythonWorkerConfig, WorkflowBenchmarkConfig, WorkflowBenchmarkHarness};
+use carabiner::{
+    AppConfig, Database, PythonWorkerConfig, WorkflowBenchmarkConfig, WorkflowBenchmarkHarness,
+};
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -13,7 +15,6 @@ struct Options {
     worker_count: usize,
     partition_id: i32,
     log_interval_secs: Option<u64>,
-    database_url: String,
 }
 
 impl Default for Options {
@@ -26,7 +27,6 @@ impl Default for Options {
             worker_count: 1,
             partition_id: 0,
             log_interval_secs: Some(30),
-            database_url: default_database_url(),
         }
     }
 }
@@ -73,12 +73,6 @@ impl Options {
                         .ok_or_else(|| anyhow!("--partition requires a value"))?;
                     opts.partition_id = value.parse()?;
                 }
-                "--database-url" | "-d" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--database-url requires a value"))?;
-                    opts.database_url = value;
-                }
                 "--log-interval" => {
                     let value = args
                         .next()
@@ -99,28 +93,23 @@ impl Options {
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --bin bench_instances -- [--instances N] [--batch-size N] [--payload-size BYTES] [--concurrency N] [--workers N] [--database-url URL] [--partition ID] [--log-interval SECONDS]"
+        "Usage: cargo run --bin bench_instances -- [--instances N] [--batch-size N] [--payload-size BYTES] [--concurrency N] [--workers N] [--partition ID] [--log-interval SECONDS]"
     );
-}
-
-fn default_database_url() -> String {
-    env::var("DATABASE_URL").unwrap_or_else(|_| {
-        "postgres://mountaineer:mountaineer@localhost:5433/mountaineer_daemons".to_string()
-    })
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let options = Options::parse()?;
+    let app_config = AppConfig::load()?;
     info!(?options, "starting workflow benchmark");
-    let database = Database::connect(&options.database_url).await?;
+    let database = Database::connect(&app_config.database_url).await?;
     let worker_config = PythonWorkerConfig {
         partition_id: options.partition_id as u32,
         ..PythonWorkerConfig::default()
     };
     let harness = WorkflowBenchmarkHarness::new(
-        &options.database_url,
+        &app_config.database_url,
         database,
         options.worker_count,
         worker_config,

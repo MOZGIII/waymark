@@ -35,6 +35,8 @@ async def build_greetings(user: User) -> GreetingSummary:
     return GreetingSummary(user=user, messages=messages)
 ```
 
+Your webserver wants to greet some user but do it (1) asynchronously and (2) guarantees this happens even if your app exits.
+
 Actions are the distributed work that your system does: these are the parallelism primitives that can be retired, throw errors independently, etc.
 
 Instances are your control flow - also written in Python - that orchestrate the actions. They are intended to be fast business logic: list iterations. Not long-running or blocking network jobs, for instance.
@@ -73,6 +75,36 @@ async def run(self) -> Summary:
           top_spenders.append(record.amount)
 ```
 
+1. asyncio primitives
+
+Use asyncio.gather to parallelize tasks. Use asyncio.sleep to sleep for a longer period of time.
+
+```python
+from asyncio import gather, sleep
+
+async def run(self) -> Summary:
+    # parallelize independent actions with gather
+    profile, settings, history = await gather(
+        fetch_profile(user_id=self.user_id),
+        fetch_settings(user_id=self.user_id),
+        fetch_purchase_history(user_id=self.user_id)
+    )
+    
+    # wait before sending email
+    await sleep(24*60*60)
+    recommendations = await email_ping(history)
+    
+    return Summary(profile=profile, settings=settings, recommendations=recommendations)
+```
+
+## Configuration
+
+The main carabiner configuration is done through env vars, which is what you'll typically use in production when using a docker deployment pipeline. If we can't find an environment parameter we will fallback to looking for an .env that specifies it within your local filesystem.
+
+| Environment Variable | Description | Example |
+|---------------------|-------------|---------|
+| `DATABASE_URL` | PostgreSQL connection string for the carabiner server | `postgresql://mountaineer:mountaineer@localhost:5433/mountaineer_daemons` |
+
 ## Philosophy
 
 Background jobs in webapps are so frequently used that they should really be a primitive of your fullstack library: database, backend, frontend, _and_ background jobs. Otherwise you're stuck in a situation where users either have to always make blocking requests to an API or you spin up ephemeral tasks that will be killed during re-deployments or an accidental docker crash.
@@ -101,7 +133,7 @@ Almost all of these require a dedicated task broker that you host alongside your
 The Rust runtime exposes both HTTP and gRPC APIs via the `carabiner-server` binary:
 
 ```bash
-$ cargo run --bin boot-carabiner-singleton
+$ cargo run --bin carabiner-server
 ```
 
 Developers can either launch it directly or rely on the `boot-carabiner-singleton` helper which finds (or starts) a single shared instance on
@@ -141,7 +173,6 @@ $ cargo run --bin bench -- \
   --concurrency 64 \
   --workers 4 \
   --log-interval 15 \
-  --database-url postgres://mountaineer:mountaineer@localhost:5433/mountaineer_daemons \
   --partition 0 | \
   uv run python/tools/parse_bench_logs.py
 ```

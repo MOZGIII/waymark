@@ -25,9 +25,6 @@ class Workflow:
     """When True, downstream engines may respect DAG-parallel execution; False preserves sequential semantics which
     is what you would see if you were to run the code directly in a Python process."""
 
-    database_url: ClassVar[Optional[str]] = None
-    """Override to point to a non-default DATABASE_URL when registering workflow definitions."""
-
     _workflow_dag: ClassVar[Optional[WorkflowDag]] = None
     _dag_lock: ClassVar[RLock] = RLock()
     _workflow_version_id: ClassVar[Optional[int]] = None
@@ -48,15 +45,6 @@ class Workflow:
                 if cls._workflow_dag is None:
                     cls._workflow_dag = build_workflow_dag(cls)
         return cls._workflow_dag
-
-    @classmethod
-    def database_dsn(cls) -> str:
-        if cls.database_url:
-            return cls.database_url
-        return os.environ.get(
-            "DATABASE_URL",
-            "postgres://mountaineer:mountaineer@localhost:5433/mountaineer_daemons",
-        )
 
     @classmethod
     def _build_registration_payload(cls) -> pb2.WorkflowRegistration:
@@ -131,7 +119,7 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         version = cls._workflow_version_id
         if version is None:
             payload = cls._build_registration_payload()
-            version = await bridge.run_instance(cls.database_dsn(), payload.SerializeToString())
+            version = await bridge.run_instance(payload.SerializeToString())
             cls._workflow_version_id = version
         return version
 

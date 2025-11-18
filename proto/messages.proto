@@ -72,7 +72,7 @@ message WorkflowNodeDispatch {
 }
 
 message RegisterWorkflowRequest {
-  string database_url = 1;
+  reserved 1;
   WorkflowRegistration registration = 2;
 }
 
@@ -81,7 +81,7 @@ message RegisterWorkflowResponse {
 }
 
 message WaitForInstanceRequest {
-  string database_url = 1;
+  reserved 1;
   double poll_interval_secs = 2;
 }
 
