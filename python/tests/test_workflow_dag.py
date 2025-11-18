@@ -35,6 +35,21 @@ async def persist_summary(total: float) -> None:
     raise NotImplementedError
 
 
+@action
+async def fetch_number(idx: int) -> int:
+    raise NotImplementedError
+
+
+@action
+async def double_number(value: int) -> int:
+    raise NotImplementedError
+
+
+@action
+async def positional_action(prefix: str, count: int) -> str:
+    raise NotImplementedError
+
+
 class SampleWorkflow(Workflow):
     async def run(self) -> float:
         records = await fetch_records()
@@ -175,3 +190,58 @@ class MultiStatementConditionalWorkflow(Workflow):
 def test_conditional_action_rejects_multiple_statements() -> None:
     with pytest.raises(ValueError, match="single action call"):
         build_workflow_dag(MultiStatementConditionalWorkflow)
+
+
+class GatherWorkflow(Workflow):
+    async def run(self) -> None:
+        numbers = await asyncio.gather(fetch_number(idx=1), fetch_number(idx=2))
+        await summarize(values=list(numbers))
+
+
+def test_asyncio_gather_assignment_builds_collection_node() -> None:
+    dag = build_workflow_dag(GatherWorkflow)
+    actions = [node.action for node in dag.nodes]
+    assert actions == ["fetch_number", "fetch_number", "python_block", "summarize"]
+    first, second, collection, summary = dag.nodes
+    assert first.produces == ["numbers__item0"]
+    assert second.produces == ["numbers__item1"]
+    assert collection.kwargs["code"] == "numbers = [numbers__item0, numbers__item1]"
+    assert collection.produces == ["numbers"]
+    assert summary.depends_on == [collection.id]
+
+
+class GatherAndMapWorkflow(Workflow):
+    async def run(self) -> None:
+        numbers = await asyncio.gather(fetch_number(idx=1), fetch_number(idx=2))
+        doubled = [await double_number(value=value) for value in numbers]
+        await summarize(values=doubled)
+
+
+def test_list_comprehension_of_actions_expands_nodes_per_item() -> None:
+    dag = build_workflow_dag(GatherAndMapWorkflow)
+    actions = [node.action for node in dag.nodes]
+    assert actions == [
+        "fetch_number",
+        "fetch_number",
+        "python_block",
+        "double_number",
+        "double_number",
+        "python_block",
+        "summarize",
+    ]
+    doubled_collection = dag.nodes[-2]
+    assert doubled_collection.kwargs["code"] == "doubled = [doubled__item0, doubled__item1]"
+    summarize_node = dag.nodes[-1]
+    assert summarize_node.depends_on == [doubled_collection.id]
+
+
+class PositionalArgsWorkflow(Workflow):
+    async def run(self) -> None:
+        await positional_action("greeting", 3)
+
+
+def test_actions_support_positional_arguments() -> None:
+    dag = build_workflow_dag(PositionalArgsWorkflow)
+    node = dag.nodes[0]
+    assert node.action == "positional_action"
+    assert node.kwargs == {"prefix": "'greeting'", "count": "3"}
