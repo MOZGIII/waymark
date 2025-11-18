@@ -2,6 +2,12 @@
 
 carabiner is a library to let you build durable background tasks that withstand device restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements.
 
+## On Instances and Actions
+
+Actions are the distributed work that your system does: these are the parallelism primitives that can be retired, throw errors independently, etc.
+
+Instances are your control flow - also written in Python - that orchestrate the actions. They are intended to be fast business logic: list iterations. Not long-running or blocking network jobs, for instance.
+
 ## Philosophy
 
 Background jobs in webapps are so frequently used that they should really be a primitive of your fullstack library: database, backend, frontend, _and_ background jobs. Otherwise you're stuck in a situation where users either have to always make blocking requests to an API or you spin up ephemeral background jobs that will be killed during re-deployments or an accidental docker crash.
@@ -9,9 +15,10 @@ Background jobs in webapps are so frequently used that they should really be a p
 After trying most of the ecosystem in the last 3 years, I believe background jobs should provide a few key features:
 
 - Easy to write control flow in normal Python
-- Control flow shouldn't be forced into a DAG definition; it should be regular control flow
 - Should be both very simple to test locally and very simple to deploy remotely
 - Reasonable default configurations to scale to a reasonable request volume without performance tuning
+
+On the point of control flow, we shouldn't be forced into a DAG definition (decorators, custom syntax). It should be regular control flow just distinguished because the flows are durable and because some portions of the parallelism can be run across machines.
 
 Nothing on the market provides this balance - `carabiner` aims to try. We don't expect ourselves to reach best in class functionality for load performance. Instead we intend for this to scale _most_ applications well past product market fit.
 
@@ -23,7 +30,6 @@ There is no shortage of robust background queues in Python, including ones that 
 2. Celery/RabbitMQ
 
 Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs, but they all have a ton of knobs and dials so you can performance tune it to your own environment. It's also yet another thing in which to build a competency. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs.
-
 
 ## Benchmarking & Log Parsing
 
@@ -42,3 +48,13 @@ $ cargo run --bin bench -- \
 ```
 
 Add `--json` to the parser if you prefer JSON output.
+
+## Building Python Wheels
+
+Since we have a rust base, you need to compile sources before using it during development. We use `maturin` for both the pyo3
+extension module and the CLI binaries. Use the helper script at the repo root:
+
+```
+$ ./build_wheel.sh develop          # installs the dev artifacts into your current environment
+$ ./build_wheel.sh release          # writes merged wheels into target/wheels/
+```

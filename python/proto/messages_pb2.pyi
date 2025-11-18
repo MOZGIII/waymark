@@ -55,3 +55,58 @@ class MessageKind:
     MESSAGE_KIND_ACTION_RESULT: int
     MESSAGE_KIND_ACK: int
     MESSAGE_KIND_HEARTBEAT: int
+
+class WorkflowDagNode(_ProtoMessage):
+    def __init__(
+        self,
+        id: str = ...,
+        action: str = ...,
+        kwargs: dict[str, str] | None = ...,
+        depends_on: list[str] | None = ...,
+        wait_for_sync: list[str] | None = ...,
+        produces: list[str] | None = ...,
+        module: str = ...,
+    ) -> None: ...
+    id: str
+    action: str
+    kwargs: dict[str, str]
+    depends_on: list[str]
+    wait_for_sync: list[str]
+    produces: list[str]
+    module: str
+
+class WorkflowDagDefinition(_ProtoMessage):
+    def __init__(
+        self,
+        concurrent: bool = ...,
+        nodes: list[WorkflowDagNode] | None = ...,
+    ) -> None: ...
+    concurrent: bool
+    nodes: list[WorkflowDagNode]
+
+class WorkflowRegistration(_ProtoMessage):
+    def __init__(
+        self,
+        workflow_name: str = ...,
+        dag: WorkflowDagDefinition | None = ...,
+        dag_hash: str = ...,
+    ) -> None: ...
+    workflow_name: str
+    dag: WorkflowDagDefinition
+    dag_hash: str
+
+class WorkflowNodeContext(_ProtoMessage):
+    def __init__(self, variable: str = ..., payload: bytes = ...) -> None: ...
+    variable: str
+    payload: bytes
+
+class WorkflowNodeDispatch(_ProtoMessage):
+    def __init__(
+        self,
+        node: WorkflowDagNode | None = ...,
+        workflow_input: bytes = ...,
+        context: list[WorkflowNodeContext] | None = ...,
+    ) -> None: ...
+    node: WorkflowDagNode
+    workflow_input: bytes
+    context: list[WorkflowNodeContext]

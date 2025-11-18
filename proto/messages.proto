@@ -37,3 +37,35 @@ message ActionResult {
 message Ack {
   uint64 acked_delivery_id = 1;
 }
+
+message WorkflowDagNode {
+  string id = 1;
+  string action = 2;
+  map<string, string> kwargs = 3;
+  repeated string depends_on = 4;
+  repeated string wait_for_sync = 5;
+  repeated string produces = 6;
+  string module = 7;
+}
+
+message WorkflowDagDefinition {
+  bool concurrent = 1;
+  repeated WorkflowDagNode nodes = 2;
+}
+
+message WorkflowRegistration {
+  string workflow_name = 1;
+  WorkflowDagDefinition dag = 2;
+  string dag_hash = 3;
+}
+
+message WorkflowNodeContext {
+  string variable = 1;
+  bytes payload = 2;
+}
+
+message WorkflowNodeDispatch {
+  WorkflowDagNode node = 1;
+  bytes workflow_input = 2;
+  repeated WorkflowNodeContext context = 3;
+}

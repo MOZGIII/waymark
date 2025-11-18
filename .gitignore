@@ -211,3 +211,10 @@ __marimo__/
 # Added by cargo
 
 /target
+
+# Build artifacts
+.merge-tmp/
+target/wheels/
+*.whl
+
+autospec

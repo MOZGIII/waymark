@@ -28,6 +28,7 @@ pub struct PythonWorkerConfig {
     pub python_binary: PathBuf,
     pub partition_id: u32,
     pub user_module: String,
+    pub extra_python_paths: Vec<PathBuf>,
 }
 
 impl Default for PythonWorkerConfig {
@@ -37,6 +38,7 @@ impl Default for PythonWorkerConfig {
             python_binary: PathBuf::from("python3"),
             partition_id: 0,
             user_module: "carabiner_worker.fixtures.benchmark_actions".to_string(),
+            extra_python_paths: Vec::new(),
         }
     }
 }
@@ -98,6 +100,8 @@ impl PythonWorker {
         } else {
             vec![script_dir.clone()]
         };
+        let mut module_paths = module_paths;
+        module_paths.extend(config.extra_python_paths.clone());
         let joined_python_path = module_paths
             .iter()
             .map(|path| path.display().to_string())

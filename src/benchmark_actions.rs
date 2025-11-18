@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use serde_json::json;
-use tokio::{sync::mpsc, task::JoinHandle, time};
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
 
 use crate::{
+    benchmark_common::{BenchmarkResult, BenchmarkSummary, spawn_completion_worker},
     db::{CompletionRecord, Database},
     messages::MessageError,
     python_worker::{
@@ -53,11 +54,7 @@ impl BenchmarkHarness {
         database: Database,
     ) -> Result<Self> {
         let workers = PythonWorkerPool::new(config, worker_count).await?;
-        let (tx, rx) = mpsc::channel(1024);
-        let db_clone = database.clone();
-        let handle = tokio::spawn(async move {
-            run_completion_worker(db_clone, rx).await;
-        });
+        let (tx, handle) = spawn_completion_worker(database.clone());
         Ok(Self {
             workers,
             database,
@@ -182,135 +179,6 @@ impl BenchmarkHarness {
             warn!(?err, "completion worker failed");
         }
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BenchmarkResult {
-    pub sequence: u32,
-    pub ack_latency: Duration,
-    pub round_trip: Duration,
-    pub worker_duration: Duration,
-}
-
-impl From<RoundTripMetrics> for BenchmarkResult {
-    fn from(value: RoundTripMetrics) -> Self {
-        Self {
-            sequence: value.sequence,
-            ack_latency: value.ack_latency,
-            round_trip: value.round_trip,
-            worker_duration: value.worker_duration,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BenchmarkSummary {
-    pub total_messages: usize,
-    pub elapsed: Duration,
-    pub throughput_per_sec: f64,
-    pub avg_ack_ms: f64,
-    pub avg_round_trip_ms: f64,
-    pub worker_avg_ms: f64,
-    pub p95_round_trip_ms: f64,
-}
-
-impl BenchmarkSummary {
-    fn from_results(results: Vec<BenchmarkResult>, elapsed: Duration) -> Self {
-        let total_messages = results.len();
-        let throughput_per_sec = total_messages as f64 / elapsed.as_secs_f64().max(1e-9);
-
-        let mut ack_sum = 0f64;
-        let mut round_sum = 0f64;
-        let mut worker_sum = 0f64;
-        let mut round_sorted = Vec::with_capacity(total_messages);
-
-        for result in &results {
-            ack_sum += result.ack_latency.as_secs_f64();
-            round_sum += result.round_trip.as_secs_f64();
-            worker_sum += result.worker_duration.as_secs_f64();
-            round_sorted.push(result.round_trip);
-        }
-
-        round_sorted.sort();
-        let denom = total_messages.max(1) as f64;
-        let p95_index = if round_sorted.is_empty() {
-            0
-        } else {
-            let idx = ((round_sorted.len() - 1) as f64 * 0.95).round() as usize;
-            idx.min(round_sorted.len() - 1)
-        };
-        let p95_round_trip_ms = round_sorted
-            .get(p95_index)
-            .copied()
-            .unwrap_or_default()
-            .as_secs_f64()
-            * 1000.0;
-
-        Self {
-            total_messages,
-            elapsed,
-            throughput_per_sec,
-            avg_ack_ms: (ack_sum / denom) * 1000.0,
-            avg_round_trip_ms: (round_sum / denom) * 1000.0,
-            worker_avg_ms: (worker_sum / denom) * 1000.0,
-            p95_round_trip_ms,
-        }
-    }
-
-    pub fn log(&self) {
-        info!(
-            total = self.total_messages,
-            elapsed = %format!("{:.2}s", self.elapsed.as_secs_f64()),
-            throughput = %format!("{:.0} msg/s", self.throughput_per_sec),
-            avg_ack_ms = %format!("{:.3} ms", self.avg_ack_ms),
-            avg_round_trip_ms = %format!("{:.3} ms", self.avg_round_trip_ms),
-            worker_avg_ms = %format!("{:.3} ms", self.worker_avg_ms),
-            p95_round_trip_ms = %format!("{:.3} ms", self.p95_round_trip_ms),
-            "benchmark summary",
-        );
-    }
-}
-
-async fn run_completion_worker(db: Database, mut rx: mpsc::Receiver<CompletionRecord>) {
-    const BATCH_SIZE: usize = 128;
-    let mut buffer = Vec::with_capacity(BATCH_SIZE);
-    let mut ticker = time::interval(Duration::from_millis(5));
-    ticker.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            msg = rx.recv() => {
-                match msg {
-                    Some(record) => {
-                        buffer.push(record);
-                        if buffer.len() >= BATCH_SIZE {
-                            if let Err(err) = db.mark_actions_batch(&buffer).await {
-                                warn!(?err, "failed to flush completion batch");
-                            }
-                            buffer.clear();
-                        }
-                    }
-                    None => break,
-                }
-            }
-            _ = ticker.tick() => {
-                if buffer.is_empty() {
-                    if rx.is_closed() {
-                        break;
-                    }
-                    continue;
-                }
-                if let Err(err) = db.mark_actions_batch(&buffer).await {
-                    warn!(?err, "failed to flush completion batch");
-                }
-                buffer.clear();
-            }
-        }
-    }
-    if !buffer.is_empty()
-        && let Err(err) = db.mark_actions_batch(&buffer).await
-    {
-        warn!(?err, "failed to flush completion batch");
     }
 }
 
