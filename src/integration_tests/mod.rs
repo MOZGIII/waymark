@@ -21,6 +21,7 @@ use self::common::run_in_env;
 const PARTITION_ID: i32 = 91;
 const INTEGRATION_MODULE: &str = "integration_module";
 const INTEGRATION_MODULE_SOURCE: &str = include_str!("fixtures/integration_module.py");
+const INTEGRATION_COMPLEX_MODULE: &str = include_str!("fixtures/integration_complex.py");
 
 const REGISTER_SCRIPT: &str = r#"
 import asyncio
@@ -28,6 +29,17 @@ from integration_module import IntegrationWorkflow
 
 async def main():
     wf = IntegrationWorkflow()
+    await wf.run()
+
+asyncio.run(main())
+"#;
+
+const REGISTER_COMPLEX_SCRIPT: &str = r#"
+import asyncio
+from integration_complex import ComplexWorkflow
+
+async def main():
+    wf = ComplexWorkflow()
     await wf.run()
 
 asyncio.run(main())
@@ -249,6 +261,85 @@ async fn workflow_executes_end_to_end() -> Result<()> {
         .transpose()?
         .context("expected primitive result")?;
     assert_eq!(message, "hello world");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_executes_complex_flow() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let files = vec![
+        ("integration_complex.py", INTEGRATION_COMPLEX_MODULE),
+        ("register_complex.py", REGISTER_COMPLEX_SCRIPT),
+    ];
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+    ];
+    let python_env = run_in_env(&files, &[], &env_pairs, "register_complex.py").await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "complexworkflow")
+        .context("complex workflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing complex workflow detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    let _instance_id = database
+        .create_workflow_instance(
+            PARTITION_ID,
+            &version.workflow_name,
+            version.id,
+            Some(br#"{"input":"unused"}"#),
+        )
+        .await?;
+
+    let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
+    let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("carabiner-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        user_module: "integration_complex".to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+        ..PythonWorkerConfig::default()
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    assert_eq!(completed.len(), expected_actions);
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+
+    let message = completed
+        .iter()
+        .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
+        .transpose()?
+        .context("expected primitive result")?;
+    assert_eq!(message, "big:3,7");
 
     server.shutdown().await;
     Ok(())
