@@ -1,6 +1,7 @@
 pub mod benchmark_actions;
 pub mod benchmark_common;
 pub mod benchmark_instances;
+pub mod dag_state;
 pub mod db;
 pub mod instances;
 pub mod messages;
