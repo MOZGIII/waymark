@@ -64,12 +64,16 @@ class WorkflowDagNode(_ProtoMessage):
         kwargs: dict[str, str] | None = ...,
         depends_on: list[str] | None = ...,
         wait_for_sync: list[str] | None = ...,
+        produces: list[str] | None = ...,
+        module: str = ...,
     ) -> None: ...
     id: str
     action: str
     kwargs: dict[str, str]
     depends_on: list[str]
     wait_for_sync: list[str]
+    produces: list[str]
+    module: str
 
 class WorkflowDagDefinition(_ProtoMessage):
     def __init__(
@@ -90,3 +94,19 @@ class WorkflowRegistration(_ProtoMessage):
     workflow_name: str
     dag: WorkflowDagDefinition
     dag_hash: str
+
+class WorkflowNodeContext(_ProtoMessage):
+    def __init__(self, variable: str = ..., payload: bytes = ...) -> None: ...
+    variable: str
+    payload: bytes
+
+class WorkflowNodeDispatch(_ProtoMessage):
+    def __init__(
+        self,
+        node: WorkflowDagNode | None = ...,
+        workflow_input: bytes = ...,
+        context: list[WorkflowNodeContext] | None = ...,
+    ) -> None: ...
+    node: WorkflowDagNode
+    workflow_input: bytes
+    context: list[WorkflowNodeContext]

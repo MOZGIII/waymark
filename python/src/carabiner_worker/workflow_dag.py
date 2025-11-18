@@ -15,8 +15,10 @@ class DagNode:
     id: str
     action: str
     kwargs: Dict[str, Any]
+    module: Optional[str] = None
     depends_on: List[str] = field(default_factory=list)
     wait_for_sync: List[str] = field(default_factory=list)
+    produces: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -30,19 +32,21 @@ def build_workflow_dag(workflow_cls: type["Workflow"]) -> WorkflowDag:
         raise ValueError(f"unable to locate module for workflow {workflow_cls!r}")
     module_source = inspect.getsource(module)
     module_index = ModuleIndex(module_source)
-    action_names = _discover_action_names(module)
+    action_modules = _discover_action_names(module)
     function_source = textwrap.dedent(inspect.getsource(workflow_cls.run))
-    builder = WorkflowDagBuilder(action_names, module_index, function_source)
+    builder = WorkflowDagBuilder(action_modules, module_index, function_source)
     builder.visit(ast.parse(function_source))
     return WorkflowDag(builder.nodes)
 
 
-def _discover_action_names(module: Any) -> Set[str]:
-    names: Set[str] = set()
+def _discover_action_names(module: Any) -> Dict[str, str]:
+    names: Dict[str, str] = {}
     for attr_name in dir(module):
         attr = getattr(module, attr_name)
-        if callable(attr) and getattr(attr, "__carabiner_action_name__", None):
-            names.add(attr_name)
+        action_name = getattr(attr, "__carabiner_action_name__", None)
+        action_module = getattr(attr, "__carabiner_action_module__", None)
+        if callable(attr) and action_name:
+            names[action_name] = action_module or module.__name__
     return names
 
 
@@ -80,11 +84,13 @@ class ModuleIndex:
 
 
 class WorkflowDagBuilder(ast.NodeVisitor):
-    def __init__(self, action_names: Set[str], module_index: ModuleIndex, source: str) -> None:
+    def __init__(
+        self, action_modules: Dict[str, str], module_index: ModuleIndex, source: str
+    ) -> None:
         self.nodes: List[DagNode] = []
         self._var_to_node: Dict[str, str] = {}
         self._counter = 0
-        self._action_names = action_names
+        self._action_modules = action_modules
         self._module_index = module_index
         self._source = source
         self._last_node_id: Optional[str] = None
@@ -153,7 +159,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
 
     def _is_action_func(self, func: ast.AST) -> bool:
         name = self._extract_name(func)
-        return bool(name and name in self._action_names)
+        return bool(name and name in self._action_modules)
 
     def _match_gather_call(self, expr: ast.AST) -> Optional[ast.Call]:
         if not isinstance(expr, ast.Await):
@@ -205,13 +211,20 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         deps = self._dependencies_from_node(node)
         references = self._resolve_module_references(node)
         imports, definitions = self._module_index.resolve(references)
+        imports_text = "\n".join(imports)
+        definitions_text = "\n".join(definitions)
         block_node = DagNode(
             id=block_id,
             action="python_block",
-            kwargs={"code": snippet, "imports": imports, "definitions": definitions},
+            kwargs={
+                "code": snippet,
+                "imports": imports_text,
+                "definitions": definitions_text,
+            },
             depends_on=sorted(set(deps)),
+            produces=sorted(self._collect_mutated_names(node)),
         )
-        for name in self._collect_mutated_names(node):
+        for name in block_node.produces:
             self._var_to_node[name] = block_id
         self._append_node(block_node)
 
@@ -255,11 +268,14 @@ class WorkflowDagBuilder(ast.NodeVisitor):
                 continue
             kwargs[kw.arg] = ast.unparse(kw.value)
             dependencies.extend(self._dependencies_from_expr(kw.value))
+        module_name = self._action_modules.get(name)
         return DagNode(
             id=node_id,
             action=name,
+            module=module_name,
             kwargs=kwargs,
             depends_on=sorted(set(dependencies)),
+            produces=[target] if target else [],
         )
 
     def _new_node_id(self) -> str:

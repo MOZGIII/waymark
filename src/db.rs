@@ -1,13 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use base64::{Engine as _, engine::general_purpose};
 use prost::Message;
+use serde_json::json;
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
 };
 
-use crate::messages::proto::{WorkflowDagDefinition, WorkflowDagNode};
+use crate::messages::proto::{
+    WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext, WorkflowNodeDispatch,
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -62,12 +66,76 @@ fn determine_unlocked_nodes(
         .collect()
 }
 
+async fn build_variable_context(
+    tx: &mut Transaction<'_, Postgres>,
+    instance_id: i64,
+    dag_nodes: &HashMap<String, WorkflowDagNode>,
+) -> Result<HashMap<String, Vec<u8>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT workflow_node_id, result_payload
+        FROM daemon_action_ledger
+        WHERE instance_id = $1 AND status = 'completed' AND workflow_node_id IS NOT NULL AND result_payload IS NOT NULL
+        "#,
+    )
+    .bind(instance_id)
+    .map(|row: PgRow| (row.get::<Option<String>, _>(0), row.get::<Option<Vec<u8>>, _>(1)))
+    .fetch_all(tx.as_mut())
+    .await?;
+    let mut context = HashMap::new();
+    for (node_id_opt, payload_opt) in rows {
+        let Some(node_id) = node_id_opt else {
+            continue;
+        };
+        let Some(payload) = payload_opt else {
+            continue;
+        };
+        if let Some(node) = dag_nodes.get(&node_id) {
+            for variable in &node.produces {
+                context.insert(variable.clone(), payload.clone());
+            }
+        }
+    }
+    Ok(context)
+}
+
 fn required_dependencies(node: &WorkflowDagNode, concurrent: bool) -> Vec<&str> {
     let mut deps: Vec<&str> = node.depends_on.iter().map(|s| s.as_str()).collect();
     if !concurrent {
         deps.extend(node.wait_for_sync.iter().map(|s| s.as_str()));
     }
     deps
+}
+
+fn build_workflow_action_payload(
+    node: &WorkflowDagNode,
+    workflow_input: &[u8],
+    context: &HashMap<String, Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let mut dispatch = WorkflowNodeDispatch {
+        node: Some(node.clone()),
+        workflow_input: workflow_input.to_vec(),
+        context: Vec::new(),
+    };
+    for (variable, payload) in context {
+        dispatch.context.push(WorkflowNodeContext {
+            variable: variable.clone(),
+            payload: payload.clone(),
+        });
+    }
+    let dispatch_bytes = dispatch.encode_to_vec();
+    let encoded = general_purpose::STANDARD.encode(dispatch_bytes);
+    let payload = json!({
+        "module": "carabiner_worker.workflow_runtime",
+        "action": "workflow.execute_node",
+        "kwargs": {
+            "dispatch_b64": {
+                "kind": "primitive",
+                "value": encoded,
+            }
+        }
+    });
+    Ok(serde_json::to_vec(&payload)?)
 }
 
 #[cfg(test)]
@@ -183,6 +251,7 @@ struct WorkflowInstanceRow {
     pub workflow_name: String,
     pub workflow_version_id: Option<i64>,
     pub next_action_seq: i32,
+    pub input_payload: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -449,7 +518,7 @@ impl Database {
     ) -> Result<usize> {
         let instance = sqlx::query_as::<_, WorkflowInstanceRow>(
             r#"
-            SELECT id, partition_id, workflow_name, workflow_version_id, next_action_seq
+            SELECT id, partition_id, workflow_name, workflow_version_id, next_action_seq, input_payload
             FROM workflow_instances
             WHERE id = $1
             FOR UPDATE
@@ -481,17 +550,23 @@ impl Database {
         .await?;
         let dag = WorkflowDagDefinition::decode(version.dag_proto.as_slice())
             .context("failed to decode workflow dag for scheduling")?;
+        let mut node_map = HashMap::new();
+        for node in &dag.nodes {
+            node_map.insert(node.id.clone(), node.clone());
+        }
         let (known_nodes, completed_nodes) = load_instance_node_state(tx, instance.id).await?;
         let unlocked =
             determine_unlocked_nodes(&dag, &known_nodes, &completed_nodes, version.concurrent);
         if unlocked.is_empty() {
             return Ok(0);
         }
+        let workflow_input = instance.input_payload.clone().unwrap_or_default();
+        let context_values = build_variable_context(tx, instance.id, &node_map).await?;
         let mut next_sequence = instance.next_action_seq;
         let mut inserted = 0usize;
         for node in unlocked {
             let node_id = node.id.clone();
-            let payload = node.encode_to_vec();
+            let payload = build_workflow_action_payload(&node, &workflow_input, &context_values)?;
             let _action_id: i64 = sqlx::query_scalar::<_, i64>(
                 r#"
                 INSERT INTO daemon_action_ledger (

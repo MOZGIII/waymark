@@ -66,8 +66,10 @@ class Workflow:
             proto_node = pb2.WorkflowDagNode(
                 id=node.id,
                 action=node.action,
+                module=node.module or "",
                 depends_on=list(node.depends_on),
                 wait_for_sync=list(node.wait_for_sync),
+                produces=list(node.produces),
             )
             proto_node.kwargs.update(node.kwargs)
             dag_definition.nodes.append(proto_node)

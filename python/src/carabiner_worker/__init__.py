@@ -1,6 +1,7 @@
 """Public API for user-defined carabiner actions."""
 
-from . import bridge
+from . import bridge  # noqa: F401
+from . import workflow_runtime as _workflow_runtime  # noqa: F401
 from .actions import (
     ActionCall,
     ActionResultPayload,

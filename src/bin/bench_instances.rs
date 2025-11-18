@@ -1,0 +1,149 @@
+use std::{env, process, time::Duration};
+
+use anyhow::{Result, anyhow};
+use carabiner::{Database, PythonWorkerConfig, WorkflowBenchmarkConfig, WorkflowBenchmarkHarness};
+use tracing::info;
+
+#[derive(Debug, Clone)]
+struct Options {
+    instance_count: usize,
+    batch_size: usize,
+    payload_size: usize,
+    concurrency: usize,
+    worker_count: usize,
+    partition_id: i32,
+    log_interval_secs: Option<u64>,
+    database_url: String,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            instance_count: 100,
+            batch_size: 4,
+            payload_size: 1024,
+            concurrency: 32,
+            worker_count: 1,
+            partition_id: 0,
+            log_interval_secs: Some(30),
+            database_url: default_database_url(),
+        }
+    }
+}
+
+impl Options {
+    fn parse() -> Result<Self> {
+        let mut opts = Options::default();
+        let mut args = env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--instances" | "-n" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--instances requires a value"))?;
+                    opts.instance_count = value.parse()?;
+                }
+                "--batch-size" | "-b" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--batch-size requires a value"))?;
+                    opts.batch_size = value.parse()?;
+                }
+                "--payload-size" | "-p" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--payload-size requires a value"))?;
+                    opts.payload_size = value.parse()?;
+                }
+                "--concurrency" | "-c" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--concurrency requires a value"))?;
+                    opts.concurrency = value.parse()?;
+                }
+                "--workers" | "-w" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--workers requires a value"))?;
+                    opts.worker_count = value.parse()?;
+                }
+                "--partition" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--partition requires a value"))?;
+                    opts.partition_id = value.parse()?;
+                }
+                "--database-url" | "-d" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--database-url requires a value"))?;
+                    opts.database_url = value;
+                }
+                "--log-interval" => {
+                    let value = args
+                        .next()
+                        .ok_or_else(|| anyhow!("--log-interval requires a value"))?;
+                    let secs: u64 = value.parse()?;
+                    opts.log_interval_secs = if secs == 0 { None } else { Some(secs) };
+                }
+                "--help" | "-h" => {
+                    print_usage();
+                    process::exit(0);
+                }
+                other => return Err(anyhow!("unknown argument: {other}")),
+            }
+        }
+        Ok(opts)
+    }
+}
+
+fn print_usage() {
+    println!(
+        "Usage: cargo run --bin bench_instances -- [--instances N] [--batch-size N] [--payload-size BYTES] [--concurrency N] [--workers N] [--database-url URL] [--partition ID] [--log-interval SECONDS]"
+    );
+}
+
+fn default_database_url() -> String {
+    env::var("DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://mountaineer:mountaineer@localhost:5433/mountaineer_daemons".to_string()
+    })
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt::init();
+    let options = Options::parse()?;
+    info!(?options, "starting workflow benchmark");
+    let database = Database::connect(&options.database_url).await?;
+    let worker_config = PythonWorkerConfig {
+        partition_id: options.partition_id as u32,
+        ..PythonWorkerConfig::default()
+    };
+    let harness = WorkflowBenchmarkHarness::new(
+        &options.database_url,
+        database,
+        options.worker_count,
+        worker_config,
+    )
+    .await?;
+
+    let config = WorkflowBenchmarkConfig {
+        instance_count: options.instance_count,
+        in_flight: options.concurrency,
+        batch_size: options.batch_size,
+        payload_size: options.payload_size,
+        partition_id: options.partition_id,
+        progress_interval: options.log_interval_secs.map(Duration::from_secs),
+    };
+
+    let summary = harness.run(&config).await?;
+    summary.log();
+    let actions = options.instance_count * harness.actions_per_instance();
+    println!(
+        "Processed {} workflows ({} actions) in {:.2?} - {:.0} actions/s",
+        options.instance_count, actions, summary.elapsed, summary.throughput_per_sec,
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}

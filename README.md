@@ -15,9 +15,10 @@ Background jobs in webapps are so frequently used that they should really be a p
 After trying most of the ecosystem in the last 3 years, I believe background jobs should provide a few key features:
 
 - Easy to write control flow in normal Python
-- Control flow shouldn't be forced into a DAG definition; it should be regular control flow
 - Should be both very simple to test locally and very simple to deploy remotely
 - Reasonable default configurations to scale to a reasonable request volume without performance tuning
+
+On the point of control flow, we shouldn't be forced into a DAG definition (decorators, custom syntax). It should be regular control flow just distinguished because the flows are durable and because some portions of the parallelism can be run across machines.
 
 Nothing on the market provides this balance - `carabiner` aims to try. We don't expect ourselves to reach best in class functionality for load performance. Instead we intend for this to scale _most_ applications well past product market fit.
 

@@ -56,14 +56,19 @@ def test_build_workflow_dag_with_python_block() -> None:
     ]
     python_block = next(node for node in dag.nodes if node.action == "python_block")
     assert "for record in records" in python_block.kwargs["code"]
-    assert python_block.kwargs["definitions"] == [
-        'def helper_threshold(record: "Record") -> bool:\n    return record.amount > 10'
-    ]
+    assert (
+        python_block.kwargs["definitions"]
+        == 'def helper_threshold(record: "Record") -> bool:\n    return record.amount > 10'
+    )
     summarize_node = next(node for node in dag.nodes if node.action == "summarize")
     assert summarize_node.depends_on == [python_block.id]
+    assert summarize_node.produces == ["total"]
     assert dag.nodes[0].wait_for_sync == []
     assert dag.nodes[1].wait_for_sync == [dag.nodes[0].id]
     assert dag.nodes[2].wait_for_sync == [dag.nodes[1].id]
+    assert dag.nodes[0].produces == ["records"]
+    assert dag.nodes[-1].produces == []
+    assert dag.nodes[0].module == __name__
 
     # Execute the captured python block to ensure it remains valid.
     sample_records = [Record(5), Record(20)]
