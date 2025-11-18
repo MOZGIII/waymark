@@ -154,14 +154,13 @@ async def _workflow_stub() -> pb2_grpc.WorkflowServiceStub:
     return _GRPC_STUB  # type: ignore[return-value]
 
 
-async def run_instance(database_url: str, payload: bytes) -> int:
+async def run_instance(payload: bytes) -> int:
     """Register a workflow definition over the gRPC bridge."""
     async with ensure_singleton():
         stub = await _workflow_stub()
     registration = pb2.WorkflowRegistration()
     registration.ParseFromString(payload)
     request = pb2.RegisterWorkflowRequest(
-        database_url=database_url,
         registration=registration,
     )
     try:
@@ -171,12 +170,11 @@ async def run_instance(database_url: str, payload: bytes) -> int:
     return int(response.workflow_version_id)
 
 
-async def wait_for_instance(database_url: str, poll_interval_secs: float = 1.0) -> Optional[bytes]:
+async def wait_for_instance(poll_interval_secs: float = 1.0) -> Optional[bytes]:
     """Block until the workflow daemon produces another instance payload."""
     async with ensure_singleton():
         stub = await _workflow_stub()
     request = pb2.WaitForInstanceRequest(
-        database_url=database_url,
         poll_interval_secs=poll_interval_secs,
     )
     try:

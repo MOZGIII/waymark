@@ -26,7 +26,7 @@ use tera::{Context as TeraContext, Tera};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{Request, Response as GrpcResponse, Status, transport::Server};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 const REGISTER_PATH: &str = "/v1/workflows/register";
 const WAIT_PATH: &str = "/v1/workflows/wait";
@@ -49,7 +49,8 @@ struct Args {
 struct HttpState {
     http_addr: SocketAddr,
     grpc_addr: SocketAddr,
-    database: Option<Database>,
+    database_url: Arc<String>,
+    database: Database,
     templates: Arc<Tera>,
 }
 
@@ -63,7 +64,6 @@ struct HealthResponse {
 
 #[derive(Debug, Deserialize)]
 struct RegisterWorkflowHttpRequest {
-    database_url: String,
     registration_b64: String,
 }
 
@@ -74,7 +74,6 @@ struct RegisterWorkflowHttpResponse {
 
 #[derive(Debug, Deserialize)]
 struct WaitForInstanceHttpRequest {
-    database_url: String,
     poll_interval_secs: Option<f64>,
 }
 
@@ -128,7 +127,15 @@ impl IntoResponse for HttpError {
 }
 
 #[derive(Clone)]
-struct WorkflowGrpcService;
+struct WorkflowGrpcService {
+    database_url: Arc<String>,
+}
+
+impl WorkflowGrpcService {
+    fn new(database_url: Arc<String>) -> Self {
+        Self { database_url }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -146,12 +153,13 @@ async fn main() -> Result<()> {
         .or(app_config.grpc_addr)
         .unwrap_or_else(|| SocketAddr::new(http_addr.ip(), http_addr.port().saturating_add(1)));
 
-    let database = Database::connect(&app_config.database_url)
+    let database_url = Arc::new(app_config.database_url.clone());
+    let database = Database::connect(database_url.as_ref())
         .await
         .with_context(|| {
             format!(
                 "failed to connect to dashboard database at {}",
-                app_config.database_url
+                database_url.as_ref()
             )
         })?;
     let mut templates = Tera::new("templates/**/*.html")
@@ -171,12 +179,13 @@ async fn main() -> Result<()> {
     let http_state = HttpState {
         http_addr,
         grpc_addr,
-        database: Some(database),
+        database_url: database_url.clone(),
+        database,
         templates,
     };
 
     let http_task = tokio::spawn(run_http_server(http_listener, http_state));
-    let grpc_task = tokio::spawn(run_grpc_server(grpc_listener));
+    let grpc_task = tokio::spawn(run_grpc_server(grpc_listener, database_url));
 
     tokio::select! {
         result = http_task => result??,
@@ -198,10 +207,11 @@ async fn run_http_server(listener: TcpListener, state: HttpState) -> Result<()> 
     Ok(())
 }
 
-async fn run_grpc_server(listener: TcpListener) -> Result<()> {
+async fn run_grpc_server(listener: TcpListener, database_url: Arc<String>) -> Result<()> {
     let incoming = TcpListenerStream::new(listener);
+    let service = WorkflowGrpcService::new(database_url);
     Server::builder()
-        .add_service(WorkflowServiceServer::new(WorkflowGrpcService))
+        .add_service(WorkflowServiceServer::new(service))
         .serve_with_incoming(incoming)
         .await?;
     Ok(())
@@ -217,15 +227,8 @@ async fn healthz(State(state): State<HttpState>) -> Json<HealthResponse> {
 }
 
 async fn list_workflows(State(state): State<HttpState>) -> Html<String> {
-    let HttpState {
-        database,
-        templates,
-        ..
-    } = state;
-    let Some(database) = database else {
-        warn!("dashboard requested but database_url not configured");
-        return Html(render_database_missing_page(&templates));
-    };
+    let templates = state.templates.clone();
+    let database = state.database.clone();
     match database.list_workflow_versions().await {
         Ok(workflows) => Html(render_home_page(&templates, &workflows)),
         Err(err) => {
@@ -243,18 +246,8 @@ async fn workflow_detail(
     State(state): State<HttpState>,
     Path(version_id): Path<i64>,
 ) -> Html<String> {
-    let HttpState {
-        database,
-        templates,
-        ..
-    } = state;
-    let Some(database) = database else {
-        warn!(
-            workflow_version_id = version_id,
-            "workflow detail requested but database_url not configured"
-        );
-        return Html(render_database_missing_page(&templates));
-    };
+    let templates = state.templates.clone();
+    let database = state.database.clone();
     match database.load_workflow_version(version_id).await {
         Ok(Some(workflow)) => Html(render_workflow_detail_page(&templates, &workflow)),
         Ok(None) => Html(render_error_page(
@@ -278,6 +271,7 @@ async fn workflow_detail(
 }
 
 async fn register_workflow_http(
+    State(state): State<HttpState>,
     Json(payload): Json<RegisterWorkflowHttpRequest>,
 ) -> Result<Json<RegisterWorkflowHttpResponse>, HttpError> {
     if payload.registration_b64.is_empty() {
@@ -286,7 +280,8 @@ async fn register_workflow_http(
     let bytes = general_purpose::STANDARD
         .decode(payload.registration_b64)
         .map_err(|_| HttpError::bad_request("invalid base64 payload"))?;
-    let version_id = instances::run_instance_payload(&payload.database_url, &bytes)
+    let database_url = state.database_url.clone();
+    let version_id = instances::run_instance_payload(database_url.as_ref(), &bytes)
         .await
         .map_err(HttpError::internal)?;
     Ok(Json(RegisterWorkflowHttpResponse {
@@ -295,10 +290,12 @@ async fn register_workflow_http(
 }
 
 async fn wait_for_instance_http(
+    State(state): State<HttpState>,
     Json(request): Json<WaitForInstanceHttpRequest>,
 ) -> Result<Json<WaitForInstanceHttpResponse>, HttpError> {
     let interval = sanitize_interval(request.poll_interval_secs);
-    let payload = instances::wait_for_instance_poll(&request.database_url, interval)
+    let database_url = state.database_url.clone();
+    let payload = instances::wait_for_instance_poll(database_url.as_ref(), interval)
         .await
         .map_err(HttpError::internal)?;
     let Some(bytes) = payload else {
@@ -321,7 +318,7 @@ impl WorkflowService for WorkflowGrpcService {
             .registration
             .ok_or_else(|| Status::invalid_argument("registration missing"))?;
         let payload = registration.encode_to_vec();
-        let version_id = instances::run_instance_payload(&inner.database_url, &payload)
+        let version_id = instances::run_instance_payload(self.database_url.as_ref(), &payload)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         Ok(GrpcResponse::new(proto::RegisterWorkflowResponse {
@@ -335,7 +332,7 @@ impl WorkflowService for WorkflowGrpcService {
     ) -> Result<GrpcResponse<proto::WaitForInstanceResponse>, Status> {
         let inner = request.into_inner();
         let interval = sanitize_interval(Some(inner.poll_interval_secs));
-        let payload = instances::wait_for_instance_poll(&inner.database_url, interval)
+        let payload = instances::wait_for_instance_poll(self.database_url.as_ref(), interval)
             .await
             .map_err(|err| Status::internal(err.to_string()))?;
         let bytes = payload.ok_or_else(|| Status::not_found("no workflow instance available"))?;
@@ -427,14 +424,6 @@ fn render_error_page(templates: &Tera, title: &str, message: &str) -> String {
         message: message.to_string(),
     };
     render_template(templates, "error.html", &context)
-}
-
-fn render_database_missing_page(templates: &Tera) -> String {
-    render_error_page(
-        templates,
-        "Database not configured",
-        "Set DATABASE_URL in the environment or a nearby .env file so the dashboard can query workflow versions.",
-    )
 }
 
 fn render_template<T: Serialize>(templates: &Tera, template: &str, data: &T) -> String {

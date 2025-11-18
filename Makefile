@@ -7,11 +7,11 @@ all: build-proto
 
 build-proto:
 	@mkdir -p $(PY_PROTO_OUT)
-	uv run --project python python -m grpc_tools.protoc \
-		--proto_path=proto \
-		--python_out=$(PY_PROTO_OUT) \
-		--grpc_python_out=$(PY_PROTO_OUT) \
-		$(PROTO_FILES)
+	cd python && uv run python -m grpc_tools.protoc \
+		--proto_path=../proto \
+		--python_out=../$(PY_PROTO_OUT) \
+		--grpc_python_out=../$(PY_PROTO_OUT) \
+		../$(PROTO_FILES)
 	@python scripts/fix_proto_imports.py
 
 clean:
