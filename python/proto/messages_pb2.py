@@ -7,7 +7,6 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import descriptor_pool as _descriptor_pool
 from google.protobuf import runtime_version as _runtime_version
-from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2
 from google.protobuf import symbol_database as _symbol_database
 from google.protobuf.internal import builder as _builder
 
@@ -21,9 +20,10 @@ _runtime_version.ValidateProtobufRuntimeVersion(
 )
 # @@protoc_insertion_point(imports)
 
+from google.protobuf import struct_pb2 as google_dot_protobuf_dot_struct__pb2
+
 _sym_db = _symbol_database.Default()
 _sym_db.RegisterFileDescriptor(google_dot_protobuf_dot_struct__pb2.DESCRIPTOR)
-
 
 
 

@@ -194,7 +194,7 @@ async def wait_for_instance(
     try:
         response = await stub.WaitForInstance(request, timeout=None)
     except aio.AioRpcError as exc:  # pragma: no cover
-        status_fn = getattr(exc, "code", None)
+        status_fn = exc.code
         if callable(status_fn) and status_fn() == grpc.StatusCode.NOT_FOUND:
             return None
         raise RuntimeError(f"wait_for_instance failed: {exc}") from exc
