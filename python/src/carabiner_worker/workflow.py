@@ -3,14 +3,15 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import sys
 from functools import wraps
 from threading import RLock
-from typing import Any, ClassVar, Dict, Optional, TypeVar
+from typing import Any, ClassVar, Dict, Optional, TextIO, TypeVar
 
 from proto import messages_pb2 as pb2
 
 from . import bridge
-from .workflow_dag import WorkflowDag, build_workflow_dag
+from .workflow_dag import DagNode, WorkflowDag, build_workflow_dag
 
 TWorkflow = TypeVar("TWorkflow", bound="Workflow")
 
@@ -74,6 +75,14 @@ class Workflow:
         )
         return message
 
+    @classmethod
+    def visualize(cls, *, stream: Optional[TextIO] = None) -> str:
+        """Render the cached DAG into a readable ASCII summary."""
+
+        dag = cls.workflow_dag()
+        renderer = WorkflowDagVisualizer(cls, dag)
+        return renderer.write(stream or sys.stdout)
+
 
 class WorkflowRegistry:
     """Registry of workflow definitions keyed by workflow name."""
@@ -102,6 +111,112 @@ class WorkflowRegistry:
 
 
 workflow_registry = WorkflowRegistry()
+
+
+class WorkflowDagVisualizer:
+    """Pretty-printer for workflow DAG metadata."""
+
+    def __init__(self, workflow_cls: type["Workflow"], dag: WorkflowDag) -> None:
+        self._workflow_cls = workflow_cls
+        self._dag = dag
+        self._meta_label_width = 12
+        self._field_label_width = 14
+        self._indent = "    "
+
+    def render(self) -> str:
+        lines = self._build_lines()
+        return "\n".join(lines).rstrip()
+
+    def write(self, stream: TextIO) -> str:
+        output = self.render()
+        if output:
+            stream.write(f"{output}\n")
+        else:
+            stream.write("")
+        return output
+
+    def _build_lines(self) -> list[str]:
+        workflow_cls = self._workflow_cls
+        dag = self._dag
+        meta_lines = [
+            f"Workflow: {workflow_cls.__module__}.{workflow_cls.__name__}",
+            f"{'Short name':<{self._meta_label_width}}: {workflow_cls.short_name()}",
+            f"{'Concurrent':<{self._meta_label_width}}: {'yes' if workflow_cls.concurrent else 'no'}",
+            f"{'Return var':<{self._meta_label_width}}: {dag.return_variable or '<none>'}",
+            f"{'Total nodes':<{self._meta_label_width}}: {len(dag.nodes)}",
+        ]
+        lines: list[str] = [line.rstrip() for line in meta_lines]
+        lines.append("")
+        lines.append("Nodes:")
+        if not dag.nodes:
+            lines.append("  <none>")
+            return lines
+        lines.append("")
+        for idx, node in enumerate(dag.nodes):
+            lines.extend(self._format_node_entry(node))
+            if idx < len(dag.nodes) - 1:
+                lines.append("")
+        return lines
+
+    def _format_node_entry(self, node: DagNode) -> list[str]:
+        header = f"{node.id}: {node.action}"
+        if node.module:
+            header = f"{header} [{node.module}]"
+        lines = [header]
+        lines.extend(
+            self._format_field(
+                "depends_on",
+                self._format_sequence(node.depends_on),
+            )
+        )
+        lines.extend(
+            self._format_field(
+                "wait_for_sync",
+                self._format_sequence(node.wait_for_sync),
+            )
+        )
+        lines.extend(self._format_field("produces", self._format_sequence(node.produces)))
+        lines.extend(self._format_field("guard", node.guard or "-"))
+        lines.extend(self._format_kwargs(node.kwargs))
+        return lines
+
+    def _format_field(self, name: str, value: str) -> list[str]:
+        text = value if value.strip() else "-"
+        parts = text.splitlines() or ["-"]
+        prefix = f"{self._indent}{name:<{self._field_label_width}}: "
+        lines = [prefix + parts[0]]
+        continuation = f"{self._indent}{'':<{self._field_label_width}}  "
+        for part in parts[1:]:
+            lines.append(continuation + part)
+        return lines
+
+    def _format_kwargs(self, kwargs: Dict[str, Any]) -> list[str]:
+        if not kwargs:
+            return self._format_field("kwargs", "-")
+        lines = [f"{self._indent}{'kwargs':<{self._field_label_width}}:"]
+        for key in sorted(kwargs):
+            rendered = self._stringify_value(kwargs[key])
+            parts = rendered.splitlines() or ["-"]
+            first = parts[0] or "-"
+            lines.append(f"{self._indent}  - {key}: {first}")
+            pad = f"{self._indent}    "
+            for part in parts[1:]:
+                lines.append(pad + part)
+        return lines
+
+    @staticmethod
+    def _format_sequence(values: list[str]) -> str:
+        return ", ".join(values) if values else "-"
+
+    @staticmethod
+    def _stringify_value(value: Any) -> str:
+        if isinstance(value, (list, tuple, set)):
+            items = [str(item) for item in value]
+            return ", ".join(items) if items else "-"
+        if value is None:
+            return "-"
+        text = str(value)
+        return text if text else "-"
 
 
 def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
