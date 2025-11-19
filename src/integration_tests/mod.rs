@@ -15,10 +15,10 @@ use crate::{
     worker::{ActionDispatchPayload, RoundTripMetrics},
 };
 use anyhow::{Context, Result, anyhow};
+use once_cell::sync::Lazy;
 use prost::Message;
 use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use reqwest::Client;
-use once_cell::sync::Lazy;
 use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 mod common;
 use self::common::run_in_env;
@@ -177,9 +177,9 @@ fn encode_workflow_input(pairs: &[(&str, &str)]) -> Vec<u8> {
             value: Some(proto::WorkflowArgumentValue {
                 kind: Some(proto::workflow_argument_value::Kind::Primitive(
                     proto::PrimitiveWorkflowArgument {
-                        value: Some(ProstValue {
-                            kind: Some(ProstValueKind::StringValue((*value).to_string())),
-                        }),
+                        kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
+                            (*value).to_string(),
+                        )),
                     },
                 )),
             }),
@@ -212,9 +212,7 @@ fn parse_result(payload: &[u8]) -> Result<Option<String>> {
 fn decode_argument_value(value: &proto::WorkflowArgumentValue) -> Result<Option<String>> {
     use proto::workflow_argument_value::Kind;
     match value.kind.as_ref() {
-        Some(Kind::Primitive(primitive)) => {
-            Ok(primitive.value.as_ref().and_then(extract_string_from_prost))
-        }
+        Some(Kind::Primitive(primitive)) => Ok(primitive_value_to_string(primitive)),
         Some(Kind::Basemodel(model)) => {
             if let Some(struct_data) = model.data.as_ref()
                 && let Some(variables) = struct_data.fields.get("variables")
@@ -261,6 +259,17 @@ fn decode_argument_value(value: &proto::WorkflowArgumentValue) -> Result<Option<
 
 fn extract_string_from_value(value: &proto::WorkflowArgumentValue) -> Option<String> {
     decode_argument_value(value).ok().flatten()
+}
+
+fn primitive_value_to_string(value: &proto::PrimitiveWorkflowArgument) -> Option<String> {
+    use proto::primitive_workflow_argument::Kind;
+    match value.kind.as_ref()? {
+        Kind::StringValue(text) => Some(text.clone()),
+        Kind::DoubleValue(number) => Some(number.to_string()),
+        Kind::IntValue(number) => Some(number.to_string()),
+        Kind::BoolValue(flag) => Some(flag.to_string()),
+        Kind::NullValue(_) => None,
+    }
 }
 
 fn extract_string_from_prost(value: &ProstValue) -> Option<String> {

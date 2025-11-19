@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use prost::Message;
-use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
@@ -16,7 +15,7 @@ use crate::{
     messages::proto::{
         self, PrimitiveWorkflowArgument, WorkflowArgument, WorkflowArgumentValue,
         WorkflowArguments, WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext,
-        WorkflowNodeDispatch,
+        WorkflowNodeDispatch, primitive_workflow_argument,
     },
 };
 
@@ -180,13 +179,12 @@ fn decode_arguments(bytes: &[u8], label: &str) -> Result<WorkflowArguments> {
 }
 
 fn build_string_argument(key: &str, value: String) -> WorkflowArguments {
-    let primitive = PrimitiveWorkflowArgument {
-        value: Some(ProstValue {
-            kind: Some(ProstValueKind::StringValue(value)),
-        }),
-    };
     let argument_value = WorkflowArgumentValue {
-        kind: Some(proto::workflow_argument_value::Kind::Primitive(primitive)),
+        kind: Some(proto::workflow_argument_value::Kind::Primitive(
+            PrimitiveWorkflowArgument {
+                kind: Some(primitive_workflow_argument::Kind::StringValue(value)),
+            },
+        )),
     };
     WorkflowArguments {
         arguments: vec![WorkflowArgument {

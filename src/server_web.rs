@@ -542,11 +542,7 @@ fn workflow_arguments_to_json(arguments: &proto::WorkflowArguments) -> JsonValue
 fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
     use proto::workflow_argument_value::Kind;
     match value.kind.as_ref() {
-        Some(Kind::Primitive(primitive)) => primitive
-            .value
-            .as_ref()
-            .map(prost_value_to_json)
-            .unwrap_or(JsonValue::Null),
+        Some(Kind::Primitive(primitive)) => primitive_argument_to_json(primitive),
         Some(Kind::Basemodel(model)) => {
             let mut map = JsonMap::new();
             map.insert(
@@ -598,6 +594,19 @@ fn workflow_argument_value_to_json(value: &proto::WorkflowArgumentValue) -> Json
             JsonValue::Object(map)
         }
         None => JsonValue::Null,
+    }
+}
+
+fn primitive_argument_to_json(value: &proto::PrimitiveWorkflowArgument) -> JsonValue {
+    use proto::primitive_workflow_argument::Kind;
+    match value.kind.as_ref() {
+        Some(Kind::StringValue(text)) => JsonValue::String(text.clone()),
+        Some(Kind::DoubleValue(number)) => {
+            serde_json::Number::from_f64(*number).map_or(JsonValue::Null, JsonValue::Number)
+        }
+        Some(Kind::IntValue(number)) => JsonValue::Number((*number).into()),
+        Some(Kind::BoolValue(flag)) => JsonValue::Bool(*flag),
+        Some(Kind::NullValue(_)) | None => JsonValue::Null,
     }
 }
 

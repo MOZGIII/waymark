@@ -182,8 +182,19 @@ class WorkflowArguments(_ProtoMessage):
     arguments: _WorkflowArgumentContainer
 
 class PrimitiveWorkflowArgument(_ProtoMessage):
-    def __init__(self, value: Value | None = ...) -> None: ...
-    value: Value
+    def __init__(
+        self,
+        string_value: str = ...,
+        double_value: float = ...,
+        int_value: int = ...,
+        bool_value: bool = ...,
+        null_value: int = ...,
+    ) -> None: ...
+    string_value: str
+    double_value: float
+    int_value: int
+    bool_value: bool
+    null_value: int
 
 class BaseModelWorkflowArgument(_ProtoMessage):
     def __init__(self, module: str = ..., name: str = ..., data: Struct | None = ...) -> None: ...

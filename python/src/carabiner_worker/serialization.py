@@ -10,7 +10,6 @@ from pydantic import BaseModel
 from proto import messages_pb2 as pb2
 
 Struct = struct_pb2.Struct  # type: ignore[attr-defined]
-Value = struct_pb2.Value  # type: ignore[attr-defined]
 NULL_VALUE = struct_pb2.NULL_VALUE  # type: ignore[attr-defined]
 
 PRIMITIVE_TYPES = (str, int, float, bool, type(None))
@@ -56,7 +55,7 @@ def arguments_to_kwargs(arguments: pb2.WorkflowArguments | None) -> dict[str, An
 def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
     argument = pb2.WorkflowArgumentValue()
     if isinstance(value, PRIMITIVE_TYPES):
-        argument.primitive.value.CopyFrom(_python_to_value(value))
+        argument.primitive.CopyFrom(_serialize_primitive(value))
         return argument
     if isinstance(value, BaseException):
         argument.exception.type = value.__class__.__name__
@@ -98,7 +97,7 @@ def _to_argument_value(value: Any) -> pb2.WorkflowArgumentValue:
 def _from_argument_value(argument: pb2.WorkflowArgumentValue) -> Any:
     kind = argument.WhichOneof("kind")  # type: ignore[attr-defined]
     if kind == "primitive":
-        return _value_to_python(argument.primitive.value)
+        return _primitive_to_python(argument.primitive)
     if kind == "basemodel":
         module = argument.basemodel.module
         name = argument.basemodel.name
@@ -131,32 +130,36 @@ def _serialize_model_data(model: BaseModel) -> dict[str, Any]:
     return model.__dict__
 
 
-def _python_to_value(value: Any) -> Value:
-    message = Value()
+def _serialize_primitive(value: Any) -> pb2.PrimitiveWorkflowArgument:
+    primitive = pb2.PrimitiveWorkflowArgument()
     if value is None:
-        message.null_value = NULL_VALUE
+        primitive.null_value = NULL_VALUE
     elif isinstance(value, bool):
-        message.bool_value = value
-    elif isinstance(value, (int, float)):
-        message.number_value = float(value)
+        primitive.bool_value = value
+    elif isinstance(value, int) and not isinstance(value, bool):
+        primitive.int_value = value
+    elif isinstance(value, float):
+        primitive.double_value = value
     elif isinstance(value, str):
-        message.string_value = value
+        primitive.string_value = value
     else:  # pragma: no cover - unreachable given PRIMITIVE_TYPES
         raise TypeError(f"unsupported primitive type {type(value)!r}")
-    return message
+    return primitive
 
 
-def _value_to_python(value: Value) -> Any:
-    kind = value.WhichOneof("kind")
+def _primitive_to_python(primitive: pb2.PrimitiveWorkflowArgument) -> Any:
+    kind = primitive.WhichOneof("kind")  # type: ignore[attr-defined]
+    if kind == "string_value":
+        return primitive.string_value
+    if kind == "double_value":
+        return primitive.double_value
+    if kind == "int_value":
+        return primitive.int_value
+    if kind == "bool_value":
+        return primitive.bool_value
     if kind == "null_value":
         return None
-    if kind == "bool_value":
-        return value.bool_value
-    if kind == "number_value":
-        return value.number_value
-    if kind == "string_value":
-        return value.string_value
-    raise ValueError("unsupported primitive value kind")
+    raise ValueError("primitive argument missing kind discriminator")
 
 
 def _instantiate_serialized_model(module: str, name: str, model_data: dict[str, Any]) -> Any:

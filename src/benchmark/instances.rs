@@ -10,7 +10,6 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
-use prost_types::{Value as ProstValue, value::Kind as ProstValueKind};
 use tempfile::TempDir;
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{Instrument, info, warn};
@@ -301,25 +300,25 @@ fn build_workflow_input(batch_size: usize, payload_size: usize) -> Vec<u8> {
     };
     arguments.arguments.push(proto::WorkflowArgument {
         key: "batch_size".to_string(),
-        value: Some(primitive_argument(ProstValueKind::NumberValue(
-            batch_size as f64,
-        ))),
+        value: Some(primitive_argument(
+            proto::primitive_workflow_argument::Kind::IntValue(batch_size as i64),
+        )),
     });
     arguments.arguments.push(proto::WorkflowArgument {
         key: "payload_size".to_string(),
-        value: Some(primitive_argument(ProstValueKind::NumberValue(
-            payload_size as f64,
-        ))),
+        value: Some(primitive_argument(
+            proto::primitive_workflow_argument::Kind::IntValue(payload_size as i64),
+        )),
     });
     arguments.encode_to_vec()
 }
 
-fn primitive_argument(kind: ProstValueKind) -> proto::WorkflowArgumentValue {
+fn primitive_argument(
+    kind: proto::primitive_workflow_argument::Kind,
+) -> proto::WorkflowArgumentValue {
     proto::WorkflowArgumentValue {
         kind: Some(proto::workflow_argument_value::Kind::Primitive(
-            proto::PrimitiveWorkflowArgument {
-                value: Some(ProstValue { kind: Some(kind) }),
-            },
+            proto::PrimitiveWorkflowArgument { kind: Some(kind) },
         )),
     }
 }

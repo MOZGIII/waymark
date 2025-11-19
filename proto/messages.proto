@@ -103,7 +103,13 @@ message WorkflowArguments {
 }
 
 message PrimitiveWorkflowArgument {
-  google.protobuf.Value value = 1;
+  oneof kind {
+    string string_value = 1;
+    double double_value = 2;
+    sint64 int_value = 3;
+    bool bool_value = 4;
+    google.protobuf.NullValue null_value = 5;
+  }
 }
 
 message BaseModelWorkflowArgument {
