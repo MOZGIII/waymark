@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose};
 use chrono::{DateTime, Utc};
 use prost::Message;
 use sqlx::{
@@ -13,9 +12,8 @@ use crate::{
     LedgerActionId, WorkflowInstanceId, WorkflowVersionId,
     dag_state::{DagStateMachine, InstanceDagState},
     messages::proto::{
-        self, PrimitiveWorkflowArgument, WorkflowArgument, WorkflowArgumentValue,
-        WorkflowArguments, WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext,
-        WorkflowNodeDispatch, primitive_workflow_argument,
+        self, WorkflowArguments, WorkflowDagDefinition, WorkflowDagNode, WorkflowNodeContext,
+        WorkflowNodeDispatch,
     },
 };
 
@@ -129,11 +127,11 @@ async fn build_variable_context(
     Ok(context)
 }
 
-fn build_workflow_action_payload(
+fn build_workflow_node_dispatch(
     node: &WorkflowDagNode,
     workflow_input: &[u8],
     context: &HashMap<String, Vec<(String, Vec<u8>)>>,
-) -> Result<ActionInvocationPayload> {
+) -> Result<QueuedWorkflowNode> {
     let workflow_args = decode_arguments(workflow_input, "workflow input")?;
     let mut dispatch = WorkflowNodeDispatch {
         node: Some(node.clone()),
@@ -158,13 +156,21 @@ fn build_workflow_action_payload(
             }
         }
     }
-    let dispatch_bytes = dispatch.encode_to_vec();
-    let encoded = general_purpose::STANDARD.encode(dispatch_bytes);
-    let kwargs = build_string_argument("dispatch_b64", encoded).encode_to_vec();
-    Ok(ActionInvocationPayload {
-        module: "carabiner_worker.workflow_runtime".to_string(),
-        function_name: "workflow.execute_node".to_string(),
-        kwargs,
+    let module = if node.module.is_empty() {
+        "workflow".to_string()
+    } else {
+        node.module.clone()
+    };
+    let function_name = if node.action.is_empty() {
+        "action".to_string()
+    } else {
+        node.action.clone()
+    };
+
+    Ok(QueuedWorkflowNode {
+        module,
+        function_name,
+        dispatch,
     })
 }
 
@@ -178,22 +184,6 @@ fn decode_arguments(bytes: &[u8], label: &str) -> Result<WorkflowArguments> {
         .with_context(|| format!("failed to decode {label} workflow arguments"))
 }
 
-fn build_string_argument(key: &str, value: String) -> WorkflowArguments {
-    let argument_value = WorkflowArgumentValue {
-        kind: Some(proto::workflow_argument_value::Kind::Primitive(
-            PrimitiveWorkflowArgument {
-                kind: Some(primitive_workflow_argument::Kind::StringValue(value)),
-            },
-        )),
-    };
-    WorkflowArguments {
-        arguments: vec![WorkflowArgument {
-            key: key.to_string(),
-            value: Some(argument_value),
-        }],
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct CompletionRecord {
     pub action_id: LedgerActionId,
@@ -203,10 +193,10 @@ pub struct CompletionRecord {
 }
 
 #[derive(Debug, Clone)]
-struct ActionInvocationPayload {
+struct QueuedWorkflowNode {
     module: String,
     function_name: String,
-    kwargs: Vec<u8>,
+    dispatch: proto::WorkflowNodeDispatch,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -217,7 +207,7 @@ pub struct LedgerAction {
     pub action_seq: i32,
     pub module: String,
     pub function_name: String,
-    pub kwargs_payload: Vec<u8>,
+    pub dispatch_payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -288,7 +278,7 @@ pub struct WorkflowInstanceActionDetail {
     pub success: Option<bool>,
     pub module: String,
     pub function_name: String,
-    pub kwargs_payload: Vec<u8>,
+    pub dispatch_payload: Vec<u8>,
     pub result_payload: Option<Vec<u8>>,
 }
 
@@ -435,7 +425,7 @@ impl Database {
                    success,
                    module,
                    function_name,
-                   kwargs_payload,
+                   dispatch_payload,
                    result_payload
             FROM daemon_action_ledger
             WHERE instance_id = $1
@@ -450,7 +440,7 @@ impl Database {
             success: row.get("success"),
             module: row.get("module"),
             function_name: row.get("function_name"),
-            kwargs_payload: row.get("kwargs_payload"),
+            dispatch_payload: row.get("dispatch_payload"),
             result_payload: row.get("result_payload"),
         })
         .fetch_all(&self.pool)
@@ -480,7 +470,7 @@ impl Database {
         action_count: usize,
         module: &str,
         function_name: &str,
-        kwargs_payload: &[u8],
+        dispatch_payload: &[u8],
     ) -> Result<()> {
         let span = tracing::info_span!("db.seed_actions", partition_id, action_count);
         let _guard = span.enter();
@@ -508,7 +498,7 @@ impl Database {
                     status,
                     module,
                     function_name,
-                    kwargs_payload
+                    dispatch_payload
                 ) VALUES ($1, $2, $3, 'queued', $4, $5, $6)
                 "#,
             )
@@ -517,7 +507,7 @@ impl Database {
             .bind(seq as i32)
             .bind(module)
             .bind(function_name)
-            .bind(kwargs_payload)
+            .bind(dispatch_payload)
             .execute(&mut *tx)
             .await?;
         }
@@ -592,12 +582,12 @@ impl Database {
             FROM next_actions
             WHERE dal.id = next_actions.id
             RETURNING dal.id,
-                      dal.instance_id,
-                      dal.partition_id,
-                      dal.action_seq,
-                      dal.module,
-                      dal.function_name,
-                      dal.kwargs_payload
+                     dal.instance_id,
+                     dal.partition_id,
+                     dal.action_seq,
+                     dal.module,
+                     dal.function_name,
+                     dal.dispatch_payload
             "#,
         )
         .bind(partition_id)
@@ -776,8 +766,9 @@ impl Database {
         let mut inserted = 0usize;
         for node in unlocked {
             let node_id = node.id.clone();
-            let invocation =
-                build_workflow_action_payload(&node, &workflow_input, &context_values)?;
+            let node_dispatch =
+                build_workflow_node_dispatch(&node, &workflow_input, &context_values)?;
+            let dispatch_bytes = node_dispatch.dispatch.encode_to_vec();
             let _action_id: LedgerActionId = sqlx::query_scalar::<_, LedgerActionId>(
                 r#"
                 INSERT INTO daemon_action_ledger (
@@ -787,7 +778,7 @@ impl Database {
                     status,
                     module,
                     function_name,
-                    kwargs_payload,
+                    dispatch_payload,
                     workflow_node_id
                 ) VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
                 RETURNING id
@@ -796,9 +787,9 @@ impl Database {
             .bind(instance.id)
             .bind(instance.partition_id)
             .bind(next_sequence)
-            .bind(&invocation.module)
-            .bind(&invocation.function_name)
-            .bind(&invocation.kwargs)
+            .bind(&node_dispatch.module)
+            .bind(&node_dispatch.function_name)
+            .bind(&dispatch_bytes)
             .bind(node_id)
             .fetch_one(tx.as_mut())
             .await?;

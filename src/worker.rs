@@ -77,9 +77,7 @@ pub struct ActionDispatchPayload {
     pub action_id: LedgerActionId,
     pub instance_id: WorkflowInstanceId,
     pub sequence: i32,
-    pub module: String,
-    pub function_name: String,
-    pub kwargs_payload: Vec<u8>,
+    pub dispatch: proto::WorkflowNodeDispatch,
 }
 
 pub struct PythonWorker {
@@ -185,12 +183,18 @@ impl PythonWorker {
     ) -> Result<RoundTripMetrics, MessageError> {
         let delivery_id = self.next_delivery.fetch_add(1, Ordering::SeqCst);
         let send_instant = Instant::now();
+        let action_node = dispatch
+            .dispatch
+            .node
+            .as_ref()
+            .map(|node| (node.module.clone(), node.action.clone()))
+            .unwrap_or_default();
         tracing::debug!(
             action_id = %dispatch.action_id,
             instance_id = %dispatch.instance_id,
             sequence = dispatch.sequence,
-            module = %dispatch.module,
-            function = %dispatch.function_name,
+            module = %action_node.0,
+            function = %action_node.1,
             "worker.send_action"
         );
         let (ack_tx, ack_rx) = oneshot::channel();
@@ -202,23 +206,11 @@ impl PythonWorker {
             shared.pending_responses.insert(delivery_id, response_tx);
         }
 
-        let kwargs = if dispatch.kwargs_payload.is_empty() {
-            proto::WorkflowArguments {
-                arguments: Vec::new(),
-            }
-        } else {
-            proto::WorkflowArguments::decode(dispatch.kwargs_payload.as_slice())
-                .map_err(MessageError::Decode)?
-        };
         let command = proto::ActionDispatch {
             action_id: dispatch.action_id.to_string(),
             instance_id: dispatch.instance_id.to_string(),
             sequence: dispatch.sequence as u32,
-            invocation: Some(proto::WorkflowInvocation {
-                module: dispatch.module.clone(),
-                function_name: dispatch.function_name.clone(),
-                kwargs: Some(kwargs),
-            }),
+            dispatch: Some(dispatch.dispatch.clone()),
         };
 
         let envelope = proto::Envelope {

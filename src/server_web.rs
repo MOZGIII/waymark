@@ -429,8 +429,8 @@ fn render_workflow_run_page(
         total_nodes,
     );
     let progress = format_run_progress(completed_nodes, total_nodes);
-    let input_payload = format_optional_payload(&detail.instance.input_payload);
-    let result_payload = format_optional_payload(&detail.instance.result_payload);
+    let input_payload = format_optional_raw(&detail.instance.input_payload);
+    let result_payload = format_optional_arguments(&detail.instance.result_payload);
     let instance_meta = WorkflowRunMetadataContext {
         id: detail.instance.id.to_string(),
         created_at: detail
@@ -460,8 +460,8 @@ fn render_workflow_run_page(
                     action: record.function_name.clone(),
                     module: record.module.clone(),
                     status: describe_action_status(record),
-                    request_payload: format_payload(&record.kwargs_payload),
-                    response_payload: format_optional_payload(&record.result_payload),
+                    request_payload: format_dispatch_payload(&record.dispatch_payload),
+                    response_payload: format_optional_arguments(&record.result_payload),
                 }
             } else {
                 WorkflowRunNodeContext {
@@ -509,24 +509,139 @@ fn describe_action_status(action: &WorkflowInstanceActionDetail) -> String {
     }
 }
 
-fn format_payload(bytes: &[u8]) -> String {
+fn format_dispatch_payload(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "-".to_string();
     }
-    match proto::WorkflowArguments::decode(bytes) {
-        Ok(arguments) => {
-            let value = workflow_arguments_to_json(&arguments);
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| "-".to_string())
-        }
+    match proto::WorkflowNodeDispatch::decode(bytes) {
+        Ok(dispatch) => serde_json::to_string_pretty(&workflow_dispatch_to_json(&dispatch))
+            .unwrap_or_else(|_| "-".to_string()),
         Err(_) => general_purpose::STANDARD.encode(bytes),
     }
 }
 
-fn format_optional_payload(value: &Option<Vec<u8>>) -> String {
+fn format_arguments_payload(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "-".to_string();
+    }
+    match proto::WorkflowArguments::decode(bytes) {
+        Ok(arguments) => serde_json::to_string_pretty(&workflow_arguments_to_json(&arguments))
+            .unwrap_or_else(|_| "-".to_string()),
+        Err(_) => general_purpose::STANDARD.encode(bytes),
+    }
+}
+
+fn format_optional_arguments(value: &Option<Vec<u8>>) -> String {
     match value {
-        Some(bytes) => format_payload(bytes),
+        Some(bytes) => format_arguments_payload(bytes),
         None => "-".to_string(),
     }
+}
+
+fn format_optional_raw(value: &Option<Vec<u8>>) -> String {
+    match value {
+        Some(bytes) => format_raw_payload(bytes),
+        None => "-".to_string(),
+    }
+}
+
+fn format_raw_payload(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "-".to_string();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+            && let Ok(pretty) = serde_json::to_string_pretty(&value)
+        {
+            return pretty;
+        }
+        let trimmed = text.trim();
+        return if trimmed.is_empty() {
+            "-".to_string()
+        } else {
+            trimmed.to_string()
+        };
+    }
+    general_purpose::STANDARD.encode(bytes)
+}
+
+fn workflow_dispatch_to_json(dispatch: &proto::WorkflowNodeDispatch) -> JsonValue {
+    let mut map = JsonMap::new();
+    if let Some(node) = dispatch.node.as_ref() {
+        map.insert("node".to_string(), workflow_node_to_json(node));
+    }
+    if let Some(input) = dispatch.workflow_input.as_ref() {
+        map.insert(
+            "workflow_input".to_string(),
+            workflow_arguments_to_json(input),
+        );
+    }
+    if !dispatch.context.is_empty() {
+        let entries = dispatch
+            .context
+            .iter()
+            .map(|entry| {
+                let mut obj = JsonMap::new();
+                obj.insert(
+                    "variable".to_string(),
+                    JsonValue::String(entry.variable.clone()),
+                );
+                obj.insert(
+                    "workflow_node_id".to_string(),
+                    JsonValue::String(entry.workflow_node_id.clone()),
+                );
+                if let Some(payload) = entry.payload.as_ref() {
+                    obj.insert("payload".to_string(), workflow_arguments_to_json(payload));
+                }
+                JsonValue::Object(obj)
+            })
+            .collect();
+        map.insert("context".to_string(), JsonValue::Array(entries));
+    }
+    JsonValue::Object(map)
+}
+
+fn workflow_node_to_json(node: &proto::WorkflowDagNode) -> JsonValue {
+    let mut map = JsonMap::new();
+    map.insert("id".to_string(), JsonValue::String(node.id.clone()));
+    map.insert("action".to_string(), JsonValue::String(node.action.clone()));
+    map.insert("module".to_string(), JsonValue::String(node.module.clone()));
+    map.insert("guard".to_string(), JsonValue::String(node.guard.clone()));
+    map.insert(
+        "depends_on".to_string(),
+        JsonValue::Array(
+            node.depends_on
+                .iter()
+                .map(|v| JsonValue::String(v.clone()))
+                .collect(),
+        ),
+    );
+    map.insert(
+        "wait_for_sync".to_string(),
+        JsonValue::Array(
+            node.wait_for_sync
+                .iter()
+                .map(|v| JsonValue::String(v.clone()))
+                .collect(),
+        ),
+    );
+    map.insert(
+        "produces".to_string(),
+        JsonValue::Array(
+            node.produces
+                .iter()
+                .map(|v| JsonValue::String(v.clone()))
+                .collect(),
+        ),
+    );
+    if !node.kwargs.is_empty() {
+        let mut kwargs_map = JsonMap::new();
+        for (key, value) in &node.kwargs {
+            kwargs_map.insert(key.clone(), JsonValue::String(value.clone()));
+        }
+        map.insert("kwargs".to_string(), JsonValue::Object(kwargs_map));
+    }
+    JsonValue::Object(map)
 }
 
 fn workflow_arguments_to_json(arguments: &proto::WorkflowArguments) -> JsonValue {

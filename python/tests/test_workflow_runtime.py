@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 from typing import List
 
 from carabiner_worker import registry as action_registry
@@ -23,7 +22,7 @@ async def exception_handler() -> str:
     return "handled"
 
 
-def _build_dispatch(flag: bool) -> str:
+def _build_dispatch(flag: bool) -> pb2.WorkflowNodeDispatch:
     if action_registry.get("guarded_noop") is None:
         action_registry.register("guarded_noop", guarded_noop)
     node = pb2.WorkflowDagNode(
@@ -34,15 +33,19 @@ def _build_dispatch(flag: bool) -> str:
     )
     node.produces.append("result")
     dispatch = pb2.WorkflowNodeDispatch(node=node)
-    dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
+    workflow_input = pb2.WorkflowArguments()
+    entry = workflow_input.arguments.add()
+    entry.key = "flag"
+    entry.value.primitive.bool_value = flag
+    dispatch.workflow_input.CopyFrom(workflow_input)
     payload = serialize_result_payload(flag)
     entry = dispatch.context.add()
     entry.variable = "flag"
     entry.payload.CopyFrom(payload)
-    return base64.b64encode(dispatch.SerializeToString()).decode("utf-8")
+    return dispatch
 
 
-def _build_exception_dispatch(include_error: bool) -> str:
+def _build_exception_dispatch(include_error: bool) -> pb2.WorkflowNodeDispatch:
     if action_registry.get("exception_handler") is None:
         action_registry.register("exception_handler", exception_handler)
     node = pb2.WorkflowDagNode(
@@ -65,7 +68,7 @@ def _build_exception_dispatch(include_error: bool) -> str:
     entry.variable = ""
     entry.workflow_node_id = "node_source"
     entry.payload.CopyFrom(payload)
-    return base64.b64encode(dispatch.SerializeToString()).decode("utf-8")
+    return dispatch
 
 
 def test_execute_node_skips_guarded_action() -> None:

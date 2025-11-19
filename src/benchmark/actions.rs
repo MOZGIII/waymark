@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use prost::Message;
 use prost_types::{Struct as ProstStruct, Value as ProstValue, value::Kind as ProstValueKind};
@@ -73,7 +73,7 @@ impl BenchmarkHarness {
 
     pub async fn run(&self, config: &HarnessConfig) -> Result<BenchmarkSummary> {
         self.database.reset_partition(config.partition_id).await?;
-        let encoded_payload = build_benchmark_payload(config.payload_size);
+        let encoded_payload = build_benchmark_dispatch(config.payload_size)?;
         self.database
             .seed_actions(
                 config.partition_id,
@@ -106,13 +106,14 @@ impl BenchmarkHarness {
                 }
 
                 for action in actions {
+                    let dispatch =
+                        proto::WorkflowNodeDispatch::decode(action.dispatch_payload.as_slice())
+                            .map_err(|err| anyhow!("failed to decode benchmark dispatch: {err}"))?;
                     let payload = ActionDispatchPayload {
                         action_id: action.id,
                         instance_id: action.instance_id,
                         sequence: action.action_seq,
-                        module: action.module.clone(),
-                        function_name: action.function_name.clone(),
-                        kwargs_payload: action.kwargs_payload.clone(),
+                        dispatch,
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
@@ -200,7 +201,7 @@ impl BenchmarkHarness {
     }
 }
 
-fn build_benchmark_payload(payload_size: usize) -> Vec<u8> {
+fn build_benchmark_dispatch(payload_size: usize) -> Result<Vec<u8>> {
     let payload_data = "x".repeat(payload_size);
     let mut struct_fields = BTreeMap::new();
     struct_fields.insert(
@@ -225,5 +226,20 @@ fn build_benchmark_payload(payload_size: usize) -> Vec<u8> {
             value: Some(argument_value),
         }],
     };
-    arguments.encode_to_vec()
+    let mut kwargs = HashMap::new();
+    kwargs.insert("request".to_string(), "request".to_string());
+    let node = proto::WorkflowDagNode {
+        id: "benchmark".to_string(),
+        action: BENCHMARK_ACTION.to_string(),
+        module: BENCHMARK_USER_MODULE.to_string(),
+        produces: vec!["result".to_string()],
+        kwargs,
+        ..Default::default()
+    };
+    let dispatch = proto::WorkflowNodeDispatch {
+        node: Some(node),
+        workflow_input: Some(arguments),
+        context: Vec::new(),
+    };
+    Ok(dispatch.encode_to_vec())
 }

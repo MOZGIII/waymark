@@ -26,7 +26,7 @@ message ActionDispatch {
   string action_id = 1;
   string instance_id = 2;
   uint32 sequence = 3;
-  WorkflowInvocation invocation = 4;
+  WorkflowNodeDispatch dispatch = 4;
 }
 
 message ActionResult {
@@ -135,12 +135,6 @@ message WorkflowTupleArgument {
 
 message WorkflowDictArgument {
   repeated WorkflowArgument entries = 1;
-}
-
-message WorkflowInvocation {
-  string module = 1;
-  string function_name = 2;
-  WorkflowArguments kwargs = 3;
 }
 
 message WorkflowNodeDispatch {

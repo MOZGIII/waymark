@@ -139,13 +139,13 @@ async fn dispatch_all_actions(
         let mut batch_records = Vec::new();
         let mut batch_metrics = Vec::new();
         for action in actions {
+            let dispatch = proto::WorkflowNodeDispatch::decode(action.dispatch_payload.as_slice())
+                .context("failed to decode workflow dispatch")?;
             let payload = ActionDispatchPayload {
                 action_id: action.id,
                 instance_id: action.instance_id,
                 sequence: action.action_seq,
-                module: action.module.clone(),
-                function_name: action.function_name.clone(),
-                kwargs_payload: action.kwargs_payload.clone(),
+                dispatch,
             };
             let worker = pool.next_worker();
             let metrics = worker.send_action(payload).await?;

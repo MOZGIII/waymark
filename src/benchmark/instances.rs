@@ -165,13 +165,14 @@ impl WorkflowBenchmarkHarness {
                     break;
                 }
                 for action in actions {
+                    let dispatch =
+                        proto::WorkflowNodeDispatch::decode(action.dispatch_payload.as_slice())
+                            .map_err(|err| anyhow!("failed to decode workflow dispatch: {err}"))?;
                     let payload = ActionDispatchPayload {
                         action_id: action.id,
                         instance_id: action.instance_id,
                         sequence: action.action_seq,
-                        module: action.module.clone(),
-                        function_name: action.function_name.clone(),
-                        kwargs_payload: action.kwargs_payload.clone(),
+                        dispatch,
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(

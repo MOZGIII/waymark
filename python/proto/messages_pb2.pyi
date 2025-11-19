@@ -18,12 +18,12 @@ class ActionDispatch(_ProtoMessage):
         action_id: str = ...,
         instance_id: str = ...,
         sequence: int = ...,
-        invocation: WorkflowInvocation | None = ...,
+        dispatch: WorkflowNodeDispatch | None = ...,
     ) -> None: ...
     action_id: str
     instance_id: str
     sequence: int
-    invocation: WorkflowInvocation
+    dispatch: WorkflowNodeDispatch
 
 class ActionResult(_ProtoMessage):
     def __init__(
@@ -226,17 +226,6 @@ class WorkflowTupleArgument(_ProtoMessage):
 class WorkflowDictArgument(_ProtoMessage):
     def __init__(self, entries: list[WorkflowArgument] | None = ...) -> None: ...
     entries: _WorkflowArgumentContainer
-
-class WorkflowInvocation(_ProtoMessage):
-    def __init__(
-        self,
-        module: str = ...,
-        function_name: str = ...,
-        kwargs: WorkflowArguments | None = ...,
-    ) -> None: ...
-    module: str
-    function_name: str
-    kwargs: WorkflowArguments
 
 class WorkflowNodeDispatch(_ProtoMessage):
     def __init__(

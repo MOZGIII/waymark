@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import importlib
 from typing import Any, Dict, Tuple
 
@@ -11,7 +10,7 @@ from pydantic import BaseModel
 
 from proto import messages_pb2 as pb2
 
-from .actions import action, deserialize_result_payload
+from .actions import deserialize_result_payload
 from .registry import registry
 from .serialization import arguments_to_kwargs
 
@@ -142,13 +141,11 @@ def _execute_python_block(node: pb2.WorkflowDagNode, context: dict[str, Any]) ->
     return result
 
 
-@action(name="workflow.execute_node")
-async def execute_node(dispatch_b64: str) -> Any:
-    payload = base64.b64decode(dispatch_b64)
-    dispatch = pb2.WorkflowNodeDispatch()
-    dispatch.ParseFromString(payload)
+async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> WorkflowNodeResult:
     context, exceptions = _build_context(dispatch)
     node = dispatch.node
+    if node is None:
+        raise RuntimeError("workflow dispatch missing node definition")
     if not _guard_allows_execution(node, context):
         return WorkflowNodeResult(variables={})
     matched_sources = _matching_exception_sources(node, exceptions)
