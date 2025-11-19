@@ -448,16 +448,14 @@ impl Database {
         Ok(Some(WorkflowInstanceDetail { instance, actions }))
     }
 
-    pub async fn reset_partition(&self, partition_id: i32) -> Result<()> {
-        let span = tracing::info_span!("db.reset_partition", partition_id);
+    pub async fn reset_workflow_state(&self) -> Result<()> {
+        let span = tracing::info_span!("db.reset_workflow_state");
         let _guard = span.enter();
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM daemon_action_ledger WHERE partition_id = $1")
-            .bind(partition_id)
+        sqlx::query("DELETE FROM daemon_action_ledger")
             .execute(&mut *tx)
             .await?;
-        sqlx::query("DELETE FROM workflow_instances WHERE partition_id = $1")
-            .bind(partition_id)
+        sqlx::query("DELETE FROM workflow_instances")
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -466,13 +464,12 @@ impl Database {
 
     pub async fn seed_actions(
         &self,
-        partition_id: i32,
         action_count: usize,
         module: &str,
         function_name: &str,
         dispatch_payload: &[u8],
     ) -> Result<()> {
-        let span = tracing::info_span!("db.seed_actions", partition_id, action_count);
+        let span = tracing::info_span!("db.seed_actions", action_count);
         let _guard = span.enter();
         let mut tx = self.pool.begin().await?;
         let instance_id: WorkflowInstanceId = sqlx::query_scalar(
@@ -482,7 +479,7 @@ impl Database {
             RETURNING id
             "#,
         )
-        .bind(partition_id)
+        .bind(0i32)
         .bind("benchmark")
         .bind(action_count as i32)
         .fetch_one(&mut *tx)
@@ -503,7 +500,7 @@ impl Database {
                 "#,
             )
             .bind(instance_id)
-            .bind(partition_id)
+            .bind(0i32)
             .bind(seq as i32)
             .bind(module)
             .bind(function_name)
@@ -518,7 +515,6 @@ impl Database {
 
     pub async fn create_workflow_instance(
         &self,
-        partition_id: i32,
         workflow_name: &str,
         workflow_version_id: WorkflowVersionId,
         input_payload: Option<&[u8]>,
@@ -536,7 +532,7 @@ impl Database {
             RETURNING id
             "#,
         )
-        .bind(partition_id)
+        .bind(0i32)
         .bind(workflow_name)
         .bind(workflow_version_id)
         .bind(input_payload)
@@ -560,22 +556,18 @@ impl Database {
         Ok(count)
     }
 
-    pub async fn dispatch_actions(
-        &self,
-        partition_id: i32,
-        limit: i64,
-    ) -> Result<Vec<LedgerAction>> {
-        let span = tracing::info_span!("db.dispatch_actions", partition_id, limit);
+    pub async fn dispatch_actions(&self, limit: i64) -> Result<Vec<LedgerAction>> {
+        let span = tracing::info_span!("db.dispatch_actions", limit);
         let _guard = span.enter();
-        let records = sqlx::query_as::<_, LedgerAction>(
+        let result = sqlx::query_as::<_, LedgerAction>(
             r#"
             WITH next_actions AS (
                 SELECT id
                 FROM daemon_action_ledger
-                WHERE partition_id = $1 AND status = 'queued'
+                WHERE status = 'queued'
                 ORDER BY action_seq
                 FOR UPDATE SKIP LOCKED
-                LIMIT $2
+                LIMIT $1
             )
             UPDATE daemon_action_ledger AS dal
             SET status = 'dispatched', dispatched_at = NOW()
@@ -590,11 +582,39 @@ impl Database {
                      dal.dispatch_payload
             "#,
         )
-        .bind(partition_id)
         .bind(limit)
         .fetch_all(&self.pool)
+        .await;
+        match result {
+            Ok(records) => {
+                if !records.is_empty() {
+                    metrics::counter!("carabiner_actions_dispatched_total")
+                        .increment(records.len() as u64);
+                }
+                Ok(records)
+            }
+            Err(err) => {
+                metrics::counter!("carabiner_dispatch_errors_total").increment(1);
+                Err(err.into())
+            }
+        }
+    }
+
+    pub async fn requeue_action(&self, action_id: LedgerActionId) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE daemon_action_ledger
+            SET status = 'queued',
+                dispatched_at = NULL,
+                acked_at = NULL,
+                delivery_id = NULL
+            WHERE id = $1
+            "#,
+        )
+        .bind(action_id)
+        .execute(&self.pool)
         .await?;
-        Ok(records)
+        Ok(())
     }
 
     pub async fn mark_actions_batch(&self, records: &[CompletionRecord]) -> Result<()> {

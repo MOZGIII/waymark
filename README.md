@@ -104,6 +104,12 @@ The main carabiner configuration is done through env vars, which is what you'll 
 | Environment Variable | Description | Example |
 |---------------------|-------------|---------|
 | `DATABASE_URL` | PostgreSQL connection string for the carabiner server | `postgresql://mountaineer:mountaineer@localhost:5433/mountaineer_daemons` |
+| `CARABINER_HTTP_ADDR` | Optional HTTP bind address for `carabiner-server` | `0.0.0.0:24117` |
+| `CARABINER_GRPC_ADDR` | Optional gRPC bind address for `carabiner-server` | `0.0.0.0:24118` |
+| `CARABINER_WORKER_COUNT` | Override number of Python workers spawned by `start_workers` | `8` |
+| `CARABINER_USER_MODULE` | Python module preloaded into each worker process | `my_app.actions` |
+| `CARABINER_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` |
+| `CARABINER_BATCH_SIZE` | Max actions fetched per poll | `100` |
 
 ## Philosophy
 
@@ -173,8 +179,16 @@ $ cargo run --bin bench -- \
   --concurrency 64 \
   --workers 4 \
   --log-interval 15 \
-  --partition 0 | \
   uv run python/tools/parse_bench_logs.py
 ```
 
 Add `--json` to the parser if you prefer JSON output.
+
+## Worker Pool Runtime
+
+`start_workers` launches the gRPC bridge plus a polling dispatcher that streams
+queued actions from Postgres into the Python workers:
+
+```bash
+$ cargo run --bin start_workers
+```

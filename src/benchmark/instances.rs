@@ -36,7 +36,6 @@ pub struct WorkflowBenchmarkConfig {
     pub in_flight: usize,
     pub batch_size: usize,
     pub payload_size: usize,
-    pub partition_id: i32,
     pub progress_interval: Option<Duration>,
 }
 
@@ -47,7 +46,6 @@ impl Default for WorkflowBenchmarkConfig {
             in_flight: 32,
             batch_size: 4,
             payload_size: 1024,
-            partition_id: 0,
             progress_interval: None,
         }
     }
@@ -131,12 +129,11 @@ impl WorkflowBenchmarkHarness {
     }
 
     pub async fn run(&self, config: &WorkflowBenchmarkConfig) -> Result<BenchmarkSummary> {
-        self.database.reset_partition(config.partition_id).await?;
+        self.database.reset_workflow_state().await?;
         let input_payload = build_workflow_input(config.batch_size, config.payload_size);
         for _ in 0..config.instance_count {
             self.database
                 .create_workflow_instance(
-                    config.partition_id,
                     &self.workflow_name,
                     self.workflow_version_id,
                     Some(&input_payload),
@@ -157,10 +154,7 @@ impl WorkflowBenchmarkHarness {
         while completed.len() < total_actions {
             while inflight.len() < max_inflight && dispatched < total_actions {
                 let needed = (max_inflight - inflight.len()).min(total_actions - dispatched);
-                let actions = self
-                    .database
-                    .dispatch_actions(config.partition_id, needed as i64)
-                    .await?;
+                let actions = self.database.dispatch_actions(needed as i64).await?;
                 if actions.is_empty() {
                     break;
                 }

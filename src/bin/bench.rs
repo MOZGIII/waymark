@@ -9,7 +9,6 @@ struct Options {
     total_messages: usize,
     payload_size: usize,
     concurrency: usize,
-    partition_id: i32,
     log_interval_secs: Option<u64>,
     worker_count: usize,
     user_module: String,
@@ -21,7 +20,6 @@ impl Default for Options {
             total_messages: 10_000,
             payload_size: 4096,
             concurrency: 32,
-            partition_id: 0,
             log_interval_secs: Some(30),
             worker_count: 1,
             user_module: PythonWorkerConfig::default().user_module,
@@ -58,12 +56,6 @@ impl Options {
                     print_usage();
                     process::exit(0);
                 }
-                "--partition" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--partition requires a value"))?;
-                    opts.partition_id = value.parse()?;
-                }
                 "--log-interval" => {
                     let value = args
                         .next()
@@ -95,7 +87,7 @@ impl Options {
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --bin bench -- [--messages N] [--payload BYTES] [--concurrency N] [--partition ID] [--log-interval seconds] [--workers N] [--user-module MODULE]"
+        "Usage: cargo run --bin bench -- [--messages N] [--payload BYTES] [--concurrency N] [--log-interval seconds] [--workers N] [--user-module MODULE]"
     );
 }
 
@@ -117,7 +109,6 @@ async fn main() -> Result<()> {
         total_messages: options.total_messages,
         in_flight: options.concurrency,
         payload_size: options.payload_size,
-        partition_id: options.partition_id,
         progress_interval: options.log_interval_secs.map(Duration::from_secs),
     };
 

@@ -22,7 +22,6 @@ use reqwest::Client;
 use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
 mod common;
 use self::common::run_in_env;
-const PARTITION_ID: i32 = 91;
 const INTEGRATION_MODULE: &str = "integration_module";
 const INTEGRATION_MODULE_SOURCE: &str = include_str!("fixtures/integration_module.py");
 const INTEGRATION_COMPLEX_MODULE: &str = include_str!("fixtures/integration_complex.py");
@@ -131,7 +130,7 @@ async fn dispatch_all_actions(
 ) -> Result<Vec<RoundTripMetrics>> {
     let mut completed = Vec::new();
     while completed.len() < expected_actions {
-        let actions = database.dispatch_actions(PARTITION_ID, 16).await?;
+        let actions = database.dispatch_actions(16).await?;
         if actions.is_empty() {
             sleep(Duration::from_millis(50)).await;
             continue;
@@ -340,12 +339,7 @@ async fn workflow_executes_end_to_end() -> Result<()> {
 
     let workflow_input = encode_workflow_input(&[("input", "world")]);
     let _instance_id = database
-        .create_workflow_instance(
-            PARTITION_ID,
-            &version.workflow_name,
-            version.id,
-            Some(&workflow_input),
-        )
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
         .await?;
 
     let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
@@ -358,7 +352,6 @@ async fn workflow_executes_end_to_end() -> Result<()> {
         script_path: worker_script,
         user_module: INTEGRATION_MODULE.to_string(),
         extra_python_paths: vec![python_env.path().to_path_buf()],
-        ..PythonWorkerConfig::default()
     };
     let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
 
@@ -423,12 +416,7 @@ async fn workflow_executes_complex_flow() -> Result<()> {
 
     let complex_input = encode_workflow_input(&[("input", "unused")]);
     let instance_id = database
-        .create_workflow_instance(
-            PARTITION_ID,
-            &version.workflow_name,
-            version.id,
-            Some(&complex_input),
-        )
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&complex_input))
         .await?;
 
     let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
@@ -441,7 +429,6 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         script_path: worker_script,
         user_module: "integration_complex".to_string(),
         extra_python_paths: vec![python_env.path().to_path_buf()],
-        ..PythonWorkerConfig::default()
     };
     let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
 
@@ -516,12 +503,7 @@ async fn workflow_handles_exception_flow() -> Result<()> {
 
     let exception_input = encode_workflow_input(&[("mode", "exception")]);
     let instance_id = database
-        .create_workflow_instance(
-            PARTITION_ID,
-            &version.workflow_name,
-            version.id,
-            Some(&exception_input),
-        )
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&exception_input))
         .await?;
 
     let worker_server: Arc<WorkerBridgeServer> = WorkerBridgeServer::start(None).await?;
@@ -534,7 +516,6 @@ async fn workflow_handles_exception_flow() -> Result<()> {
         script_path: worker_script,
         user_module: "integration_exception".to_string(),
         extra_python_paths: vec![python_env.path().to_path_buf()],
-        ..PythonWorkerConfig::default()
     };
     let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
 

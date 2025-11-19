@@ -24,7 +24,6 @@ pub struct HarnessConfig {
     pub total_messages: usize,
     pub in_flight: usize,
     pub payload_size: usize,
-    pub partition_id: i32,
     pub progress_interval: Option<Duration>,
 }
 
@@ -34,7 +33,6 @@ impl Default for HarnessConfig {
             total_messages: 10_000,
             in_flight: 32,
             payload_size: 4096,
-            partition_id: 0,
             progress_interval: None,
         }
     }
@@ -72,11 +70,10 @@ impl BenchmarkHarness {
     }
 
     pub async fn run(&self, config: &HarnessConfig) -> Result<BenchmarkSummary> {
-        self.database.reset_partition(config.partition_id).await?;
+        self.database.reset_workflow_state().await?;
         let encoded_payload = build_benchmark_dispatch(config.payload_size)?;
         self.database
             .seed_actions(
-                config.partition_id,
                 config.total_messages,
                 BENCHMARK_USER_MODULE,
                 BENCHMARK_ACTION,
@@ -97,10 +94,7 @@ impl BenchmarkHarness {
         while completed.len() < total {
             while inflight.len() < max_inflight && dispatched < total {
                 let needed = (max_inflight - inflight.len()).min(total - dispatched);
-                let actions = self
-                    .database
-                    .dispatch_actions(config.partition_id, needed as i64)
-                    .await?;
+                let actions = self.database.dispatch_actions(needed as i64).await?;
                 if actions.is_empty() {
                     break;
                 }
