@@ -7,6 +7,7 @@ use sqlx::{
     FromRow, PgPool, Postgres, Row, Transaction,
     postgres::{PgPoolOptions, PgRow},
 };
+use uuid::Uuid;
 
 use crate::{
     LedgerActionId, WorkflowInstanceId, WorkflowVersionId,
@@ -259,6 +260,7 @@ pub struct CompletionRecord {
     pub success: bool,
     pub delivery_id: u64,
     pub result_payload: Vec<u8>,
+    pub dispatch_token: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +294,7 @@ pub struct LedgerAction {
     pub timeout_seconds: i32,
     pub max_retries: i32,
     pub attempt_number: i32,
+    pub delivery_token: Uuid,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -591,7 +594,8 @@ impl Database {
                     completed_at = NOW(),
                     acked_at = COALESCE(acked_at, NOW()),
                     result_payload = $2,
-                    deadline_at = NULL
+                    deadline_at = NULL,
+                    delivery_token = NULL
                 WHERE id = $1
                 "#,
             )
@@ -623,7 +627,8 @@ impl Database {
                 delivery_id = NULL,
                 scheduled_at = NOW(),
                 result_payload = NULL,
-                success = NULL
+                success = NULL,
+                delivery_token = NULL
             WHERE id = ANY($1)
               AND status IN ('failed', 'timed_out')
               AND attempt_number + 1 < max_retries
@@ -756,7 +761,8 @@ impl Database {
                 deadline_at = CASE
                     WHEN dal.timeout_seconds > 0 THEN NOW() + dal.timeout_seconds * INTERVAL '1 second'
                     ELSE NULL
-                END
+                END,
+                delivery_token = gen_random_uuid()
             FROM next_actions
             WHERE dal.id = next_actions.id
             RETURNING dal.id,
@@ -768,7 +774,8 @@ impl Database {
                      dal.dispatch_payload,
                      dal.timeout_seconds,
                      dal.max_retries,
-                     dal.attempt_number
+                     dal.attempt_number,
+                     dal.delivery_token
             "#,
         )
         .bind(limit)
@@ -800,7 +807,8 @@ impl Database {
                 deadline_at = NULL,
                 scheduled_at = NOW(),
                 result_payload = NULL,
-                success = NULL
+                success = NULL,
+                delivery_token = NULL
             WHERE id = $1
             "#,
         )
@@ -877,21 +885,57 @@ impl Database {
         }
         let span = tracing::debug_span!("db.mark_actions_batch", count = records.len());
         let _guard = span.enter();
-        let successes: Vec<&CompletionRecord> = records.iter().filter(|r| r.success).collect();
-        let failures: Vec<&CompletionRecord> = records.iter().filter(|r| !r.success).collect();
+        let successes_with_tokens: Vec<(&CompletionRecord, Uuid)> = records
+            .iter()
+            .filter(|r| r.success)
+            .filter_map(|record| record.dispatch_token.map(|token| (record, token)))
+            .collect();
+        let dropped_successes =
+            records.iter().filter(|r| r.success).count() - successes_with_tokens.len();
+        if dropped_successes > 0 {
+            tracing::debug!(
+                count = dropped_successes,
+                "dropping successful completions missing dispatch tokens"
+            );
+        }
+        let failures_with_tokens: Vec<(&CompletionRecord, Uuid)> = records
+            .iter()
+            .filter(|r| !r.success)
+            .filter_map(|record| record.dispatch_token.map(|token| (record, token)))
+            .collect();
+        let dropped_failures =
+            records.iter().filter(|r| !r.success).count() - failures_with_tokens.len();
+        if dropped_failures > 0 {
+            tracing::debug!(
+                count = dropped_failures,
+                "dropping failed completions missing dispatch tokens"
+            );
+        }
         let mut tx = self.pool.begin().await?;
         let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
-        if !successes.is_empty() {
-            let ids: Vec<LedgerActionId> = successes.iter().map(|r| r.action_id).collect();
-            let deliveries: Vec<i64> = successes.iter().map(|r| r.delivery_id as i64).collect();
-            let payloads: Vec<Vec<u8>> =
-                successes.iter().map(|r| r.result_payload.clone()).collect();
+        if !successes_with_tokens.is_empty() {
+            let ids: Vec<LedgerActionId> = successes_with_tokens
+                .iter()
+                .map(|(record, _)| record.action_id)
+                .collect();
+            let deliveries: Vec<i64> = successes_with_tokens
+                .iter()
+                .map(|(record, _)| record.delivery_id as i64)
+                .collect();
+            let payloads: Vec<Vec<u8>> = successes_with_tokens
+                .iter()
+                .map(|(record, _)| record.result_payload.clone())
+                .collect();
+            let tokens: Vec<Uuid> = successes_with_tokens
+                .iter()
+                .map(|(_, token)| *token)
+                .collect();
             let updated = sqlx::query(
                 r#"
                 WITH data AS (
                     SELECT *
-                    FROM UNNEST($1::UUID[], $2::BIGINT[], $3::BYTEA[])
-                        AS t(action_id, delivery_id, result_payload)
+                    FROM UNNEST($1::UUID[], $2::UUID[], $3::BIGINT[], $4::BYTEA[])
+                        AS t(action_id, dispatch_token, delivery_id, result_payload)
                 )
                 UPDATE daemon_action_ledger AS dal
                 SET status = 'completed',
@@ -900,13 +944,16 @@ impl Database {
                     acked_at = COALESCE(dal.acked_at, NOW()),
                     delivery_id = data.delivery_id,
                     result_payload = data.result_payload,
-                    deadline_at = NULL
+                    deadline_at = NULL,
+                    delivery_token = NULL
                 FROM data
                 WHERE dal.id = data.action_id
+                  AND dal.delivery_token = data.dispatch_token
                 RETURNING dal.instance_id, dal.workflow_node_id
                 "#,
             )
             .bind(&ids)
+            .bind(&tokens)
             .bind(&deliveries)
             .bind(&payloads)
             .map(|row: PgRow| {
@@ -924,24 +971,36 @@ impl Database {
             }
         }
 
-        if !failures.is_empty() {
-            let failure_ids: Vec<LedgerActionId> = failures.iter().map(|r| r.action_id).collect();
-            let deliveries: Vec<i64> = failures.iter().map(|r| r.delivery_id as i64).collect();
-            let payloads: Vec<Vec<u8>> =
-                failures.iter().map(|r| r.result_payload.clone()).collect();
-            let errors: Vec<String> = failures
+        if !failures_with_tokens.is_empty() {
+            let failure_ids: Vec<LedgerActionId> = failures_with_tokens
                 .iter()
-                .map(|record| {
+                .map(|(record, _)| record.action_id)
+                .collect();
+            let deliveries: Vec<i64> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| record.delivery_id as i64)
+                .collect();
+            let payloads: Vec<Vec<u8>> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| record.result_payload.clone())
+                .collect();
+            let errors: Vec<String> = failures_with_tokens
+                .iter()
+                .map(|(record, _)| {
                     extract_error_message(&record.result_payload)
                         .unwrap_or_else(|| "action failed".to_string())
                 })
+                .collect();
+            let tokens: Vec<Uuid> = failures_with_tokens
+                .iter()
+                .map(|(_, token)| *token)
                 .collect();
             sqlx::query(
                 r#"
                 WITH data AS (
                     SELECT *
-                    FROM UNNEST($1::UUID[], $2::BIGINT[], $3::BYTEA[], $4::TEXT[])
-                        AS t(action_id, delivery_id, result_payload, last_error)
+                    FROM UNNEST($1::UUID[], $2::UUID[], $3::BIGINT[], $4::BYTEA[], $5::TEXT[])
+                        AS t(action_id, dispatch_token, delivery_id, result_payload, last_error)
                 )
                 UPDATE daemon_action_ledger AS dal
                 SET status = 'failed',
@@ -950,12 +1009,15 @@ impl Database {
                     delivery_id = data.delivery_id,
                     result_payload = data.result_payload,
                     last_error = NULLIF(data.last_error, ''),
-                    deadline_at = NULL
+                    deadline_at = NULL,
+                    delivery_token = NULL
                 FROM data
                 WHERE dal.id = data.action_id
+                  AND dal.delivery_token = data.dispatch_token
                 "#,
             )
             .bind(&failure_ids)
+            .bind(&tokens)
             .bind(&deliveries)
             .bind(&payloads)
             .bind(&errors)

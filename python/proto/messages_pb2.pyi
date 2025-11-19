@@ -96,12 +96,14 @@ class ActionDispatch(google.protobuf.message.Message):
     TIMEOUT_SECONDS_FIELD_NUMBER: builtins.int
     MAX_RETRIES_FIELD_NUMBER: builtins.int
     ATTEMPT_NUMBER_FIELD_NUMBER: builtins.int
+    DISPATCH_TOKEN_FIELD_NUMBER: builtins.int
     action_id: builtins.str
     instance_id: builtins.str
     sequence: builtins.int
     timeout_seconds: builtins.int
     max_retries: builtins.int
     attempt_number: builtins.int
+    dispatch_token: builtins.str
     @property
     def dispatch(self) -> Global___WorkflowNodeDispatch: ...
     def __init__(
@@ -114,12 +116,15 @@ class ActionDispatch(google.protobuf.message.Message):
         timeout_seconds: builtins.int | None = ...,
         max_retries: builtins.int | None = ...,
         attempt_number: builtins.int | None = ...,
+        dispatch_token: builtins.str | None = ...,
     ) -> None: ...
     def HasField(
         self,
         field_name: typing.Literal[
             "_attempt_number",
             b"_attempt_number",
+            "_dispatch_token",
+            b"_dispatch_token",
             "_max_retries",
             b"_max_retries",
             "_timeout_seconds",
@@ -128,6 +133,8 @@ class ActionDispatch(google.protobuf.message.Message):
             b"attempt_number",
             "dispatch",
             b"dispatch",
+            "dispatch_token",
+            b"dispatch_token",
             "max_retries",
             b"max_retries",
             "timeout_seconds",
@@ -139,6 +146,8 @@ class ActionDispatch(google.protobuf.message.Message):
         field_name: typing.Literal[
             "_attempt_number",
             b"_attempt_number",
+            "_dispatch_token",
+            b"_dispatch_token",
             "_max_retries",
             b"_max_retries",
             "_timeout_seconds",
@@ -149,6 +158,8 @@ class ActionDispatch(google.protobuf.message.Message):
             b"attempt_number",
             "dispatch",
             b"dispatch",
+            "dispatch_token",
+            b"dispatch_token",
             "instance_id",
             b"instance_id",
             "max_retries",
@@ -163,6 +174,10 @@ class ActionDispatch(google.protobuf.message.Message):
     def WhichOneof(
         self, oneof_group: typing.Literal["_attempt_number", b"_attempt_number"]
     ) -> typing.Literal["attempt_number"] | None: ...
+    @typing.overload
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_dispatch_token", b"_dispatch_token"]
+    ) -> typing.Literal["dispatch_token"] | None: ...
     @typing.overload
     def WhichOneof(
         self, oneof_group: typing.Literal["_max_retries", b"_max_retries"]
@@ -183,10 +198,12 @@ class ActionResult(google.protobuf.message.Message):
     PAYLOAD_FIELD_NUMBER: builtins.int
     WORKER_START_NS_FIELD_NUMBER: builtins.int
     WORKER_END_NS_FIELD_NUMBER: builtins.int
+    DISPATCH_TOKEN_FIELD_NUMBER: builtins.int
     action_id: builtins.str
     success: builtins.bool
     worker_start_ns: builtins.int
     worker_end_ns: builtins.int
+    dispatch_token: builtins.str
     @property
     def payload(self) -> Global___WorkflowArguments: ...
     def __init__(
@@ -197,13 +214,28 @@ class ActionResult(google.protobuf.message.Message):
         payload: Global___WorkflowArguments | None = ...,
         worker_start_ns: builtins.int = ...,
         worker_end_ns: builtins.int = ...,
+        dispatch_token: builtins.str | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["payload", b"payload"]) -> builtins.bool: ...
+    def HasField(
+        self,
+        field_name: typing.Literal[
+            "_dispatch_token",
+            b"_dispatch_token",
+            "dispatch_token",
+            b"dispatch_token",
+            "payload",
+            b"payload",
+        ],
+    ) -> builtins.bool: ...
     def ClearField(
         self,
         field_name: typing.Literal[
+            "_dispatch_token",
+            b"_dispatch_token",
             "action_id",
             b"action_id",
+            "dispatch_token",
+            b"dispatch_token",
             "payload",
             b"payload",
             "success",
@@ -214,6 +246,9 @@ class ActionResult(google.protobuf.message.Message):
             b"worker_start_ns",
         ],
     ) -> None: ...
+    def WhichOneof(
+        self, oneof_group: typing.Literal["_dispatch_token", b"_dispatch_token"]
+    ) -> typing.Literal["dispatch_token"] | None: ...
 
 Global___ActionResult: typing_extensions.TypeAlias = ActionResult
 

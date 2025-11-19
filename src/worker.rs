@@ -25,6 +25,7 @@ use crate::{
     messages::{self, MessageError, proto},
     server_worker::{WorkerBridgeChannels, WorkerBridgeServer},
 };
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct PythonWorkerConfig {
@@ -54,6 +55,7 @@ pub struct RoundTripMetrics {
     pub worker_duration: Duration,
     pub response_payload: Vec<u8>,
     pub success: bool,
+    pub dispatch_token: Option<Uuid>,
 }
 
 struct SharedState {
@@ -79,6 +81,7 @@ pub struct ActionDispatchPayload {
     pub timeout_seconds: i32,
     pub max_retries: i32,
     pub attempt_number: i32,
+    pub dispatch_token: Uuid,
 }
 
 pub struct PythonWorker {
@@ -213,6 +216,7 @@ impl PythonWorker {
             timeout_seconds: Some(dispatch.timeout_seconds.max(0) as u32),
             max_retries: Some(dispatch.max_retries.max(0) as u32),
             attempt_number: Some(dispatch.attempt_number.max(0) as u32),
+            dispatch_token: Some(dispatch.dispatch_token.to_string()),
         };
 
         let envelope = proto::Envelope {
@@ -254,6 +258,10 @@ impl PythonWorker {
                 .map(|payload| payload.encode_to_vec())
                 .unwrap_or_default(),
             success: response.success,
+            dispatch_token: response
+                .dispatch_token
+                .as_ref()
+                .and_then(|token| Uuid::parse_str(token).ok()),
         })
     }
 

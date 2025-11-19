@@ -148,6 +148,7 @@ async fn dispatch_all_actions(
                 timeout_seconds: action.timeout_seconds,
                 max_retries: action.max_retries,
                 attempt_number: action.attempt_number,
+                dispatch_token: action.delivery_token,
             };
             let worker = pool.next_worker();
             let metrics = worker.send_action(payload).await?;
@@ -166,6 +167,7 @@ fn to_completion_record(metrics: RoundTripMetrics) -> CompletionRecord {
         success: metrics.success,
         delivery_id: metrics.delivery_id,
         result_payload: metrics.response_payload,
+        dispatch_token: metrics.dispatch_token,
     }
 }
 
@@ -548,4 +550,86 @@ async fn workflow_handles_exception_flow() -> Result<()> {
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_worker_completion_is_ignored() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+    let dispatch = proto::WorkflowNodeDispatch {
+        node: None,
+        workflow_input: None,
+        context: Vec::new(),
+    };
+    let payload = dispatch.encode_to_vec();
+    database
+        .seed_actions(1, "tests", "action", &payload)
+        .await?;
+    let mut actions = database.dispatch_actions(1).await?;
+    let mut action = actions.pop().expect("dispatched action");
+    let stale_token = action.delivery_token;
+    database.requeue_action(action.id).await?;
+    let mut redispatched = database.dispatch_actions(1).await?;
+    action = redispatched.pop().expect("redispatched action");
+    let fresh_token = action.delivery_token;
+
+    let stale_record = CompletionRecord {
+        action_id: action.id,
+        success: true,
+        delivery_id: 1,
+        result_payload: Vec::new(),
+        dispatch_token: Some(stale_token),
+    };
+    database.mark_actions_batch(&[stale_record]).await?;
+    let row = sqlx::query!(
+        "SELECT status, result_payload FROM daemon_action_ledger WHERE id = $1",
+        action.id
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(row.status, "dispatched");
+    assert!(row.result_payload.is_none());
+
+    let mut result_args = proto::WorkflowArguments {
+        arguments: Vec::new(),
+    };
+    result_args.arguments.push(proto::WorkflowArgument {
+        key: "result".to_string(),
+        value: Some(proto::WorkflowArgumentValue {
+            kind: Some(proto::workflow_argument_value::Kind::Primitive(
+                proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
+                        "ok".to_string(),
+                    )),
+                },
+            )),
+        }),
+    });
+    let valid_record = CompletionRecord {
+        action_id: action.id,
+        success: true,
+        delivery_id: 2,
+        result_payload: result_args.encode_to_vec(),
+        dispatch_token: Some(fresh_token),
+    };
+    database.mark_actions_batch(&[valid_record]).await?;
+    let row = sqlx::query!(
+        "SELECT status, result_payload FROM daemon_action_ledger WHERE id = $1",
+        action.id
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(row.status, "completed");
+    assert!(row.result_payload.is_some());
+    Ok(())
+}
+
 static TEST_SERIAL_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));

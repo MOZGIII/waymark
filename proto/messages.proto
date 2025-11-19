@@ -30,6 +30,7 @@ message ActionDispatch {
   optional uint32 timeout_seconds = 5;
   optional uint32 max_retries = 6;
   optional uint32 attempt_number = 7;
+  optional string dispatch_token = 8;
 }
 
 message ActionResult {
@@ -38,6 +39,7 @@ message ActionResult {
   WorkflowArguments payload = 3;
   uint64 worker_start_ns = 4;
   uint64 worker_end_ns = 5;
+  optional string dispatch_token = 6;
 }
 
 message Ack {

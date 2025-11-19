@@ -4,7 +4,8 @@ ALTER TABLE daemon_action_ledger
     ADD COLUMN timeout_seconds INTEGER NOT NULL DEFAULT 300,
     ADD COLUMN last_error TEXT,
     ADD COLUMN deadline_at TIMESTAMPTZ,
-    ADD COLUMN scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+    ADD COLUMN scheduled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ADD COLUMN delivery_token UUID;
 
 CREATE INDEX IF NOT EXISTS idx_action_deadline
     ON daemon_action_ledger (deadline_at)

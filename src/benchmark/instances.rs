@@ -170,6 +170,7 @@ impl WorkflowBenchmarkHarness {
                         timeout_seconds: action.timeout_seconds,
                         max_retries: action.max_retries,
                         attempt_number: action.attempt_number,
+                        dispatch_token: action.delivery_token,
                     };
                     let worker = self.workers.next_worker();
                     let span = tracing::debug_span!(
@@ -192,6 +193,7 @@ impl WorkflowBenchmarkHarness {
                         success: metrics.success,
                         delivery_id: metrics.delivery_id,
                         result_payload: metrics.response_payload.clone(),
+                        dispatch_token: metrics.dispatch_token,
                     };
                     if let Err(err) = self.completion_tx.send(record).await {
                         warn!(?err, "completion channel closed");

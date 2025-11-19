@@ -118,6 +118,8 @@ async def _handle_dispatch(
         worker_end_ns=worker_end,
     )
     response.payload.CopyFrom(response_payload)
+    if dispatch.dispatch_token:
+        response.dispatch_token = dispatch.dispatch_token
     response_envelope = pb2.Envelope(
         delivery_id=envelope.delivery_id,
         partition_id=envelope.partition_id,
