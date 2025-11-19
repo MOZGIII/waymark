@@ -246,14 +246,21 @@ class RegisterWorkflowRequest(_ProtoMessage):
     registration: WorkflowRegistration
 
 class RegisterWorkflowResponse(_ProtoMessage):
-    def __init__(self, workflow_version_id: str = ...) -> None: ...
+    def __init__(
+        self,
+        workflow_version_id: str = ...,
+        workflow_instance_id: str = ...,
+    ) -> None: ...
     workflow_version_id: str
+    workflow_instance_id: str
 
 class WaitForInstanceRequest(_ProtoMessage):
     def __init__(
         self,
+        instance_id: str = ...,
         poll_interval_secs: float = ...,
     ) -> None: ...
+    instance_id: str
     poll_interval_secs: float
 
 class WaitForInstanceResponse(_ProtoMessage):
