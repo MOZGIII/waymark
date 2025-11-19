@@ -13,7 +13,6 @@ struct Options {
     payload_size: usize,
     concurrency: usize,
     worker_count: usize,
-    partition_id: i32,
     log_interval_secs: Option<u64>,
 }
 
@@ -25,7 +24,6 @@ impl Default for Options {
             payload_size: 1024,
             concurrency: 32,
             worker_count: 1,
-            partition_id: 0,
             log_interval_secs: Some(30),
         }
     }
@@ -67,12 +65,6 @@ impl Options {
                         .ok_or_else(|| anyhow!("--workers requires a value"))?;
                     opts.worker_count = value.parse()?;
                 }
-                "--partition" => {
-                    let value = args
-                        .next()
-                        .ok_or_else(|| anyhow!("--partition requires a value"))?;
-                    opts.partition_id = value.parse()?;
-                }
                 "--log-interval" => {
                     let value = args
                         .next()
@@ -93,7 +85,7 @@ impl Options {
 
 fn print_usage() {
     println!(
-        "Usage: cargo run --bin bench_instances -- [--instances N] [--batch-size N] [--payload-size BYTES] [--concurrency N] [--workers N] [--partition ID] [--log-interval SECONDS]"
+        "Usage: cargo run --bin bench_instances -- [--instances N] [--batch-size N] [--payload-size BYTES] [--concurrency N] [--workers N] [--log-interval SECONDS]"
     );
 }
 
@@ -104,10 +96,7 @@ async fn main() -> Result<()> {
     let app_config = AppConfig::load()?;
     info!(?options, "starting workflow benchmark");
     let database = Database::connect(&app_config.database_url).await?;
-    let worker_config = PythonWorkerConfig {
-        partition_id: options.partition_id as u32,
-        ..PythonWorkerConfig::default()
-    };
+    let worker_config = PythonWorkerConfig::default();
     let harness = WorkflowBenchmarkHarness::new(
         &app_config.database_url,
         database,
@@ -121,7 +110,6 @@ async fn main() -> Result<()> {
         in_flight: options.concurrency,
         batch_size: options.batch_size,
         payload_size: options.payload_size,
-        partition_id: options.partition_id,
         progress_interval: options.log_interval_secs.map(Duration::from_secs),
     };
 

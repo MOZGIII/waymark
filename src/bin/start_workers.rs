@@ -14,11 +14,9 @@ async fn main() -> Result<()> {
     let app_config = AppConfig::load()?;
     let worker_settings = app_config.worker.clone();
     let worker_count = worker_settings.worker_count.max(1);
-    let partition_id = worker_settings.partition_id;
     let database = Arc::new(Database::connect(&app_config.database_url).await?);
 
     let mut config = PythonWorkerConfig {
-        partition_id: partition_id as u32,
         ..PythonWorkerConfig::default()
     };
     if let Some(module) = worker_settings.user_module.clone() {
@@ -30,7 +28,6 @@ async fn main() -> Result<()> {
         Arc::new(PythonWorkerPool::new(config, worker_count, Arc::clone(&worker_server)).await?);
 
     let polling_config = PollingConfig {
-        partition_id,
         poll_interval: worker_settings.poll_interval,
         batch_size: worker_settings.batch_size,
         max_concurrent: worker_count.max(1) * 2,
@@ -39,7 +36,6 @@ async fn main() -> Result<()> {
         PollingDispatcher::start(polling_config, Arc::clone(&database), Arc::clone(&pool));
     info!(
         worker_count,
-        partition_id,
         poll_interval_ms = worker_settings.poll_interval.as_millis(),
         batch_size = worker_settings.batch_size,
         "python worker pool started - waiting for shutdown signal"

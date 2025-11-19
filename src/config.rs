@@ -14,7 +14,6 @@ const HTTP_ADDR_ENV: &str = "CARABINER_HTTP_ADDR";
 const GRPC_ADDR_ENV: &str = "CARABINER_GRPC_ADDR";
 const WORKER_COUNT_ENV: &str = "CARABINER_WORKER_COUNT";
 const WORKER_USER_MODULE_ENV: &str = "CARABINER_USER_MODULE";
-const WORKER_PARTITION_ENV: &str = "CARABINER_PARTITION_ID";
 const WORKER_POLL_INTERVAL_ENV: &str = "CARABINER_POLL_INTERVAL_MS";
 const WORKER_BATCH_SIZE_ENV: &str = "CARABINER_BATCH_SIZE";
 
@@ -30,7 +29,6 @@ pub struct AppConfig {
 pub struct WorkerRuntimeConfig {
     pub worker_count: usize,
     pub user_module: Option<String>,
-    pub partition_id: i32,
     pub poll_interval: Duration,
     pub batch_size: i64,
 }
@@ -111,20 +109,6 @@ impl WorkerRuntimeConfig {
             }
             Err(_) => num_cpus::get().max(1),
         };
-        let partition_id = match env::var(WORKER_PARTITION_ENV) {
-            Ok(raw) => {
-                let parsed = raw
-                    .parse::<i32>()
-                    .with_context(|| format!("{WORKER_PARTITION_ENV} must be an integer"))?;
-                if parsed < 0 {
-                    return Err(anyhow!(
-                        "{WORKER_PARTITION_ENV} must be non-negative when provided"
-                    ));
-                }
-                parsed
-            }
-            Err(_) => 0,
-        };
         let poll_interval_ms = match env::var(WORKER_POLL_INTERVAL_ENV) {
             Ok(raw) => {
                 let parsed = raw.parse::<u64>().with_context(|| {
@@ -156,7 +140,6 @@ impl WorkerRuntimeConfig {
         Ok(Self {
             worker_count,
             user_module: env::var(WORKER_USER_MODULE_ENV).ok(),
-            partition_id,
             poll_interval: Duration::from_millis(poll_interval_ms),
             batch_size,
         })

@@ -29,7 +29,6 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct PythonWorkerConfig {
     pub script_path: PathBuf,
-    pub partition_id: u32,
     pub user_module: String,
     pub extra_python_paths: Vec<PathBuf>,
 }
@@ -38,7 +37,6 @@ impl Default for PythonWorkerConfig {
     fn default() -> Self {
         Self {
             script_path: PathBuf::from("carabiner-worker"),
-            partition_id: 0,
             user_module: "fixtures.benchmark_actions".to_string(),
             extra_python_paths: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")],
         }
@@ -85,7 +83,6 @@ pub struct PythonWorker {
     sender: mpsc::Sender<proto::Envelope>,
     shared: Arc<Mutex<SharedState>>,
     next_delivery: AtomicU64,
-    partition_id: u32,
     reader_handle: Option<JoinHandle<()>>,
 }
 
@@ -172,7 +169,6 @@ impl PythonWorker {
             sender: to_worker,
             shared,
             next_delivery: AtomicU64::new(1),
-            partition_id: config.partition_id,
             reader_handle: Some(reader_handle),
         })
     }
@@ -215,7 +211,7 @@ impl PythonWorker {
 
         let envelope = proto::Envelope {
             delivery_id,
-            partition_id: self.partition_id,
+            partition_id: 0,
             kind: proto::MessageKind::ActionDispatch as i32,
             payload: messages::encode_message(&command),
         };

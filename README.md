@@ -108,7 +108,6 @@ The main carabiner configuration is done through env vars, which is what you'll 
 | `CARABINER_GRPC_ADDR` | Optional gRPC bind address for `carabiner-server` | `0.0.0.0:24118` |
 | `CARABINER_WORKER_COUNT` | Override number of Python workers spawned by `start_workers` | `8` |
 | `CARABINER_USER_MODULE` | Python module preloaded into each worker process | `my_app.actions` |
-| `CARABINER_PARTITION_ID` | Partition ID serviced by this worker node | `0` |
 | `CARABINER_POLL_INTERVAL_MS` | Poll interval for the dispatch loop (ms) | `100` |
 | `CARABINER_BATCH_SIZE` | Max actions fetched per poll | `100` |
 
@@ -180,7 +179,6 @@ $ cargo run --bin bench -- \
   --concurrency 64 \
   --workers 4 \
   --log-interval 15 \
-  --partition 0 | \
   uv run python/tools/parse_bench_logs.py
 ```
 

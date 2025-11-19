@@ -19,7 +19,6 @@ const COMPLETION_FLUSH_INTERVAL_MS: u64 = 50;
 
 #[derive(Clone, Debug)]
 pub struct PollingConfig {
-    pub partition_id: i32,
     pub poll_interval: Duration,
     pub batch_size: i64,
     pub max_concurrent: usize,
@@ -28,7 +27,6 @@ pub struct PollingConfig {
 impl Default for PollingConfig {
     fn default() -> Self {
         Self {
-            partition_id: 0,
             poll_interval: Duration::from_millis(100),
             batch_size: 100,
             max_concurrent: num_cpus::get().max(1) * 2,
@@ -91,7 +89,6 @@ struct DispatcherTask {
 impl DispatcherTask {
     async fn run(mut self) -> Result<()> {
         info!(
-            partition_id = self.config.partition_id,
             poll_interval_ms = self.config.poll_interval.as_millis(),
             batch_size = self.config.batch_size,
             max_concurrent = self.config.max_concurrent,
@@ -161,20 +158,13 @@ impl DispatcherTask {
         }
         let limit = available.min(self.config.batch_size.max(1) as usize).max(1) as i64;
 
-        let actions = self
-            .database
-            .dispatch_actions(self.config.partition_id, limit)
-            .await?;
+        let actions = self.database.dispatch_actions(limit).await?;
 
         if actions.is_empty() {
             return Ok(());
         }
 
-        debug!(
-            partition_id = self.config.partition_id,
-            count = actions.len(),
-            "dispatching actions",
-        );
+        debug!(count = actions.len(), "dispatching actions");
 
         for action in actions {
             let permit = semaphore.clone().acquire_owned().await?;
@@ -306,7 +296,6 @@ mod tests {
     #[test]
     fn default_config_values() {
         let config = PollingConfig::default();
-        assert_eq!(config.partition_id, 0);
         assert_eq!(config.poll_interval, std::time::Duration::from_millis(100));
         assert_eq!(config.batch_size, 100);
         assert_eq!(config.max_concurrent, num_cpus::get().max(1) * 2);

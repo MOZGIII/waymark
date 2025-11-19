@@ -24,12 +24,12 @@ The server receives these completed actions and uses them to increment a state m
 The `start_workers` binary polls for the work to be done. Launch this a single
 time for each worker node you have in your cluster. Worker processes read their
 configuration from `DATABASE_URL` plus optional `CARABINER_*` environment
-variables (partition ID, poll interval, batch size, worker count, etc.) so the
-loop can be tuned per deployment without CLI flags. The dispatcher shares a
-single `Database` handle with the worker bridge, repeatedly calls
-`dispatch_actions()` for the configured partition, and streams the resulting
-payloads through the round-robin worker pool. Workers still have no direct
-database access – they only handle gRPC traffic from the dispatcher.
+variables (poll interval, batch size, worker count, etc.) so the loop can be
+tuned per deployment without CLI flags. The dispatcher shares a single
+`Database` handle with the worker bridge, repeatedly calls `dispatch_actions()`
+to dequeue pending actions, and streams the resulting payloads through the
+round-robin worker pool. Workers still have no direct database access – they
+only handle gRPC traffic from the dispatcher.
 
 ```
 +-------------------+       poll queued actions        +---------------------+
@@ -55,5 +55,5 @@ Tuning notes:
   in-flight buffering to keep workers busy without unbounded task spawning.
 
 The dispatcher automatically handles completion batching and graceful
-shutdowns so a single host can service an entire partition with one outbound
+shutdowns so a single host can service the entire queue with one outbound
 connection.
