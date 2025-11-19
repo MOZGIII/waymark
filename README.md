@@ -1,4 +1,6 @@
-# carabiner
+# rappel
+
+![Rappel Logo](https://raw.githubusercontent.com/piercefreeman/rappel/main/media/header.png)
 
 carabiner is a library to let you build durable background tasks that withstand device restarts, task crashes, and long-running jobs. It's built for Python and Postgres without any additional deploy time requirements.
 

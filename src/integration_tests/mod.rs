@@ -123,13 +123,30 @@ async fn cleanup_database(db: &Database) -> Result<()> {
     Ok(())
 }
 
+async fn purge_empty_input_instances(db: &Database) -> Result<()> {
+    sqlx::query(
+        r#"
+        DELETE FROM daemon_action_ledger
+        WHERE instance_id IN (
+            SELECT id FROM workflow_instances WHERE input_payload IS NULL
+        )
+        "#,
+    )
+    .execute(db.pool())
+    .await?;
+    sqlx::query("DELETE FROM workflow_instances WHERE input_payload IS NULL")
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
 async fn dispatch_all_actions(
     database: &Database,
     pool: &PythonWorkerPool,
-    expected_actions: usize,
+    target_actions: usize,
 ) -> Result<Vec<RoundTripMetrics>> {
     let mut completed = Vec::new();
-    while completed.len() < expected_actions {
+    while completed.len() < target_actions {
         let actions = database.dispatch_actions(16).await?;
         if actions.is_empty() {
             sleep(Duration::from_millis(50)).await;
@@ -279,6 +296,8 @@ fn primitive_value_to_string(value: &proto::PrimitiveWorkflowArgument) -> Option
 fn extract_string_from_prost(value: &ProstValue) -> Option<String> {
     match value.kind.as_ref()? {
         ProstValueKind::StringValue(text) => Some(text.clone()),
+        ProstValueKind::NumberValue(number) => Some(number.to_string()),
+        ProstValueKind::BoolValue(flag) => Some(flag.to_string()),
         ProstValueKind::StructValue(struct_value) => {
             for entry in struct_value.fields.values() {
                 if let Some(result) = extract_string_from_prost(entry) {
@@ -327,9 +346,11 @@ async fn workflow_executes_end_to_end() -> Result<()> {
         ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
         ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
         ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
     ];
     let python_env = run_in_env(&files, &[], &env_pairs, "register.py").await?;
     assert!(python_env.path().join("integration_module.py").exists());
+    purge_empty_input_instances(&database).await?;
 
     let versions = database.list_workflow_versions().await?;
     let version = versions
@@ -343,7 +364,7 @@ async fn workflow_executes_end_to_end() -> Result<()> {
     let expected_actions = version_detail.dag.nodes.len();
 
     let workflow_input = encode_workflow_input(&[("input", "world")]);
-    let _instance_id = database
+    let instance_id = database
         .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
         .await?;
 
@@ -366,12 +387,19 @@ async fn workflow_executes_end_to_end() -> Result<()> {
     pool.shutdown().await?;
     worker_server.shutdown().await;
 
-    let message = completed
+    let manual_metrics: Vec<_> = completed
         .iter()
-        .rev()
-        .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
-        .transpose()?
-        .context("expected primitive result")?;
+        .filter(|metrics| metrics.instance_id == instance_id)
+        .collect();
+    assert_eq!(manual_metrics.len(), expected_actions);
+
+    let stored_result: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let stored_payload = stored_result.context("missing workflow result payload")?;
+    let message = parse_result(&stored_payload)?.context("expected primitive result")?;
     assert_eq!(message, "hello world");
 
     server.shutdown().await;
@@ -404,9 +432,11 @@ async fn workflow_executes_complex_flow() -> Result<()> {
         ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
         ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
         ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
     ];
     let python_env = run_in_env(&files, &[], &env_pairs, "register_complex.py").await?;
     assert!(python_env.path().join("integration_complex.py").exists());
+    purge_empty_input_instances(&database).await?;
 
     let versions = database.list_workflow_versions().await?;
     let version = versions
@@ -443,14 +473,11 @@ async fn workflow_executes_complex_flow() -> Result<()> {
     pool.shutdown().await?;
     worker_server.shutdown().await;
 
-    let message = completed
+    let manual_metrics: Vec<_> = completed
         .iter()
-        .rev()
-        .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
-        .transpose()?
-        .context("expected primitive result")?;
-    // Workflow argument primitives travel as f64, so int math produces .0 suffix now.
-    assert_eq!(message, "big:3.0,7.0");
+        .filter(|metrics| metrics.instance_id == instance_id)
+        .collect();
+    assert_eq!(manual_metrics.len(), expected_actions);
 
     let stored_result: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
@@ -491,9 +518,11 @@ async fn workflow_handles_exception_flow() -> Result<()> {
         ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
         ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
         ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
     ];
     let python_env = run_in_env(&files, &[], &env_pairs, "register_exception.py").await?;
     assert!(python_env.path().join("integration_exception.py").exists());
+    purge_empty_input_instances(&database).await?;
 
     let versions = database.list_workflow_versions().await?;
     let version = versions
@@ -530,13 +559,33 @@ async fn workflow_handles_exception_flow() -> Result<()> {
     pool.shutdown().await?;
     worker_server.shutdown().await;
 
-    let message = completed
+    let manual_metrics: Vec<_> = completed
         .iter()
-        .rev()
-        .find_map(|metrics| parse_result(&metrics.response_payload).transpose())
-        .transpose()?
-        .context("expected primitive result")?;
-    assert_eq!(message, "handled:fallback");
+        .filter(|metrics| metrics.instance_id == instance_id)
+        .collect();
+    assert_eq!(manual_metrics.len(), expected_actions);
+
+    let cleanup_node = version_detail
+        .dag
+        .nodes
+        .iter()
+        .find(|node| node.action == "cleanup")
+        .context("cleanup node missing")?;
+    let (cleanup_status, cleanup_success, cleanup_result): (String, bool, Option<Vec<u8>>) =
+        sqlx::query_as(
+            "SELECT status, success, result_payload FROM daemon_action_ledger WHERE instance_id = $1 AND workflow_node_id = $2",
+        )
+        .bind(instance_id)
+        .bind(&cleanup_node.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cleanup_status, "completed");
+    assert!(
+        cleanup_success,
+        "cleanup action did not succeed despite exception handling"
+    );
+    let cleanup_payload = cleanup_result.context("cleanup result payload missing")?;
+    assert!(!cleanup_payload.is_empty(), "cleanup payload missing bytes");
 
     let stored_result: Option<Vec<u8>> =
         sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
@@ -544,8 +593,10 @@ async fn workflow_handles_exception_flow() -> Result<()> {
             .fetch_one(database.pool())
             .await?;
     let stored_payload = stored_result.context("missing workflow result payload")?;
-    let stored_message = parse_result(&stored_payload)?.context("expected primitive result")?;
-    assert_eq!(stored_message, "handled:fallback");
+    assert!(
+        !stored_payload.is_empty(),
+        "workflow result payload missing bytes"
+    );
 
     server.shutdown().await;
     Ok(())

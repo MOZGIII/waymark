@@ -1312,16 +1312,43 @@ impl Database {
 mod tests {
     use super::*;
     use prost::Message;
-    use sqlx::PgPool;
+    use sqlx::{PgPool, postgres::PgPoolOptions};
+
+    async fn setup_test_pool() -> Result<Option<PgPool>> {
+        let _ = dotenvy::dotenv();
+        let database_url = match std::env::var("DATABASE_URL") {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping db tests: DATABASE_URL not set");
+                return Ok(None);
+            }
+        };
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
+        Ok(Some(pool))
+    }
+
+    async fn reset_tables(pool: &PgPool) -> Result<()> {
+        sqlx::query("TRUNCATE daemon_action_ledger, workflow_instances, workflow_versions CASCADE")
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
 
     fn encode_error_payload(message: &str) -> Vec<u8> {
         encode_exception_payload("RuntimeError", "tests", message)
     }
 
-    #[sqlx::test]
-    async fn explicit_failure_does_not_retry_by_default(pool: PgPool) -> Result<()> {
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        let database = Database { pool };
+    #[tokio::test]
+    async fn explicit_failure_does_not_retry_by_default() -> Result<()> {
+        let Some(pool) = setup_test_pool().await? else {
+            return Ok(());
+        };
+        reset_tables(&pool).await?;
+        let database = Database { pool: pool.clone() };
         let dispatch = proto::WorkflowNodeDispatch {
             node: None,
             workflow_input: None,
@@ -1349,10 +1376,13 @@ mod tests {
         Ok(())
     }
 
-    #[sqlx::test]
-    async fn timeout_retries_are_unbounded_by_default(pool: PgPool) -> Result<()> {
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        let database = Database { pool };
+    #[tokio::test]
+    async fn timeout_retries_are_unbounded_by_default() -> Result<()> {
+        let Some(pool) = setup_test_pool().await? else {
+            return Ok(());
+        };
+        reset_tables(&pool).await?;
+        let database = Database { pool: pool.clone() };
         let dispatch = proto::WorkflowNodeDispatch {
             node: None,
             workflow_input: None,

@@ -375,6 +375,12 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         payload = cls._build_registration_payload()
         run_result = await bridge.run_instance(payload.SerializeToString())
         cls._workflow_version_id = run_result.workflow_version_id
+        if _skip_wait_for_instance():
+            logger.info(
+                "Skipping wait_for_instance for workflow %s due to CARABINER_SKIP_WAIT_FOR_INSTANCE",
+                cls.short_name(),
+            )
+            return None
         result_bytes = await bridge.wait_for_instance(
             instance_id=run_result.workflow_instance_id,
             poll_interval_secs=1.0,
@@ -398,3 +404,10 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
 
 def _running_under_pytest() -> bool:
     return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+
+def _skip_wait_for_instance() -> bool:
+    value = os.environ.get("CARABINER_SKIP_WAIT_FOR_INSTANCE")
+    if not value:
+        return False
+    return value.strip().lower() not in {"0", "false", "no"}
