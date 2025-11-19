@@ -567,7 +567,7 @@ impl Database {
     ) -> Result<Vec<LedgerAction>> {
         let span = tracing::info_span!("db.dispatch_actions", partition_id, limit);
         let _guard = span.enter();
-        let records = sqlx::query_as::<_, LedgerAction>(
+        let result = sqlx::query_as::<_, LedgerAction>(
             r#"
             WITH next_actions AS (
                 SELECT id
@@ -593,8 +593,37 @@ impl Database {
         .bind(partition_id)
         .bind(limit)
         .fetch_all(&self.pool)
+        .await;
+        match result {
+            Ok(records) => {
+                if !records.is_empty() {
+                    metrics::counter!("carabiner_actions_dispatched_total")
+                        .increment(records.len() as u64);
+                }
+                Ok(records)
+            }
+            Err(err) => {
+                metrics::counter!("carabiner_dispatch_errors_total").increment(1);
+                Err(err.into())
+            }
+        }
+    }
+
+    pub async fn requeue_action(&self, action_id: LedgerActionId) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE daemon_action_ledger
+            SET status = 'queued',
+                dispatched_at = NULL,
+                acked_at = NULL,
+                delivery_id = NULL
+            WHERE id = $1
+            "#,
+        )
+        .bind(action_id)
+        .execute(&self.pool)
         .await?;
-        Ok(records)
+        Ok(())
     }
 
     pub async fn mark_actions_batch(&self, records: &[CompletionRecord]) -> Result<()> {

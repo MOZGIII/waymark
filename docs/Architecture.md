@@ -18,3 +18,42 @@ On a separate machine, the carabiner-rs is running in `worker` mode. Unlike our 
 carabiner-rs polls the database centrally so we only need 1 connection per host machine. It finds actions that haven't yet been completed and distributes them to the connected grpc worker clients. The clients read these jobs, import the necessary modules with `importlib` since we should be running in a virtualenv that has the user packages installed, runs the logic, and sends the results back to grpc.
 
 The server receives these completed actions and uses them to increment a state machine build off of the workflow DAG. This state machine determines if any other actions have been "unlocked" by the completion of this action, or if we need to wait for subsequent actions. If they have been unlocked we will insert them into the database for subsequent queuing. The cycle continues until we have a final result that can be set as the output of the full workflow instance. At that point we can wake up any waiting callers.
+
+## Workers
+
+The `start_workers` binary polls for the work to be done. Launch this a single
+time for each worker node you have in your cluster. Worker processes read their
+configuration from `DATABASE_URL` plus optional `CARABINER_*` environment
+variables (partition ID, poll interval, batch size, worker count, etc.) so the
+loop can be tuned per deployment without CLI flags. The dispatcher shares a
+single `Database` handle with the worker bridge, repeatedly calls
+`dispatch_actions()` for the configured partition, and streams the resulting
+payloads through the round-robin worker pool. Workers still have no direct
+database access – they only handle gRPC traffic from the dispatcher.
+
+```
++-------------------+       poll queued actions        +---------------------+
+| Polling Dispatcher| -------------------------------->| PostgreSQL Ledger   |
++-------------------+                                  +---------------------+
+          |                                                      |
+          | dispatch via bridge                                  |
+          v                                                      v
++-------------------+   bidirectional gRPC   +-------------------------+
+| PythonWorkerPool  | <--------------------> | Python Worker Processes |
++-------------------+                        +-------------------------+
+```
+
+Tuning notes:
+
+- `poll_interval_ms` balances latency and database load. The 100ms default
+  yields at most 10 queries per second per worker process while keeping queued
+  actions responsive.
+- `batch_size` controls how many dequeued actions get fanned out per poll. 100
+  gives ~1000 actions/second at the default interval without overwhelming the
+  worker pool.
+- `max_concurrent` dispatches default to `workers * 2`, providing enough
+  in-flight buffering to keep workers busy without unbounded task spawning.
+
+The dispatcher automatically handles completion batching and graceful
+shutdowns so a single host can service an entire partition with one outbound
+connection.
