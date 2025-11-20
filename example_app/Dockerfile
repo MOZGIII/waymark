@@ -42,8 +42,6 @@ COPY --from=wheel-builder /repo/target/wheels /tmp/wheels
 RUN set -eux; wheel=$(ls /tmp/wheels/rappel-*.whl | head -n 1); uv pip install --no-cache-dir "$wheel"
 RUN uv pip install --no-cache-dir ".[tests]"
 
-RUN chmod +x scripts/start-daemons.sh
-
 ENV CARABINER_HTTP_PORT=24117 \
     CARABINER_GRPC_PORT=24118
 

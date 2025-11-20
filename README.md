@@ -9,16 +9,15 @@ rappel is a library to let you build durable background tasks that withstand dev
 An example is worth a thousand words. Here's how you define your workflow:
 
 ```python
-from dataclasses import dataclass
-from typing import List
+from rappel import Workflow, action
 from myapp.models import User, GreetingSummary
-
+from myapp.db import my_db
 
 class GreetingWorkflow(Workflow):
     def __init__(self, user_id: str):
         self.user_id = user_id
 
-    async def run(self) -> GreetingSummary:
+    async def run(self):
         user = await fetch_user(self.user_id)      # first action
         summary = await build_greetings(user)      # second action, chained
         return summary
@@ -35,12 +34,12 @@ async def fetch_user(user_id: str) -> User:
 @action
 async def build_greetings(user: User) -> GreetingSummary:
     messages: List[str] = []
-    for topic in user.interests:        # loop + dot syntax on action result
+    for topic in user.interests:
         messages.append(f"Hi {user.name}, let's talk about {topic}!")
     return GreetingSummary(user=user, messages=messages)
 ```
 
-Your webserver wants to greet some user but do it (1) asynchronously and (2) guarantees this happens even if your webapp crashes. When you call `await workflow.run()` from within your code we'll queue up this work in Postgres; none of the workflow logic is actually executed inline within your webserver. Instead we parse the AST definition to determine your control flow: we'll identify that `fetch_user` and `build_greetings` are decorated with `@action` and depend on the outputs of the another. We will call them in sequence, passing the data as necessary, on whatever background machines are able to handle more work. When the `summary` is returned to your original webapp caller it looks like everything just happened right in the same process. Whereas the actual code was orchestrated across multiple different machines.
+Your webserver wants to greet some user but do it (1) asynchronously and (2) guarantee this happens even if your webapp crashes. When you call `await workflow.run()` from within your code we'll queue up this work in Postgres; none of the workflow logic is actually executed inline within your webserver. Instead we parse the AST definition to determine your control flow: we'll identify that `fetch_user` and `build_greetings` are decorated with `@action` and depend on the outputs of the another. We will call them in sequence, passing the data as necessary, on whatever background machines are able to handle more work. When the `summary` is returned to your original webapp caller it looks like everything just happened right in the same process. Whereas the actual code was orchestrated across multiple different machines.
 
 Actions are the distributed work that your system does: these are the parallelism primitives that can be retired, throw errors independently, etc.
 
@@ -130,7 +129,13 @@ By default we will only try explicit actions one time if there is an explicit ex
 
 ## Project Status
 
-Rappel is in an early alpha.
+Rappel is in an early alpha. Particular areas of focus include:
+
+1. Extending AST parsing logic to handle most core control flows
+1. Performance tuning
+1. Unit and integration tests
+
+If you have a particular workflow that you think should be reported but isn't yet producing the correct DAG (you can visualize it via CLI by `.visualize()`) please file a ticket.
 
 ## Configuration
 
@@ -165,17 +170,17 @@ Nothing on the market provides this balance - `rappel` aims to try. We don't exp
 **When should you use Rappel?**
 
 - You're already using Python & Postgres for the core of your stack, either with Mountaineer or FastAPI
-- You have a lot of async heavy logic that needs to be durable and can be retried (3rd party API calls, db jobs, etc)
+- You have a lot of async heavy logic that needs to be durable and can be retried if it fails (common with 3rd party API calls, db jobs, etc)
 - You want something that works the same locally as when deployed remotely
 - You want background job code to plug and play with your existing unit test & static analysis stack
 - You are focused on getting to product market fit versus scale
 
-Performance is a top priority of rappel. That's why it's written with a Rust core, is lightweight on your database connection by minimizing connections to ~1 per machine host, and runs continuous benchmarks on CI. But still - there's only so much we can do with Postgres as our backing store. And that's okay! Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
+Performance is a top priority of rappel. That's why it's written with a Rust core, is lightweight on your database connection by minimizing connections to ~1 per machine host, and runs continuous benchmarks on CI. But it's not the _only_ priority. After all there's only so much we can do with Postgres as an ACID backing store. Once you start to tax Postgres' capabilities you're probably at the scale where you should switch to a more complicated architecture.
 
 **When shouldn't you?**
 
 - You have particularly latency sensitive background jobs, where you need <100ms acknowledgement and handling of each task.
-- You have a huge scale of concurrent background jobs, order of magnitude >50k actions being coordinated at the same time.
+- You have a huge scale of concurrent background jobs, order of magnitude >10k actions being coordinated concurrently.
 - You have tried some existing task coordinators and need to scale your solution to the next 10x worth of traffic.
 
 There is no shortage of robust background queues in Python, including ones that scale to millions of requests a second:
@@ -184,7 +189,7 @@ There is no shortage of robust background queues in Python, including ones that 
 2. Celery/RabbitMQ
 3. Redis
 
-Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs but can get complex as you need to performance tune it for production. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs.
+Almost all of these require a dedicated task broker that you host alongside your app. This usually isn't a huge deal during POCs but can get complex as you need to performance tune it for production. Cloud hosting of most of these are billed per-event and can get very expensive depending on how you orchestrate your jobs. They also typically force you to migrate your logic to fit the conventions of the framework.
 
 Open source solutions like RabbitMQ have been battle tested over decades & large companies like Temporal are able to throw a lot of resources towards optimization. Both of these solutions are great choices - just intended to solve for different scopes. Expect an associated higher amount of setup and management complexity.
 
