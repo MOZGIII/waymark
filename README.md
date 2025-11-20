@@ -55,13 +55,13 @@ Workflows can get much more complex than the example above:
     from datetime import timedelta
 
     async def run(self):
-      await self.run_action(
-        inconsistent_action(0.5),
-        # control handling of failures
-        retry=RetryPolicy(attempts=50),
-        backoff=BackoffPolicy(base_delay=5),
-        timeout=timedelta(minutes=10)
-      )
+        await self.run_action(
+            inconsistent_action(0.5),
+            # control handling of failures
+            retry=RetryPolicy(attempts=50),
+            backoff=BackoffPolicy(base_delay=5),
+            timeout=timedelta(minutes=10)
+        )
     ```
 
 1. Branching control flows
@@ -70,11 +70,11 @@ Workflows can get much more complex than the example above:
 
     ```python
     async def run(self, user_id: str) -> Summary:
-      # loop + non-action helper call
-      top_spenders: list[float] = []
-      for record in summary.transactions.records:
-          if _is_high_value(record):
-              top_spenders.append(record.amount)
+        # loop + non-action helper call
+        top_spenders: list[float] = []
+        for record in summary.transactions.records:
+            if _is_high_value(record):
+                top_spenders.append(record.amount)
     ```
 
 1. asyncio primitives
