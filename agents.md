@@ -9,6 +9,9 @@
 ## Workflow Conventions
 
 - NEVER modify the protobuf python files directly, instead modify the base messages if you have to and run `make build-proto`
+- When defining Workflow classes, pass arguments directly to the `run()` method, NOT to `__init__()`. The workflow decorator automatically handles serialization and deserialization of run() arguments.
+  - Correct: `async def run(self, user_id: str) -> Result:`
+  - Incorrect: `def __init__(self, user_id: str):` with `self.user_id = user_id`
 
 ## Unit Tests
 

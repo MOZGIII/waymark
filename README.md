@@ -14,11 +14,8 @@ from myapp.models import User, GreetingSummary
 from myapp.db import my_db
 
 class GreetingWorkflow(Workflow):
-    def __init__(self, user_id: str):
-        self.user_id = user_id
-
-    async def run(self):
-        user = await fetch_user(self.user_id)      # first action
+    async def run(self, user_id: str):
+        user = await fetch_user(user_id)      # first action
         summary = await build_greetings(user)      # second action, chained
         return summary
 ```
@@ -71,7 +68,7 @@ Workflows can get much more complex than the example above:
     Use if statements, for loops, or any other Python primitives within the control logic. We will automatically detect these branches and compile them into a DAG node that gets executed just like your other actions.
 
     ```python
-    async def run(self) -> Summary:
+    async def run(self, user_id: str) -> Summary:
       # loop + non-action helper call
       top_spenders: list[float] = []
       for record in summary.transactions.records:
@@ -86,18 +83,18 @@ Workflows can get much more complex than the example above:
     ```python
     from asyncio import gather, sleep
 
-    async def run(self) -> Summary:
+    async def run(self, user_id: str) -> Summary:
         # parallelize independent actions with gather
         profile, settings, history = await gather(
-            fetch_profile(user_id=self.user_id),
-            fetch_settings(user_id=self.user_id),
-            fetch_purchase_history(user_id=self.user_id)
+            fetch_profile(user_id=user_id),
+            fetch_settings(user_id=user_id),
+            fetch_purchase_history(user_id=user_id)
         )
-        
+
         # wait before sending email
         await sleep(24*60*60)
         recommendations = await email_ping(history)
-        
+
         return Summary(profile=profile, settings=settings, recommendations=recommendations)
     ```
 
@@ -108,10 +105,10 @@ Workflows can get much more complex than the example above:
     ```python
     from myapp.helpers import _format_currency
 
-    async def run(self) -> Summary:
+    async def run(self, user_id: str) -> Summary:
         # actions related to one another
-        profile = await fetch_profile(user_id=self.user_id)
-        txns = await load_transactions(user_id=self.user_id)
+        profile = await fetch_profile(user_id=user_id)
+        txns = await load_transactions(user_id=user_id)
         summary = await compute_summary(profile=profile, txns=txns)
 
         # helper functions
