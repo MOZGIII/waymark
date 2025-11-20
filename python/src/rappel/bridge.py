@@ -4,8 +4,10 @@ import asyncio
 import os
 import shlex
 import subprocess
+import tempfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Lock, RLock
 from typing import AsyncIterator, Optional
 from urllib.parse import urlparse
@@ -69,28 +71,59 @@ def _env_port_override() -> Optional[int]:
 
 def _boot_singleton_blocking() -> int:
     command = _boot_command()
-    LOGGER.info("Booting rappel singleton via: %s", " ".join(command))
+    with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
+        output_file = Path(f.name)
     try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except subprocess.CalledProcessError as exc:  # pragma: no cover
-        LOGGER.error("boot command failed: %s", exc)
-        raise RuntimeError("unable to boot rappel server") from exc
-    except OSError as exc:  # pragma: no cover
-        LOGGER.error("unable to spawn boot command: %s", exc)
-        raise RuntimeError("unable to boot rappel server") from exc
-    output = result.stdout.strip()
-    try:
-        port = int(output)
-        LOGGER.info("boot command reported singleton port %s", port)
-        return port
-    except ValueError as exc:  # pragma: no cover
-        raise RuntimeError(f"boot command returned invalid port: {output}") from exc
+        command.extend(["--output-file", str(output_file)])
+        LOGGER.info("Booting rappel singleton via: %s", " ".join(command))
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as exc:  # pragma: no cover
+            LOGGER.error("boot command timed out after %s seconds", exc.timeout)
+            _log_process_snapshot()
+            raise RuntimeError("unable to boot rappel server") from exc
+        except subprocess.CalledProcessError as exc:  # pragma: no cover
+            LOGGER.error("boot command failed: %s", exc)
+            raise RuntimeError("unable to boot rappel server") from exc
+        except OSError as exc:  # pragma: no cover
+            LOGGER.error("unable to spawn boot command: %s", exc)
+            raise RuntimeError("unable to boot rappel server") from exc
+        try:
+            # We use a file as a message passer because passing a PIPE to the singleton launcher
+            # will block our code indefinitely
+            # The singleton launches the webserver subprocess to inherit the stdin/stdout that the
+            # singleton launcher receives; which means that in the case of a PIPE it would pass that
+            # pipe to the subprocess and therefore never correctly close the file descriptor and signal
+            # exit process status to Python.
+            port_str = output_file.read_text().strip()
+            port = int(port_str)
+            LOGGER.info("boot command reported singleton port %s", port)
+            return port
+        except (ValueError, FileNotFoundError) as exc:  # pragma: no cover
+            raise RuntimeError(f"unable to read port from output file: {exc}") from exc
+    finally:
+        output_file.unlink(missing_ok=True)
+
+
+def _log_process_snapshot() -> None:
+    commands = [["ps", "aux"], ["ps", "-ef"], ["tasklist"]]
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except FileNotFoundError:
+            continue
+        except subprocess.SubprocessError:
+            continue
+        if proc.returncode == 0 and proc.stdout:
+            lines = proc.stdout.strip().splitlines()
+            preview = "\n".join(lines[:20])
+            LOGGER.warning("Process snapshot via %s:\n%s", " ".join(cmd), preview)
+            return
+    LOGGER.warning("Process snapshot unavailable; no suitable command found")
 
 
 def _resolve_port() -> int:
