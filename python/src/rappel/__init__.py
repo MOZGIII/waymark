@@ -9,6 +9,7 @@ from .actions import (
     serialize_error_payload,
     serialize_result_payload,
 )
+from .dependencies import Depend, provide_dependencies
 from .exceptions import ExhaustedRetries, ExhaustedRetriesError
 from .registry import registry
 from .workflow import BackoffPolicy, RetryPolicy, Workflow, workflow, workflow_registry
@@ -28,6 +29,8 @@ __all__ = [
     "serialize_result_payload",
     "deserialize_result_payload",
     "serialize_error_payload",
+    "Depend",
+    "provide_dependencies",
     "bridge",
     "ExhaustedRetries",
     "ExhaustedRetriesError",

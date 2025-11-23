@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from proto import messages_pb2 as pb2
 
 from .actions import deserialize_result_payload
+from .dependencies import provide_dependencies
 from .registry import registry
 from .serialization import arguments_to_kwargs
 
@@ -158,7 +159,8 @@ async def execute_node(dispatch: pb2.WorkflowNodeDispatch) -> NodeExecutionResul
     if handler is None:
         raise RuntimeError(f"action '{node.action}' not registered")
     kwargs = resolved_kwargs or _evaluate_kwargs(node, context)
-    value = handler(**kwargs)
-    if asyncio.iscoroutine(value):
-        value = await value
+    async with provide_dependencies(handler, kwargs) as call_kwargs:
+        value = handler(**call_kwargs)
+        if asyncio.iscoroutine(value):
+            value = await value
     return NodeExecutionResult(result=value)
