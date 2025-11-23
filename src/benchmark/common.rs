@@ -1,9 +1,6 @@
 use std::time::Duration;
 
-use crate::{
-    db::{CompletionRecord, Database},
-    messages::proto,
-};
+use crate::db::{CompletionRecord, Database};
 use tokio::{sync::mpsc, task::JoinHandle, time};
 use tracing::{info, warn};
 
@@ -133,24 +130,7 @@ pub fn spawn_completion_worker(
 async fn flush_batch(database: &Database, buffer: &mut Vec<CompletionRecord>) {
     let mut pending = Vec::new();
     std::mem::swap(buffer, &mut pending);
-    let mut regular: Vec<CompletionRecord> = Vec::with_capacity(pending.len());
-    for record in pending {
-        if record.success
-            && let Some(control) = record.control.as_ref()
-            && matches!(
-                control.kind,
-                Some(proto::workflow_node_control::Kind::Loop(_))
-            )
-            && database
-                .requeue_loop_iteration(&record, control)
-                .await
-                .unwrap_or(false)
-        {
-            continue;
-        }
-        regular.push(record);
-    }
-    if let Err(err) = database.mark_actions_batch(&regular).await {
+    if let Err(err) = database.mark_actions_batch(&pending).await {
         warn!(?err, "failed to flush completion batch");
     }
 }

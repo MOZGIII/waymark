@@ -250,6 +250,7 @@ fn build_benchmark_dispatch(payload_size: usize) -> Result<Vec<u8>> {
         node: Some(node),
         workflow_input: Some(arguments),
         context: Vec::new(),
+        resolved_kwargs: None,
     };
     Ok(dispatch.encode_to_vec())
 }

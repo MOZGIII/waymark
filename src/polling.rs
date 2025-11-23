@@ -272,27 +272,10 @@ impl DispatcherTask {
         }
         let mut pending = Vec::new();
         std::mem::swap(buffer, &mut pending);
-        let mut regular: Vec<CompletionRecord> = Vec::with_capacity(pending.len());
-        for record in pending {
-            if record.success
-                && let Some(control) = record.control.as_ref()
-                && matches!(
-                    control.kind,
-                    Some(proto::workflow_node_control::Kind::Loop(_))
-                )
-                && database
-                    .requeue_loop_iteration(&record, control)
-                    .await
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-            regular.push(record);
-        }
-        if let Err(err) = database.mark_actions_batch(&regular).await {
+        if let Err(err) = database.mark_actions_batch(&pending).await {
             metrics::counter!("rappel_dispatch_errors_total").increment(1);
             error!(?err, "failed to mark action batch, retrying");
-            buffer.extend(regular);
+            buffer.extend(pending);
             sleep(Duration::from_millis(100)).await;
         }
     }

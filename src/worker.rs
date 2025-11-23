@@ -104,6 +104,10 @@ impl PythonWorker {
             if src_dir.exists() {
                 module_paths.push(src_dir);
             }
+            let proto_dir = package_root.join("proto");
+            if proto_dir.exists() {
+                module_paths.push(proto_dir);
+            }
         }
         module_paths.extend(config.extra_python_paths.clone());
         let joined_python_path = module_paths

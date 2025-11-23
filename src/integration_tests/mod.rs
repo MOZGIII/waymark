@@ -181,22 +181,6 @@ async fn dispatch_all_actions(
             };
             let worker = pool.next_worker();
             let metrics = worker.send_action(payload).await?;
-            if metrics.success
-                && matches!(
-                    metrics.control,
-                    Some(proto::WorkflowNodeControl {
-                        kind: Some(proto::workflow_node_control::Kind::Loop(_))
-                    })
-                )
-                && database
-                    .requeue_loop_iteration(
-                        &to_completion_record(metrics.clone()),
-                        metrics.control.as_ref().unwrap(),
-                    )
-                    .await?
-            {
-                continue;
-            }
             batch_records.push(to_completion_record(metrics.clone()));
             batch_metrics.push(metrics);
         }
@@ -527,6 +511,7 @@ async fn stale_worker_completion_is_ignored() -> Result<()> {
         node: None,
         workflow_input: None,
         context: Vec::new(),
+        resolved_kwargs: None,
     };
     let payload = dispatch.encode_to_vec();
     database
