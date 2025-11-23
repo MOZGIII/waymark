@@ -1,8 +1,10 @@
 import asyncio
+from typing import Annotated
 
 from proto import messages_pb2 as pb2
 from rappel import registry as action_registry
 from rappel.actions import action, serialize_error_payload, serialize_result_payload
+from rappel.dependencies import Depend
 from rappel.workflow_runtime import NodeExecutionResult, execute_node
 
 
@@ -14,6 +16,15 @@ async def multiply(value: int) -> int:
 @action
 async def exception_handler() -> str:
     return "handled"
+
+
+async def provide_suffix() -> str:
+    return "suffix"
+
+
+@action
+async def with_dependency(value: int, suffix: Annotated[str, Depend(provide_suffix)]) -> str:
+    return f"{value}-{suffix}"
 
 
 def _build_resolved_dispatch() -> pb2.WorkflowNodeDispatch:
@@ -61,6 +72,25 @@ def _build_exception_dispatch(include_error: bool) -> pb2.WorkflowNodeDispatch:
     return dispatch
 
 
+def _build_dependency_dispatch() -> pb2.WorkflowNodeDispatch:
+    if action_registry.get("with_dependency") is None:
+        action_registry.register("with_dependency", with_dependency)
+    node = pb2.WorkflowDagNode(
+        id="node_dependency",
+        action="with_dependency",
+        module=__name__,
+    )
+    node.produces.append("value")
+    dispatch = pb2.WorkflowNodeDispatch(node=node)
+    resolved = pb2.WorkflowArguments()
+    entry = resolved.arguments.add()
+    entry.key = "value"
+    entry.value.primitive.int_value = 3
+    dispatch.resolved_kwargs.CopyFrom(resolved)
+    dispatch.workflow_input.CopyFrom(pb2.WorkflowArguments())
+    return dispatch
+
+
 def test_execute_node_uses_resolved_kwargs() -> None:
     payload = _build_resolved_dispatch()
     result = asyncio.run(execute_node(payload))
@@ -73,3 +103,10 @@ def test_execute_node_handles_exception_when_edge_matches() -> None:
     result = asyncio.run(execute_node(payload))
     assert isinstance(result, NodeExecutionResult)
     assert result.result == "handled"
+
+
+def test_execute_node_resolves_dependencies() -> None:
+    payload = _build_dependency_dispatch()
+    result = asyncio.run(execute_node(payload))
+    assert isinstance(result, NodeExecutionResult)
+    assert result.result == "3-suffix"
