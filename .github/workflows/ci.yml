@@ -164,11 +164,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Update project version
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: uv run scripts/update_version.py ${{ github.ref_name }}
+        if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
+        run: uv run scripts/update_version.py ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '0.1.0' }}
 
       - name: Build wheel artifact
         run: uv run scripts/build_wheel.py --out-dir target/wheels
+
+      - name: Build sdist artifact (Linux only)
+        if: runner.os == 'Linux'
+        run: uv build --project python --sdist --out-dir target/sdist
+
+      - name: Upload sdist artifact (Linux only)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rappel-sdist
+          path: target/sdist/*.tar.gz
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4
@@ -180,6 +191,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build-wheel
     timeout-minutes: 20
+    environment: pypi
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
     permissions:
       contents: read
@@ -208,10 +220,17 @@ jobs:
           name: rappel-wheel-Windows
           path: artifacts/windows
 
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: rappel-sdist
+          path: artifacts/sdist
+
       - name: Assemble wheels
         run: |
           uv run scripts/assemble_wheels.py \
             --output target/release-wheels \
+            --sdist artifacts/sdist \
             linux=artifacts/linux \
             macos=artifacts/macos \
             windows=artifacts/windows
@@ -222,20 +241,8 @@ jobs:
           name: rappel-wheels
           path: target/release-wheels
 
-      - name: Publish Linux wheel to PyPI
+      - name: Publish wheels to PyPI
         if: startsWith(github.ref, 'refs/tags/v')
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: target/release-wheels/linux
-
-      - name: Publish macOS wheel to PyPI
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: target/release-wheels/macos
-
-      - name: Publish Windows wheel to PyPI
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: target/release-wheels/windows
+          packages-dir: target/release-wheels
