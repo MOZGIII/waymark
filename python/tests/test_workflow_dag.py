@@ -753,8 +753,7 @@ def test_multi_statement_conditional_with_postamble() -> None:
     assert actions.count("summarize") == 2
     # Find merge node - should produce both 'result' and 'multiplier'
     merge_candidates = [
-        n for n in dag.nodes
-        if n.action == "python_block" and "result" in n.produces
+        n for n in dag.nodes if n.action == "python_block" and "result" in n.produces
     ]
     assert len(merge_candidates) >= 1
     merge_node = merge_candidates[0]
@@ -781,7 +780,8 @@ def test_multi_statement_conditional_with_preamble() -> None:
     assert actions.count("summarize") == 2
     # Should have preamble python blocks with guards
     preamble_blocks = [
-        n for n in dag.nodes
+        n
+        for n in dag.nodes
         if n.action == "python_block" and "adjusted" in n.produces and n.guard is not None
     ]
     assert len(preamble_blocks) == 2
@@ -816,3 +816,31 @@ def test_elif_chain_creates_multiple_guarded_branches() -> None:
     # The guards should be mutually exclusive
     assert any("value >= 100" in g for g in guards)
     assert any("value >= 50" in g for g in guards)
+
+
+class InterleavedStatementsWorkflow(Workflow):
+    async def run(self) -> list[float]:
+        results = []
+        value1 = await summarize(values=[1.0])
+        results.append(value1)
+        value2 = await summarize(values=[2.0])
+        results.append(value2)
+        return results
+
+
+def test_interleaved_statements_are_captured() -> None:
+    """Statements between actions (like list.append) should be captured."""
+    dag = build_workflow_dag(InterleavedStatementsWorkflow)
+    actions = [node.action for node in dag.nodes]
+    # Should have: init block, action, append block, action, append block, return block
+    assert actions.count("summarize") == 2
+    assert actions.count("python_block") >= 3  # init + 2 appends + return
+    # Find the append blocks
+    append_blocks = [
+        n for n in dag.nodes if n.action == "python_block" and "append" in n.kwargs.get("code", "")
+    ]
+    assert len(append_blocks) == 2
+    # Each append should depend on a summarize node
+    summarize_ids = {n.id for n in dag.nodes if n.action == "summarize"}
+    for block in append_blocks:
+        assert any(dep in summarize_ids for dep in block.depends_on)

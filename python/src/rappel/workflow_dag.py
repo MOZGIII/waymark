@@ -327,6 +327,10 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         if self._is_complex_block(node.value):
             self._capture_block(node.value)
             return
+        # Capture expression statements that have side effects (e.g., method calls like append)
+        if self._is_side_effect_expr(node.value):
+            self._capture_block(node)
+            return
         self.generic_visit(node)
 
     def visit_For(self, node: ast.For) -> Any:
@@ -446,9 +450,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         non_none_targets = {t for t in action_targets if t is not None}
         if len(non_none_targets) > 1:
             line = getattr(node, "lineno", "?")
-            raise ValueError(
-                f"conditional branches must assign to the same target (line {line})"
-            )
+            raise ValueError(f"conditional branches must assign to the same target (line {line})")
 
         # Get the common action target (if any)
         action_target = next(iter(non_none_targets), None)
@@ -551,7 +553,11 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         if len(node.orelse) == 1 and isinstance(node.orelse[0], ast.If):
             # This is an elif - recurse with negated guard
             elif_node = node.orelse[0]
-            negated_guard = f"not {condition_expr}" if not parent_guard else f"({parent_guard}) and not {condition_expr}"
+            negated_guard = (
+                f"not {condition_expr}"
+                if not parent_guard
+                else f"({parent_guard}) and not {condition_expr}"
+            )
             sub_branches = self._extract_all_branches(elif_node, negated_guard)
             if sub_branches is None:
                 return None
@@ -569,9 +575,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
 
         return branches
 
-    def _parse_branch_body(
-        self, body: List[ast.stmt], guard: str
-    ) -> Optional[_ConditionalBranch]:
+    def _parse_branch_body(self, body: List[ast.stmt], guard: str) -> Optional[_ConditionalBranch]:
         """Parse a branch body to extract preamble, action, and postamble.
 
         Returns None if the branch doesn't have exactly one action call.
@@ -696,7 +700,9 @@ class WorkflowDagBuilder(ast.NodeVisitor):
 
         # Generate merge code
         for i, temp_var in enumerate(temp_vars):
-            condition = f'"{temp_var}" in locals()'
+            # Check that the variable exists AND is not None
+            # (skipped guarded nodes may pass None for their temp variables)
+            condition = f'locals().get("{temp_var}") is not None'
             if i == 0:
                 code_lines.append(f"if {condition}:")
             else:
@@ -1057,6 +1063,17 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             and isinstance(expr.func, ast.Name)
             and expr.func.id in {"list", "dict"}
         )
+
+    def _is_side_effect_expr(self, expr: ast.AST) -> bool:
+        """Check if an expression has side effects that need to be captured.
+
+        This includes method calls on objects (like list.append, dict.update, etc.)
+        that modify state but don't return a meaningful value.
+        """
+        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            # Method call like obj.method() - these often have side effects
+            return True
+        return False
 
     def _capture_block(self, node: ast.AST) -> None:
         override_snippet = vars(node).get("_rappel_snippet_override")

@@ -51,6 +51,10 @@ def _build_context(
         if isinstance(result, WorkflowNodeResult):
             if variable in result.variables:
                 context[variable] = result.variables[variable]
+        elif isinstance(result, dict) and variable in result:
+            # Unwrap dict results that contain the variable name as a key
+            # This handles the case where the Go scheduler sends {temp_var: value}
+            context[variable] = result[variable]
         else:
             context[variable] = result
     context["__workflow_exceptions"] = exceptions

@@ -454,9 +454,10 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         if isinstance(result.result, WorkflowNodeResult):
             # Extract the actual result from the variables dict
             variables = result.result.variables
-            if "result" in variables:
-                return variables["result"]
-            # If no 'result' key, this might be an empty workflow
+            dag = cls.workflow_dag()
+            if dag.return_variable and dag.return_variable in variables:
+                return variables[dag.return_variable]
+            # If no return variable or key missing, this might be an empty workflow
             return None
 
         return result.result

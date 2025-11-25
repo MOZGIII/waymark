@@ -1,10 +1,13 @@
 """FastAPI surface for the rappel example app."""
 
+import os
 from pathlib import Path
 
+import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from example_app.workflows import (
     BranchRequest,
@@ -110,3 +113,34 @@ async def run_sleep_workflow(payload: SleepRequest) -> SleepResult:
     """Run the durable sleep workflow demonstrating asyncio.sleep."""
     workflow = DurableSleepWorkflow()
     return await workflow.run(seconds=payload.seconds)
+
+
+# =============================================================================
+# Database Reset (Development Only)
+# =============================================================================
+
+
+class ResetResponse(BaseModel):
+    success: bool
+    message: str
+
+
+@app.post("/api/reset", response_model=ResetResponse)
+async def reset_database() -> ResetResponse:
+    """Reset workflow-related tables for a clean slate. Development use only."""
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        return ResetResponse(success=False, message="DATABASE_URL not configured")
+
+    try:
+        conn = await asyncpg.connect(database_url)
+        try:
+            # Delete in order respecting foreign key constraints
+            await conn.execute("DELETE FROM daemon_action_ledger")
+            await conn.execute("DELETE FROM workflow_instances")
+            await conn.execute("DELETE FROM workflow_versions")
+            return ResetResponse(success=True, message="All workflow data cleared")
+        finally:
+            await conn.close()
+    except Exception as e:
+        return ResetResponse(success=False, message=str(e))
