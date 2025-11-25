@@ -31,6 +31,89 @@ const EXHAUSTED_EXCEPTION_TYPE: &str = "ExhaustedRetries";
 const EXHAUSTED_EXCEPTION_MODULE: &str = "rappel.exceptions";
 const LOOP_INDEX_VAR: &str = "__loop_index";
 
+/// Backoff configuration extracted from proto BackoffPolicy
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackoffConfig {
+    pub kind: BackoffKind,
+    pub base_delay_ms: i32,
+}
+
+impl Default for BackoffConfig {
+    fn default() -> Self {
+        Self {
+            kind: BackoffKind::None,
+            base_delay_ms: 0,
+        }
+    }
+}
+
+impl BackoffConfig {
+    /// Extract backoff configuration from proto BackoffPolicy
+    pub fn from_proto(policy: Option<&proto::BackoffPolicy>) -> Self {
+        let Some(policy) = policy else {
+            return Self::default();
+        };
+        match &policy.policy {
+            Some(proto::backoff_policy::Policy::Linear(linear)) => Self {
+                kind: BackoffKind::Linear,
+                base_delay_ms: linear.base_delay_ms as i32,
+            },
+            Some(proto::backoff_policy::Policy::Exponential(exp)) => Self {
+                kind: BackoffKind::Exponential,
+                base_delay_ms: exp.base_delay_ms as i32,
+            },
+            None => Self::default(),
+        }
+    }
+
+    /// Calculate retry delay in milliseconds based on attempt number
+    /// attempt_number is 0-indexed (first retry is attempt 1)
+    pub fn calculate_delay_ms(&self, attempt_number: i32) -> i64 {
+        self.kind
+            .calculate_delay_ms(self.base_delay_ms, attempt_number)
+    }
+}
+
+/// Backoff strategy for retry delays
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackoffKind {
+    /// No delay between retries (immediate retry)
+    None,
+    /// Linear backoff: delay = base_delay * attempt_number
+    Linear,
+    /// Exponential backoff: delay = base_delay * 2^(attempt_number - 1)
+    Exponential,
+}
+
+impl BackoffKind {
+    /// Convert to database string representation
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            BackoffKind::None => "none",
+            BackoffKind::Linear => "linear",
+            BackoffKind::Exponential => "exponential",
+        }
+    }
+
+    /// Calculate retry delay in milliseconds based on attempt number
+    /// attempt_number is 0-indexed (first retry is attempt 1)
+    pub fn calculate_delay_ms(&self, base_delay_ms: i32, attempt_number: i32) -> i64 {
+        if base_delay_ms <= 0 || attempt_number <= 0 {
+            return 0;
+        }
+        match self {
+            BackoffKind::None => 0,
+            BackoffKind::Linear => (base_delay_ms as i64) * (attempt_number as i64),
+            BackoffKind::Exponential => {
+                // delay = base_delay * 2^(attempt - 1)
+                // Cap exponent to avoid overflow
+                let exp = (attempt_number - 1).min(30) as u32;
+                (base_delay_ms as i64) * (1i64 << exp)
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: PgPool,
@@ -450,6 +533,7 @@ fn build_action_dispatch(
     let timeout_retry_limit = node
         .timeout_retry_limit
         .unwrap_or(DEFAULT_TIMEOUT_RETRY_LIMIT as u32) as i32;
+    let backoff = BackoffConfig::from_proto(node.backoff.as_ref());
 
     Ok(QueuedWorkflowNode {
         module,
@@ -458,6 +542,7 @@ fn build_action_dispatch(
         timeout_seconds,
         max_retries,
         timeout_retry_limit,
+        backoff,
     })
 }
 
@@ -533,6 +618,7 @@ async fn insert_synthetic_completion_tx(
     } else {
         node.action.clone()
     };
+    let backoff = BackoffConfig::from_proto(node.backoff.as_ref());
     sqlx::query(
         r#"
         INSERT INTO daemon_action_ledger (
@@ -554,7 +640,9 @@ async fn insert_synthetic_completion_tx(
             acked_at,
             result_payload,
             success,
-            retry_kind
+            retry_kind,
+            backoff_kind,
+            backoff_base_delay_ms
         ) VALUES (
             $1, $2, $3,
             'completed',
@@ -563,7 +651,8 @@ async fn insert_synthetic_completion_tx(
             0,
             NOW(), NOW(), NOW(), NOW(),
             $11, $12,
-            'failure'
+            'failure',
+            $13, $14
         )
         "#,
     )
@@ -588,6 +677,8 @@ async fn insert_synthetic_completion_tx(
     )
     .bind(payload_bytes)
     .bind(success)
+    .bind(backoff.kind.as_str())
+    .bind(backoff.base_delay_ms)
     .execute(tx.as_mut())
     .await?;
     Ok(())
@@ -799,6 +890,7 @@ struct QueuedWorkflowNode {
     timeout_seconds: i32,
     max_retries: i32,
     timeout_retry_limit: i32,
+    backoff: BackoffConfig,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -1428,6 +1520,12 @@ impl Database {
         if action_ids.is_empty() {
             return Ok(0);
         }
+        // Calculate backoff delay based on backoff_kind:
+        // - 'none': no delay (immediate retry)
+        // - 'linear': delay = base_delay_ms * (attempt_number + 1)
+        // - 'exponential': delay = base_delay_ms * 2^attempt_number
+        // Note: attempt_number is the current attempt (0-indexed), so after increment
+        // it becomes the next attempt number which we use for backoff calculation.
         let result = sqlx::query(
             r#"
             UPDATE daemon_action_ledger
@@ -1437,7 +1535,16 @@ impl Database {
                 acked_at = NULL,
                 deadline_at = NULL,
                 delivery_id = NULL,
-                scheduled_at = NOW(),
+                scheduled_at = NOW() + (
+                    CASE backoff_kind
+                        WHEN 'linear' THEN
+                            make_interval(secs => (backoff_base_delay_ms * (attempt_number + 1))::double precision / 1000.0)
+                        WHEN 'exponential' THEN
+                            make_interval(secs => (backoff_base_delay_ms * power(2, LEAST(attempt_number, 30)))::double precision / 1000.0)
+                        ELSE
+                            interval '0 seconds'
+                    END
+                ),
                 result_payload = NULL,
                 success = NULL,
                 delivery_token = NULL,
@@ -1461,6 +1568,7 @@ impl Database {
         if action_ids.is_empty() {
             return Ok(0);
         }
+        // Calculate backoff delay based on backoff_kind (same as failure retries)
         let result = sqlx::query(
             r#"
             UPDATE daemon_action_ledger
@@ -1470,7 +1578,16 @@ impl Database {
                 acked_at = NULL,
                 deadline_at = NULL,
                 delivery_id = NULL,
-                scheduled_at = NOW(),
+                scheduled_at = NOW() + (
+                    CASE backoff_kind
+                        WHEN 'linear' THEN
+                            make_interval(secs => (backoff_base_delay_ms * (attempt_number + 1))::double precision / 1000.0)
+                        WHEN 'exponential' THEN
+                            make_interval(secs => (backoff_base_delay_ms * power(2, LEAST(attempt_number, 30)))::double precision / 1000.0)
+                        ELSE
+                            interval '0 seconds'
+                    END
+                ),
                 result_payload = NULL,
                 success = NULL,
                 delivery_token = NULL,
@@ -1525,7 +1642,9 @@ impl Database {
                     timeout_retry_limit,
                     attempt_number,
                     scheduled_at,
-                    retry_kind
+                    retry_kind,
+                    backoff_kind,
+                    backoff_base_delay_ms
                 ) VALUES (
                     $1,
                     $2,
@@ -1539,7 +1658,9 @@ impl Database {
                     $9,
                     0,
                     NOW(),
-                    'failure'
+                    'failure',
+                    $10,
+                    $11
                 )
                 "#,
             )
@@ -1552,6 +1673,8 @@ impl Database {
             .bind(DEFAULT_ACTION_TIMEOUT_SECS)
             .bind(DEFAULT_ACTION_MAX_RETRIES)
             .bind(DEFAULT_TIMEOUT_RETRY_LIMIT)
+            .bind(BackoffKind::None.as_str())
+            .bind(0i32) // no backoff delay
             .execute(&mut *tx)
             .await?;
         }
@@ -2140,7 +2263,9 @@ impl Database {
                                 timeout_retry_limit,
                                 attempt_number,
                                 scheduled_at,
-                                retry_kind
+                                retry_kind,
+                                backoff_kind,
+                                backoff_base_delay_ms
                             ) VALUES (
                                 $1,
                                 $2,
@@ -2155,7 +2280,9 @@ impl Database {
                                 $10,
                                 0,
                                 $11,
-                                'failure'
+                                'failure',
+                                $12,
+                                $13
                             )
                             RETURNING id
                             "#,
@@ -2171,6 +2298,8 @@ impl Database {
                         .bind(queued.max_retries)
                         .bind(queued.timeout_retry_limit)
                         .bind(scheduled_at)
+                        .bind(queued.backoff.kind.as_str())
+                        .bind(queued.backoff.base_delay_ms)
                         .fetch_one(tx.as_mut())
                         .await?;
                         dag_state.record_known(node_id.clone());
@@ -2224,7 +2353,9 @@ impl Database {
                         timeout_retry_limit,
                         attempt_number,
                         scheduled_at,
-                        retry_kind
+                        retry_kind,
+                        backoff_kind,
+                        backoff_base_delay_ms
                     ) VALUES (
                         $1,
                         $2,
@@ -2239,7 +2370,9 @@ impl Database {
                         $10,
                         0,
                         $11,
-                        'failure'
+                        'failure',
+                        $12,
+                        $13
                     )
                     RETURNING id
                     "#,
@@ -2255,6 +2388,8 @@ impl Database {
                 .bind(queued.max_retries)
                 .bind(queued.timeout_retry_limit)
                 .bind(scheduled_at)
+                .bind(queued.backoff.kind.as_str())
+                .bind(queued.backoff.base_delay_ms)
                 .fetch_one(tx.as_mut())
                 .await?;
                 dag_state.record_known(node_id);
@@ -2393,5 +2528,104 @@ mod tests {
         let redispatched = database.dispatch_actions(1).await?;
         assert_eq!(redispatched.len(), 1);
         Ok(())
+    }
+
+    #[test]
+    fn backoff_config_from_proto_handles_none() {
+        let config = BackoffConfig::from_proto(None);
+        assert_eq!(config.kind, BackoffKind::None);
+        assert_eq!(config.base_delay_ms, 0);
+    }
+
+    #[test]
+    fn backoff_config_from_proto_handles_linear() {
+        let policy = proto::BackoffPolicy {
+            policy: Some(proto::backoff_policy::Policy::Linear(
+                proto::LinearBackoff {
+                    base_delay_ms: 1000,
+                },
+            )),
+        };
+        let config = BackoffConfig::from_proto(Some(&policy));
+        assert_eq!(config.kind, BackoffKind::Linear);
+        assert_eq!(config.base_delay_ms, 1000);
+    }
+
+    #[test]
+    fn backoff_config_from_proto_handles_exponential() {
+        let policy = proto::BackoffPolicy {
+            policy: Some(proto::backoff_policy::Policy::Exponential(
+                proto::ExponentialBackoff { base_delay_ms: 500 },
+            )),
+        };
+        let config = BackoffConfig::from_proto(Some(&policy));
+        assert_eq!(config.kind, BackoffKind::Exponential);
+        assert_eq!(config.base_delay_ms, 500);
+    }
+
+    #[test]
+    fn backoff_config_calculate_delay_uses_kind() {
+        let linear = BackoffConfig {
+            kind: BackoffKind::Linear,
+            base_delay_ms: 1000,
+        };
+        assert_eq!(linear.calculate_delay_ms(3), 3000);
+
+        let exponential = BackoffConfig {
+            kind: BackoffKind::Exponential,
+            base_delay_ms: 1000,
+        };
+        assert_eq!(exponential.calculate_delay_ms(3), 4000); // 1000 * 2^2
+    }
+
+    #[test]
+    fn backoff_kind_as_str_returns_correct_values() {
+        assert_eq!(BackoffKind::None.as_str(), "none");
+        assert_eq!(BackoffKind::Linear.as_str(), "linear");
+        assert_eq!(BackoffKind::Exponential.as_str(), "exponential");
+    }
+
+    #[test]
+    fn backoff_none_always_returns_zero_delay() {
+        assert_eq!(BackoffKind::None.calculate_delay_ms(1000, 0), 0);
+        assert_eq!(BackoffKind::None.calculate_delay_ms(1000, 1), 0);
+        assert_eq!(BackoffKind::None.calculate_delay_ms(1000, 10), 0);
+    }
+
+    #[test]
+    fn backoff_linear_calculates_correctly() {
+        // delay = base_delay * attempt_number
+        assert_eq!(BackoffKind::Linear.calculate_delay_ms(1000, 0), 0);
+        assert_eq!(BackoffKind::Linear.calculate_delay_ms(1000, 1), 1000);
+        assert_eq!(BackoffKind::Linear.calculate_delay_ms(1000, 2), 2000);
+        assert_eq!(BackoffKind::Linear.calculate_delay_ms(1000, 5), 5000);
+        assert_eq!(BackoffKind::Linear.calculate_delay_ms(500, 3), 1500);
+    }
+
+    #[test]
+    fn backoff_exponential_calculates_correctly() {
+        // delay = base_delay * 2^(attempt - 1)
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(1000, 0), 0);
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(1000, 1), 1000); // 1000 * 2^0
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(1000, 2), 2000); // 1000 * 2^1
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(1000, 3), 4000); // 1000 * 2^2
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(1000, 4), 8000); // 1000 * 2^3
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(500, 5), 8000); // 500 * 2^4
+    }
+
+    #[test]
+    fn backoff_handles_zero_base_delay() {
+        assert_eq!(BackoffKind::Linear.calculate_delay_ms(0, 5), 0);
+        assert_eq!(BackoffKind::Exponential.calculate_delay_ms(0, 5), 0);
+    }
+
+    #[test]
+    fn backoff_exponential_caps_at_30_to_prevent_overflow() {
+        // At attempt 31, we use 30 as the exponent to avoid overflow
+        let delay_30 = BackoffKind::Exponential.calculate_delay_ms(1, 31);
+        let delay_31 = BackoffKind::Exponential.calculate_delay_ms(1, 32);
+        // Both should use exponent 30 (capped)
+        assert_eq!(delay_30, 1i64 << 30);
+        assert_eq!(delay_31, 1i64 << 30);
     }
 }
