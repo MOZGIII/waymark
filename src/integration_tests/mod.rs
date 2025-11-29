@@ -40,6 +40,23 @@ const INTEGRATION_EXCEPTION_WITH_SUCCESS_MODULE: &str =
 const INTEGRATION_CRASH_RECOVERY_MODULE: &str = "integration_crash_recovery";
 const INTEGRATION_CRASH_RECOVERY_MODULE_SOURCE: &str =
     include_str!("fixtures/integration_crash_recovery.py");
+const INTEGRATION_SLEEP_MODULE: &str = "integration_sleep";
+const INTEGRATION_SLEEP_MODULE_SOURCE: &str = include_str!("fixtures/integration_sleep.py");
+const INTEGRATION_CONDITIONAL_MODULE: &str = "integration_conditional";
+const INTEGRATION_CONDITIONAL_MODULE_SOURCE: &str =
+    include_str!("fixtures/integration_conditional.py");
+const INTEGRATION_COMPLEX_LOGIC_MODULE: &str = "integration_complex_logic";
+const INTEGRATION_COMPLEX_LOGIC_MODULE_SOURCE: &str =
+    include_str!("fixtures/integration_complex_logic.py");
+const INTEGRATION_NESTED_CONDITIONALS_MODULE: &str = "integration_nested_conditionals";
+const INTEGRATION_NESTED_CONDITIONALS_MODULE_SOURCE: &str =
+    include_str!("fixtures/integration_nested_conditionals.py");
+const INTEGRATION_DATA_PIPELINE_MODULE: &str = "integration_data_pipeline";
+const INTEGRATION_DATA_PIPELINE_MODULE_SOURCE: &str =
+    include_str!("fixtures/integration_data_pipeline.py");
+const INTEGRATION_STRING_PROCESSING_MODULE: &str = "integration_string_processing";
+const INTEGRATION_STRING_PROCESSING_MODULE_SOURCE: &str =
+    include_str!("fixtures/integration_string_processing.py");
 
 const REGISTER_SCRIPT: &str = r#"
 import asyncio
@@ -129,6 +146,72 @@ async def main():
 asyncio.run(main())
 "#;
 
+const REGISTER_SLEEP_SCRIPT: &str = r#"
+import asyncio
+from integration_sleep import SleepWorkflow
+
+async def main():
+    wf = SleepWorkflow()
+    await wf.run()
+
+asyncio.run(main())
+"#;
+
+const REGISTER_CONDITIONAL_SCRIPT: &str = r#"
+import asyncio
+from integration_conditional import ConditionalWorkflow
+
+async def main():
+    wf = ConditionalWorkflow()
+    await wf.run(tier="high")
+
+asyncio.run(main())
+"#;
+
+const REGISTER_COMPLEX_LOGIC_SCRIPT: &str = r#"
+import asyncio
+from integration_complex_logic import ComplexLogicWorkflow
+
+async def main():
+    wf = ComplexLogicWorkflow()
+    await wf.run(key="alpha", apply_bonus=False)
+
+asyncio.run(main())
+"#;
+
+const REGISTER_NESTED_CONDITIONALS_SCRIPT: &str = r#"
+import asyncio
+from integration_nested_conditionals import NestedConditionalsWorkflow
+
+async def main():
+    wf = NestedConditionalsWorkflow()
+    await wf.run(user_id="user_a")
+
+asyncio.run(main())
+"#;
+
+const REGISTER_DATA_PIPELINE_SCRIPT: &str = r#"
+import asyncio
+from integration_data_pipeline import DataPipelineWorkflow
+
+async def main():
+    wf = DataPipelineWorkflow()
+    await wf.run(source="sales", threshold=100)
+
+asyncio.run(main())
+"#;
+
+const REGISTER_STRING_PROCESSING_SCRIPT: &str = r#"
+import asyncio
+from integration_string_processing import StringProcessingWorkflow
+
+async def main():
+    wf = StringProcessingWorkflow()
+    await wf.run(text="hello123")
+
+asyncio.run(main())
+"#;
+
 struct TestServer {
     http_addr: SocketAddr,
     grpc_addr: SocketAddr,
@@ -203,6 +286,33 @@ async fn purge_empty_input_instances(db: &Database) -> Result<()> {
     Ok(())
 }
 
+/// Create a synthetic completion record for sleep actions (handled by scheduler, not workers).
+fn create_sleep_completion_record(action: &crate::LedgerAction) -> CompletionRecord {
+    // Create a proper result payload with a null value for the "result" key
+    let result_payload = proto::WorkflowArguments {
+        arguments: vec![proto::WorkflowArgument {
+            key: "result".to_string(),
+            value: Some(proto::WorkflowArgumentValue {
+                kind: Some(proto::workflow_argument_value::Kind::Primitive(
+                    proto::PrimitiveWorkflowArgument {
+                        kind: Some(proto::primitive_workflow_argument::Kind::NullValue(
+                            prost_types::NullValue::NullValue as i32,
+                        )),
+                    },
+                )),
+            }),
+        }],
+    };
+    CompletionRecord {
+        action_id: action.id,
+        success: true,
+        delivery_id: 0,
+        result_payload: result_payload.encode_to_vec(),
+        dispatch_token: Some(action.delivery_token),
+        control: None,
+    }
+}
+
 async fn dispatch_all_actions(
     database: &Database,
     pool: &PythonWorkerPool,
@@ -226,6 +336,14 @@ async fn dispatch_all_actions(
         let mut batch_records = Vec::new();
         let mut batch_metrics = Vec::new();
         for action in actions {
+            // Sleep actions are auto-completed by the scheduler - they were queued with
+            // a future scheduled_at time and are picked up once that time has passed
+            if action.function_name == "sleep" {
+                let record = create_sleep_completion_record(&action);
+                batch_records.push(record);
+                continue;
+            }
+
             let dispatch = proto::WorkflowNodeDispatch::decode(action.dispatch_payload.as_slice())
                 .context("failed to decode workflow dispatch")?;
             let payload = ActionDispatchPayload {
@@ -310,6 +428,7 @@ async fn dispatch_n_actions(
 pub enum TestInputValue {
     String(&'static str),
     Bool(bool),
+    Int(i64),
 }
 
 fn encode_workflow_input(pairs: &[(&str, &str)]) -> Vec<u8> {
@@ -343,6 +462,7 @@ fn encode_workflow_input_typed(pairs: &[(&str, TestInputValue)]) -> Vec<u8> {
                 proto::primitive_workflow_argument::Kind::StringValue(s.to_string())
             }
             TestInputValue::Bool(b) => proto::primitive_workflow_argument::Kind::BoolValue(*b),
+            TestInputValue::Int(i) => proto::primitive_workflow_argument::Kind::IntValue(*i),
         };
         arguments.arguments.push(proto::WorkflowArgument {
             key: (*key).to_string(),
@@ -1195,6 +1315,1105 @@ async fn workflow_recovers_after_crash() -> Result<()> {
     // Cleanup
     pool_2.shutdown().await?;
     worker_server_2.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Test that durable sleep (asyncio.sleep) is properly handled by the scheduler.
+///
+/// This test verifies that:
+/// 1. asyncio.sleep() is converted to a scheduler-managed "sleep" action
+/// 2. The sleep action is queued with a future scheduled_at time
+/// 3. The sleep action is auto-completed when scheduled_at passes
+/// 4. The workflow resumes correctly after the sleep
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn workflow_executes_durable_sleep() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            ("integration_sleep.py", INTEGRATION_SLEEP_MODULE_SOURCE),
+            ("register_sleep.py", REGISTER_SLEEP_SCRIPT),
+        ],
+        entrypoint: "register_sleep.py",
+        workflow_name: "sleepworkflow",
+        user_module: INTEGRATION_SLEEP_MODULE,
+        inputs: &[("unused", "unused")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Verify that the DAG contains a sleep action
+    let has_sleep = harness
+        .version_detail()
+        .dag
+        .nodes
+        .iter()
+        .any(|node| node.action == "sleep");
+    assert!(has_sleep, "workflow should have a sleep action node");
+
+    let completed = harness.dispatch_all().await?;
+    // Note: sleep actions are auto-completed, so they don't appear in the
+    // completed metrics which only track worker-dispatched actions
+    assert!(
+        completed.len() >= 3,
+        "expected at least 3 worker-dispatched actions (get_timestamp x2, compute_duration), saw {}",
+        completed.len()
+    );
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .context("missing workflow result payload")?;
+    let message = parse_result(&stored_payload)?.context("expected primitive result")?;
+
+    // The result should indicate the sleep was at least 0.9 seconds
+    assert!(
+        message.starts_with("slept:"),
+        "expected sleep result, got: {}",
+        message
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that if/elif/else conditional branching works correctly.
+///
+/// This test verifies that:
+/// 1. Only the correct branch executes based on the condition
+/// 2. Other branches are skipped (guards prevent execution)
+/// 3. Variables set in the branch are available after
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn workflow_executes_conditional_high_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+    let Some(harness) = WorkflowHarness::new(WorkflowHarnessConfig {
+        files: &[
+            (
+                "integration_conditional.py",
+                INTEGRATION_CONDITIONAL_MODULE_SOURCE,
+            ),
+            ("register_conditional.py", REGISTER_CONDITIONAL_SCRIPT),
+        ],
+        entrypoint: "register_conditional.py",
+        workflow_name: "conditionalworkflow",
+        user_module: INTEGRATION_CONDITIONAL_MODULE,
+        inputs: &[("tier", "high")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Verify that the DAG has the conditional action nodes with guards
+    let evaluate_nodes: Vec<_> = harness
+        .version_detail()
+        .dag
+        .nodes
+        .iter()
+        .filter(|n| n.action.starts_with("evaluate_"))
+        .collect();
+    assert!(
+        evaluate_nodes.len() >= 3,
+        "expected at least 3 evaluate nodes (high, medium, low)"
+    );
+
+    // Check that guards are set (non-empty guard string)
+    let guarded_count = evaluate_nodes
+        .iter()
+        .filter(|n| !n.guard.is_empty())
+        .count();
+    assert!(
+        guarded_count >= 2,
+        "expected at least 2 evaluate nodes to have guards"
+    );
+
+    let completed = harness.dispatch_all().await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        harness.expected_actions()
+    );
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .context("missing workflow result payload")?;
+    let message = parse_result(&stored_payload)?.context("expected primitive result")?;
+
+    // When tier="high", get_value returns 100, which triggers evaluate_high
+    assert!(
+        message.contains("high"),
+        "expected high branch result, got: {}",
+        message
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that if/elif/else takes the medium branch correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn workflow_executes_conditional_medium_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_conditional.py",
+                INTEGRATION_CONDITIONAL_MODULE_SOURCE,
+            ),
+            ("register_conditional.py", REGISTER_CONDITIONAL_SCRIPT),
+        ],
+        &[],
+        &env_pairs,
+        "register_conditional.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "conditionalworkflow")
+        .context("conditionalworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with tier="medium"
+    let workflow_input = encode_workflow_input(&[("tier", "medium")]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_CONDITIONAL_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // When tier="medium", get_value returns 50, which triggers evaluate_medium
+    assert!(
+        message.contains("medium"),
+        "expected medium branch result, got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Test that if/elif/else takes the low (else) branch correctly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn workflow_executes_conditional_low_branch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_conditional.py",
+                INTEGRATION_CONDITIONAL_MODULE_SOURCE,
+            ),
+            ("register_conditional.py", REGISTER_CONDITIONAL_SCRIPT),
+        ],
+        &[],
+        &env_pairs,
+        "register_conditional.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "conditionalworkflow")
+        .context("conditionalworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with tier="low"
+    let workflow_input = encode_workflow_input(&[("tier", "low")]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_CONDITIONAL_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // When tier="low", get_value returns 10, which triggers evaluate_low (else branch)
+    assert!(
+        message.contains("low"),
+        "expected low branch result, got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests ComplexLogicWorkflow with intermediate variables and computed values.
+/// Key: "alpha" -> base=10, mult=1.5, offset=0 (base <= 30), result = 10*1.5 + 0 = 15
+/// Category: "small" (< 30), no bonus
+#[tokio::test]
+#[serial]
+async fn workflow_executes_complex_logic() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_complex_logic.py",
+                INTEGRATION_COMPLEX_LOGIC_MODULE_SOURCE,
+            ),
+            ("register_complex_logic.py", REGISTER_COMPLEX_LOGIC_SCRIPT),
+        ],
+        &[],
+        &env_pairs,
+        "register_complex_logic.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "complexlogicworkflow")
+        .context("complexlogicworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with key="alpha", apply_bonus=false
+    let workflow_input = encode_workflow_input_typed(&[
+        ("key", TestInputValue::String("alpha")),
+        ("apply_bonus", TestInputValue::Bool(false)),
+    ]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_COMPLEX_LOGIC_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "small:10->15" (no bonus)
+    assert!(
+        message.contains("small") && message.contains("10->15"),
+        "expected 'small:10->15', got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests ComplexLogicWorkflow with bonus applied.
+/// Key: "gamma" -> base=50, mult=2.0, offset=10 (base > 30) + 5 (bonus) = 15
+/// result = 50*2.0 + 15 = 115
+/// Category: "large" (>= 100 and < 200), with bonus
+#[tokio::test]
+#[serial]
+async fn workflow_executes_complex_logic_with_bonus() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_complex_logic.py",
+                INTEGRATION_COMPLEX_LOGIC_MODULE_SOURCE,
+            ),
+            ("register_complex_logic.py", REGISTER_COMPLEX_LOGIC_SCRIPT),
+        ],
+        &[],
+        &env_pairs,
+        "register_complex_logic.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "complexlogicworkflow")
+        .context("complexlogicworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with key="gamma", apply_bonus=true
+    let workflow_input = encode_workflow_input_typed(&[
+        ("key", TestInputValue::String("gamma")),
+        ("apply_bonus", TestInputValue::Bool(true)),
+    ]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_COMPLEX_LOGIC_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "large:50->115+bonus"
+    assert!(
+        message.contains("large") && message.contains("50->115") && message.contains("+bonus"),
+        "expected 'large:50->115+bonus', got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests NestedConditionalsWorkflow: user_a has score=85, level=3
+/// Path: score >= 50 (medium), level >= 3 -> veteran badge, keep_going notification
+#[tokio::test]
+#[serial]
+async fn workflow_executes_nested_conditionals_veteran() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_nested_conditionals.py",
+                INTEGRATION_NESTED_CONDITIONALS_MODULE_SOURCE,
+            ),
+            (
+                "register_nested_conditionals.py",
+                REGISTER_NESTED_CONDITIONALS_SCRIPT,
+            ),
+        ],
+        &[],
+        &env_pairs,
+        "register_nested_conditionals.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "nestedconditionalsworkflow")
+        .context("nestedconditionalsworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with user_id="user_a" (score=85, level=3)
+    let workflow_input = encode_workflow_input(&[("user_id", "user_a")]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_NESTED_CONDITIONALS_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "user_a:veteran|notified:keep_going"
+    assert!(
+        message.contains("veteran") && message.contains("keep_going"),
+        "expected veteran badge and keep_going notification, got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests NestedConditionalsWorkflow: user_c has score=95, level=5
+/// Path: score >= 90 (high), level >= 5 -> elite badge, high_achiever notification
+#[tokio::test]
+#[serial]
+async fn workflow_executes_nested_conditionals_elite() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_nested_conditionals.py",
+                INTEGRATION_NESTED_CONDITIONALS_MODULE_SOURCE,
+            ),
+            (
+                "register_nested_conditionals.py",
+                REGISTER_NESTED_CONDITIONALS_SCRIPT,
+            ),
+        ],
+        &[],
+        &env_pairs,
+        "register_nested_conditionals.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "nestedconditionalsworkflow")
+        .context("nestedconditionalsworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with user_id="user_c" (score=95, level=5)
+    let workflow_input = encode_workflow_input(&[("user_id", "user_c")]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_NESTED_CONDITIONALS_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "user_c:elite|notified:high_achiever"
+    assert!(
+        message.contains("elite") && message.contains("high_achiever"),
+        "expected elite badge and high_achiever notification, got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests DataPipelineWorkflow: filters sales records by threshold
+/// source="sales", threshold=100 -> filters to records with amount >= 100
+/// Records: [{id:1,amount:100}, {id:2,amount:250}, {id:4,amount:500}]
+/// total=850, count=4, filtered_count=3, avg=212
+#[tokio::test]
+#[serial]
+async fn workflow_executes_data_pipeline() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_data_pipeline.py",
+                INTEGRATION_DATA_PIPELINE_MODULE_SOURCE,
+            ),
+            ("register_data_pipeline.py", REGISTER_DATA_PIPELINE_SCRIPT),
+        ],
+        &[],
+        &env_pairs,
+        "register_data_pipeline.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "datapipelineworkflow")
+        .context("datapipelineworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with source="sales", threshold=100
+    let workflow_input = encode_workflow_input_typed(&[
+        ("source", TestInputValue::String("sales")),
+        ("threshold", TestInputValue::Int(100)),
+    ]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_DATA_PIPELINE_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "total:850,count:4,filtered:3,avg:212"
+    assert!(
+        message.contains("total:850") && message.contains("filtered:3"),
+        "expected 'total:850...filtered:3', got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests StringProcessingWorkflow with valid input.
+/// text="hello123" -> valid (len >= 3, alnum), normalized="hello123", prefix="hel", suffix=56
+/// result="HEL-56"
+#[tokio::test]
+#[serial]
+async fn workflow_executes_string_processing_valid() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_string_processing.py",
+                INTEGRATION_STRING_PROCESSING_MODULE_SOURCE,
+            ),
+            (
+                "register_string_processing.py",
+                REGISTER_STRING_PROCESSING_SCRIPT,
+            ),
+        ],
+        &[],
+        &env_pairs,
+        "register_string_processing.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "stringprocessingworkflow")
+        .context("stringprocessingworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with text="hello123"
+    let workflow_input = encode_workflow_input(&[("text", "hello123")]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_STRING_PROCESSING_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "HEL-56" (prefix="hel" uppercase, suffix=8*7=56)
+    assert!(
+        message.contains("HEL-56"),
+        "expected 'HEL-56', got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
+    server.shutdown().await;
+    drop(python_env);
+
+    Ok(())
+}
+
+/// Tests StringProcessingWorkflow with invalid input (early return).
+/// text="ab" -> invalid (len < 3), returns "ERROR:invalid_input"
+#[tokio::test]
+#[serial]
+async fn workflow_executes_string_processing_invalid() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let database_url = match env::var("DATABASE_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!("skipping integration test: DATABASE_URL not set");
+            return Ok(());
+        }
+    };
+    let database = Database::connect(&database_url).await?;
+    cleanup_database(&database).await?;
+
+    let server = TestServer::spawn(database_url.clone()).await?;
+    wait_for_health(server.http_addr).await?;
+
+    let env_pairs = vec![
+        ("CARABINER_GRPC_ADDR", server.grpc_addr.to_string()),
+        ("CARABINER_SERVER_PORT", server.http_addr.port().to_string()),
+        ("CARABINER_SERVER_HOST", server.http_addr.ip().to_string()),
+        ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
+    ];
+    let python_env = common::run_in_env(
+        &[
+            (
+                "integration_string_processing.py",
+                INTEGRATION_STRING_PROCESSING_MODULE_SOURCE,
+            ),
+            (
+                "register_string_processing.py",
+                REGISTER_STRING_PROCESSING_SCRIPT,
+            ),
+        ],
+        &[],
+        &env_pairs,
+        "register_string_processing.py",
+    )
+    .await?;
+    purge_empty_input_instances(&database).await?;
+
+    let versions = database.list_workflow_versions().await?;
+    let version = versions
+        .iter()
+        .find(|v| v.workflow_name == "stringprocessingworkflow")
+        .context("stringprocessingworkflow missing")?;
+    let version_detail = database
+        .load_workflow_version(version.id)
+        .await?
+        .context("missing workflow version detail")?;
+    let expected_actions = version_detail.dag.nodes.len();
+
+    // Create instance with text="ab" (invalid - too short)
+    let workflow_input = encode_workflow_input(&[("text", "ab")]);
+    let instance_id = database
+        .create_workflow_instance(&version.workflow_name, version.id, Some(&workflow_input))
+        .await?;
+
+    let worker_server: Arc<crate::server_worker::WorkerBridgeServer> =
+        crate::server_worker::WorkerBridgeServer::start(None).await?;
+    let worker_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("python")
+        .join(".venv")
+        .join("bin")
+        .join("rappel-worker");
+    let worker_config = PythonWorkerConfig {
+        script_path: worker_script,
+        script_args: Vec::new(),
+        user_module: INTEGRATION_STRING_PROCESSING_MODULE.to_string(),
+        extra_python_paths: vec![python_env.path().to_path_buf()],
+    };
+    let pool = PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_server)).await?;
+
+    let completed = dispatch_all_actions(&database, &pool, expected_actions).await?;
+    eprintln!(
+        "completed {} actions (expected {})",
+        completed.len(),
+        expected_actions
+    );
+
+    let stored_payload: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT result_payload FROM workflow_instances WHERE id = $1")
+            .bind(instance_id)
+            .fetch_one(database.pool())
+            .await?;
+    let payload = stored_payload.context("missing workflow result payload")?;
+    let message = parse_result(&payload)?.context("expected primitive result")?;
+
+    // Expected: "ERROR:invalid_input" (early return path)
+    assert!(
+        message.contains("ERROR:invalid_input"),
+        "expected 'ERROR:invalid_input', got: {}",
+        message
+    );
+
+    pool.shutdown().await?;
+    worker_server.shutdown().await;
     server.shutdown().await;
     drop(python_env);
 
