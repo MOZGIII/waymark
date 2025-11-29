@@ -1,13 +1,14 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# dependencies = []
+# dependencies = ["click"]
 # ///
 """Parse coverage reports from Python and Rust test runs."""
 
-import argparse
 import json
 import xml.etree.ElementTree as ET
 from pathlib import Path
+
+import click
 
 
 def parse_python_coverage(xml_path: Path) -> dict:
@@ -51,31 +52,29 @@ def parse_rust_coverage(lcov_path: Path) -> dict:
     }
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Parse coverage reports")
-    parser.add_argument("--python-xml", type=Path, help="Path to Python coverage.xml")
-    parser.add_argument("--rust-lcov", type=Path, help="Path to Rust lcov.info")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Output JSON file (optional, prints to stdout if not specified)",
-    )
-
-    args = parser.parse_args()
-
+@click.command()
+@click.option("--python-xml", type=click.Path(path_type=Path), help="Path to Python coverage.xml")
+@click.option("--rust-lcov", type=click.Path(path_type=Path), help="Path to Rust lcov.info")
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path),
+    help="Output JSON file (optional, prints to stdout if not specified)",
+)
+def main(python_xml: Path | None, rust_lcov: Path | None, output: Path | None) -> None:
+    """Parse coverage reports from Python and Rust test runs."""
     result = {}
 
-    if args.python_xml:
-        result["python"] = parse_python_coverage(args.python_xml)
+    if python_xml:
+        result["python"] = parse_python_coverage(python_xml)
 
-    if args.rust_lcov:
-        result["rust"] = parse_rust_coverage(args.rust_lcov)
+    if rust_lcov:
+        result["rust"] = parse_rust_coverage(rust_lcov)
 
-    output = json.dumps(result)
-    if args.output:
-        args.output.write_text(output)
+    output_str = json.dumps(result)
+    if output:
+        output.write_text(output_str)
     else:
-        print(output)
+        print(output_str)
 
 
 if __name__ == "__main__":
