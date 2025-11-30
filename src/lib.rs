@@ -19,6 +19,7 @@ pub mod integration_tests;
 pub use benchmark::actions::{BenchmarkHarness, HarnessConfig};
 pub use benchmark::common::{BenchmarkResult, BenchmarkSummary};
 pub use benchmark::instances::{WorkflowBenchmarkConfig, WorkflowBenchmarkHarness};
+pub use benchmark::stress::{StressBenchmarkConfig, StressBenchmarkHarness};
 pub use config::AppConfig;
 pub use db::{Database, LedgerAction};
 pub use polling::{PollingConfig, PollingDispatcher};
