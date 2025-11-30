@@ -114,7 +114,18 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     let app_config = AppConfig::load()?;
-    let database = Database::connect(&app_config.database_url).await?;
+
+    // Determine worker count from command to size DB pool appropriately
+    let worker_count = match &cli.command {
+        Commands::Actions { workers, .. } => *workers,
+        Commands::Instances { workers, .. } => *workers,
+        Commands::Stress { workers, .. } => *workers,
+    };
+
+    // Scale DB pool: base of 10 + 5 per worker to handle concurrent completions
+    // Each worker can generate completion batches that need DB connections
+    let pool_size = (10 + worker_count * 5).min(100) as u32;
+    let database = Database::connect_with_pool_size(&app_config.database_url, pool_size).await?;
 
     match cli.command {
         Commands::Actions {

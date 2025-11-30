@@ -1796,8 +1796,12 @@ impl Database {
     }
 
     pub async fn connect(database_url: &str) -> Result<Self> {
+        Self::connect_with_pool_size(database_url, 10).await
+    }
+
+    pub async fn connect_with_pool_size(database_url: &str, max_connections: u32) -> Result<Self> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_connections)
             .connect(database_url)
             .await
             .with_context(|| "failed to connect to postgres")?;
