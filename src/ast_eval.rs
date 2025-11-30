@@ -297,6 +297,16 @@ fn to_f64(v: &Value) -> Result<f64> {
     }
 }
 
+fn to_i64(v: &Value) -> Result<i64> {
+    match v {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .context("integer expected"),
+        _ => Err(anyhow!("integer expected")),
+    }
+}
+
 fn eval_unary_op(operand: &Value, op: proto::UnaryOpKind) -> Result<Value> {
     match op {
         proto::UnaryOpKind::Usub => {
@@ -400,6 +410,188 @@ fn eval_call(call: &proto::Call, ctx: &EvalContext) -> Result<Value> {
                     other => serde_json::to_string(other).unwrap_or_default(),
                 };
                 Ok(Value::String(text))
+            }
+            "range" => {
+                // range(stop) or range(start, stop) or range(start, stop, step)
+                let (start, stop, step) = match args.len() {
+                    1 => (0i64, to_i64(&args[0])?, 1i64),
+                    2 => (to_i64(&args[0])?, to_i64(&args[1])?, 1i64),
+                    3 => (to_i64(&args[0])?, to_i64(&args[1])?, to_i64(&args[2])?),
+                    _ => return Err(anyhow!("range expects 1, 2, or 3 arguments")),
+                };
+                if step == 0 {
+                    return Err(anyhow!("range step cannot be zero"));
+                }
+                let mut result = Vec::new();
+                let mut i = start;
+                if step > 0 {
+                    while i < stop {
+                        result.push(Value::Number(Number::from(i)));
+                        i += step;
+                    }
+                } else {
+                    while i > stop {
+                        result.push(Value::Number(Number::from(i)));
+                        i += step;
+                    }
+                }
+                Ok(Value::Array(result))
+            }
+            "enumerate" => {
+                // enumerate(iterable) or enumerate(iterable, start)
+                if args.is_empty() || args.len() > 2 {
+                    return Err(anyhow!("enumerate expects 1 or 2 arguments"));
+                }
+                let start = if args.len() == 2 {
+                    to_i64(&args[1])?
+                } else {
+                    0
+                };
+                let Value::Array(items) = &args[0] else {
+                    return Err(anyhow!("enumerate requires an iterable"));
+                };
+                let result: Vec<Value> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        Value::Array(vec![
+                            Value::Number(Number::from(start + i as i64)),
+                            v.clone(),
+                        ])
+                    })
+                    .collect();
+                Ok(Value::Array(result))
+            }
+            "list" => {
+                // list(iterable) - convert to list (mostly a no-op for arrays)
+                if args.len() != 1 {
+                    return Err(anyhow!("list expects 1 argument"));
+                }
+                match &args[0] {
+                    Value::Array(a) => Ok(Value::Array(a.clone())),
+                    Value::String(s) => {
+                        // Convert string to list of characters
+                        let chars: Vec<Value> = s
+                            .chars()
+                            .map(|c| Value::String(c.to_string()))
+                            .collect();
+                        Ok(Value::Array(chars))
+                    }
+                    _ => Err(anyhow!("list requires an iterable")),
+                }
+            }
+            "int" => {
+                if args.len() != 1 {
+                    return Err(anyhow!("int expects 1 argument"));
+                }
+                let val = match &args[0] {
+                    Value::Number(n) => n.as_i64().unwrap_or(0),
+                    Value::String(s) => s.parse::<i64>().unwrap_or(0),
+                    Value::Bool(b) => if *b { 1 } else { 0 },
+                    _ => return Err(anyhow!("int unsupported type")),
+                };
+                Ok(Value::Number(Number::from(val)))
+            }
+            "float" => {
+                if args.len() != 1 {
+                    return Err(anyhow!("float expects 1 argument"));
+                }
+                let val = match &args[0] {
+                    Value::Number(n) => n.as_f64().unwrap_or(0.0),
+                    Value::String(s) => s.parse::<f64>().unwrap_or(0.0),
+                    Value::Bool(b) => if *b { 1.0 } else { 0.0 },
+                    _ => return Err(anyhow!("float unsupported type")),
+                };
+                Ok(Value::Number(Number::from_f64(val).unwrap_or(Number::from(0))))
+            }
+            "bool" => {
+                if args.len() != 1 {
+                    return Err(anyhow!("bool expects 1 argument"));
+                }
+                Ok(Value::Bool(is_truthy(&args[0])))
+            }
+            "min" => {
+                if args.is_empty() {
+                    return Err(anyhow!("min expects at least 1 argument"));
+                }
+                // Handle both min(a, b, c) and min([a, b, c])
+                let items = if args.len() == 1 {
+                    match &args[0] {
+                        Value::Array(arr) => arr.clone(),
+                        _ => args.clone(),
+                    }
+                } else {
+                    args.clone()
+                };
+                if items.is_empty() {
+                    return Err(anyhow!("min arg is an empty sequence"));
+                }
+                let mut min_val = to_f64(&items[0])?;
+                let mut min_item = items[0].clone();
+                for item in items.iter().skip(1) {
+                    let val = to_f64(item)?;
+                    if val < min_val {
+                        min_val = val;
+                        min_item = item.clone();
+                    }
+                }
+                Ok(min_item)
+            }
+            "max" => {
+                if args.is_empty() {
+                    return Err(anyhow!("max expects at least 1 argument"));
+                }
+                // Handle both max(a, b, c) and max([a, b, c])
+                let items = if args.len() == 1 {
+                    match &args[0] {
+                        Value::Array(arr) => arr.clone(),
+                        _ => args.clone(),
+                    }
+                } else {
+                    args.clone()
+                };
+                if items.is_empty() {
+                    return Err(anyhow!("max arg is an empty sequence"));
+                }
+                let mut max_val = to_f64(&items[0])?;
+                let mut max_item = items[0].clone();
+                for item in items.iter().skip(1) {
+                    let val = to_f64(item)?;
+                    if val > max_val {
+                        max_val = val;
+                        max_item = item.clone();
+                    }
+                }
+                Ok(max_item)
+            }
+            "sum" => {
+                if args.len() != 1 {
+                    return Err(anyhow!("sum expects 1 argument"));
+                }
+                let Value::Array(items) = &args[0] else {
+                    return Err(anyhow!("sum requires an iterable"));
+                };
+                let mut total = 0.0;
+                for item in items {
+                    total += to_f64(item)?;
+                }
+                // Return int if result is whole number
+                if total.fract() == 0.0 && total.abs() < i64::MAX as f64 {
+                    Ok(Value::Number(Number::from(total as i64)))
+                } else {
+                    Ok(Value::Number(Number::from_f64(total).unwrap_or(Number::from(0))))
+                }
+            }
+            "abs" => {
+                if args.len() != 1 {
+                    return Err(anyhow!("abs expects 1 argument"));
+                }
+                let val = to_f64(&args[0])?;
+                if val.fract() == 0.0 {
+                    Ok(Value::Number(Number::from(val.abs() as i64)))
+                } else {
+                    Ok(Value::Number(Number::from_f64(val.abs()).unwrap_or(Number::from(0))))
+                }
             }
             other => Err(anyhow!("unsupported call '{}'", other)),
         },
@@ -524,5 +716,146 @@ mod tests {
         };
         eval_stmt(&stmt, &mut ctx).unwrap();
         assert_eq!(ctx.get("x"), Some(&Value::Number(Number::from(10))));
+    }
+
+    fn call(func_name: &str, args: Vec<proto::Expr>) -> proto::Expr {
+        proto::Expr {
+            kind: Some(proto::expr::Kind::Call(Box::new(proto::Call {
+                func: Some(Box::new(name(func_name))),
+                args,
+                keywords: Vec::new(),
+            }))),
+        }
+    }
+
+    #[test]
+    fn supports_range_single_arg() {
+        let expr = call("range", vec![int(5)]);
+        let ctx = EvalContext::new();
+        let result = eval_expr(&expr, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Number(Number::from(0)),
+                Value::Number(Number::from(1)),
+                Value::Number(Number::from(2)),
+                Value::Number(Number::from(3)),
+                Value::Number(Number::from(4)),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_range_two_args() {
+        let expr = call("range", vec![int(2), int(5)]);
+        let ctx = EvalContext::new();
+        let result = eval_expr(&expr, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Number(Number::from(2)),
+                Value::Number(Number::from(3)),
+                Value::Number(Number::from(4)),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_range_three_args() {
+        let expr = call("range", vec![int(0), int(10), int(2)]);
+        let ctx = EvalContext::new();
+        let result = eval_expr(&expr, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Number(Number::from(0)),
+                Value::Number(Number::from(2)),
+                Value::Number(Number::from(4)),
+                Value::Number(Number::from(6)),
+                Value::Number(Number::from(8)),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_range_negative_step() {
+        let expr = call("range", vec![int(5), int(0), int(-1)]);
+        let ctx = EvalContext::new();
+        let result = eval_expr(&expr, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Number(Number::from(5)),
+                Value::Number(Number::from(4)),
+                Value::Number(Number::from(3)),
+                Value::Number(Number::from(2)),
+                Value::Number(Number::from(1)),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_enumerate() {
+        let list_expr = proto::Expr {
+            kind: Some(proto::expr::Kind::List(proto::List {
+                elts: vec![int(10), int(20), int(30)],
+            })),
+        };
+        let expr = call("enumerate", vec![list_expr]);
+        let ctx = EvalContext::new();
+        let result = eval_expr(&expr, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Array(vec![Value::Number(Number::from(0)), Value::Number(Number::from(10))]),
+                Value::Array(vec![Value::Number(Number::from(1)), Value::Number(Number::from(20))]),
+                Value::Array(vec![Value::Number(Number::from(2)), Value::Number(Number::from(30))]),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_enumerate_with_start() {
+        let list_expr = proto::Expr {
+            kind: Some(proto::expr::Kind::List(proto::List {
+                elts: vec![int(10), int(20)],
+            })),
+        };
+        let expr = call("enumerate", vec![list_expr, int(5)]);
+        let ctx = EvalContext::new();
+        let result = eval_expr(&expr, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::Array(vec![
+                Value::Array(vec![Value::Number(Number::from(5)), Value::Number(Number::from(10))]),
+                Value::Array(vec![Value::Number(Number::from(6)), Value::Number(Number::from(20))]),
+            ])
+        );
+    }
+
+    #[test]
+    fn supports_min_max_sum() {
+        let list_expr = proto::Expr {
+            kind: Some(proto::expr::Kind::List(proto::List {
+                elts: vec![int(3), int(1), int(4), int(1), int(5)],
+            })),
+        };
+        let ctx = EvalContext::new();
+
+        let min_result = eval_expr(&call("min", vec![list_expr.clone()]), &ctx).unwrap();
+        assert_eq!(min_result, Value::Number(Number::from(1)));
+
+        let max_result = eval_expr(&call("max", vec![list_expr.clone()]), &ctx).unwrap();
+        assert_eq!(max_result, Value::Number(Number::from(5)));
+
+        let sum_result = eval_expr(&call("sum", vec![list_expr]), &ctx).unwrap();
+        assert_eq!(sum_result, Value::Number(Number::from(14)));
+    }
+
+    #[test]
+    fn supports_abs() {
+        let ctx = EvalContext::new();
+        let result = eval_expr(&call("abs", vec![int(-42)]), &ctx).unwrap();
+        assert_eq!(result, Value::Number(Number::from(42)));
     }
 }
