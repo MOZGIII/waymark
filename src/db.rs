@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
@@ -10,6 +11,7 @@ use sqlx::{
     postgres::{PgPoolOptions, PgRow},
 };
 use tokio::sync::RwLock;
+use tracing::debug;
 use uuid::Uuid;
 
 use crate::{
@@ -2372,6 +2374,7 @@ impl Database {
     }
 
     pub async fn dispatch_actions(&self, limit: i64) -> Result<Vec<LedgerAction>> {
+        let fn_start = Instant::now();
         let span = tracing::info_span!("db.dispatch_actions", limit);
         let _guard = span.enter();
         let result = sqlx::query_as::<_, LedgerAction>(
@@ -2417,12 +2420,20 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await;
+        let query_ms = fn_start.elapsed().as_secs_f64() * 1000.0;
         match result {
             Ok(records) => {
-                if !records.is_empty() {
+                let count = records.len();
+                if count > 0 {
                     metrics::counter!("rappel_actions_dispatched_total")
-                        .increment(records.len() as u64);
+                        .increment(count as u64);
                 }
+                // JSON timing output for analysis
+                debug!(
+                    target: "db_timing",
+                    r#"{{"fn":"dispatch_actions","total_ms":{:.3},"limit":{},"returned":{}}}"#,
+                    query_ms, limit, count
+                );
                 Ok(records)
             }
             Err(err) => {
@@ -2520,9 +2531,16 @@ impl Database {
         if records.is_empty() {
             return Ok(());
         }
-        let span = tracing::debug_span!("db.mark_actions_batch", count = records.len());
+        let batch_start = Instant::now();
+        let record_count = records.len();
+        let span = tracing::debug_span!("db.mark_actions_batch", count = record_count);
         let _guard = span.enter();
+
+        let tx_start = Instant::now();
         let mut tx = self.pool.begin().await?;
+        let tx_acquire_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
+
+        let loop_start = Instant::now();
         let mut processed: Vec<CompletionRecord> = Vec::new();
         for record in records {
             if record.success {
@@ -2533,6 +2551,7 @@ impl Database {
                 processed.push(record.clone());
             }
         }
+        let loop_processing_ms = loop_start.elapsed().as_secs_f64() * 1000.0;
         let mut workflow_instances: HashSet<WorkflowInstanceId> = HashSet::new();
         let mut successes_with_tokens: Vec<(&CompletionRecord, Uuid)> = Vec::new();
         let mut failures_with_tokens: Vec<(&CompletionRecord, Uuid)> = Vec::new();
@@ -2563,6 +2582,8 @@ impl Database {
                 "dropping failed completions missing dispatch tokens"
             );
         }
+        let success_update_start = Instant::now();
+        let success_count = successes_with_tokens.len();
         if !successes_with_tokens.is_empty() {
             let ids: Vec<LedgerActionId> = successes_with_tokens
                 .iter()
@@ -2620,7 +2641,10 @@ impl Database {
                 }
             }
         }
+        let success_update_ms = success_update_start.elapsed().as_secs_f64() * 1000.0;
 
+        let failure_update_start = Instant::now();
+        let failure_count = failures_with_tokens.len();
         if !failures_with_tokens.is_empty() {
             let failure_ids: Vec<LedgerActionId> = failures_with_tokens
                 .iter()
@@ -2688,11 +2712,16 @@ impl Database {
                 tracing::debug!(count = requeued, "requeued failed actions");
             }
         }
+        let failure_update_ms = failure_update_start.elapsed().as_secs_f64() * 1000.0;
 
+        let schedule_start = Instant::now();
+        let instance_count = workflow_instances.len();
+        let mut total_scheduled = 0usize;
         for instance_id in workflow_instances {
             let inserted = self
                 .schedule_workflow_instance_tx(&mut tx, instance_id)
                 .await?;
+            total_scheduled += inserted;
             if inserted > 0 {
                 tracing::debug!(
                     instance_id = %instance_id,
@@ -2701,8 +2730,21 @@ impl Database {
                 );
             }
         }
+        let schedule_ms = schedule_start.elapsed().as_secs_f64() * 1000.0;
 
+        let commit_start = Instant::now();
         tx.commit().await?;
+        let commit_ms = commit_start.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = batch_start.elapsed().as_secs_f64() * 1000.0;
+
+        // JSON timing output for analysis
+        debug!(
+            target: "db_timing",
+            r#"{{"fn":"mark_actions_batch","total_ms":{:.3},"tx_acquire_ms":{:.3},"loop_processing_ms":{:.3},"success_update_ms":{:.3},"failure_update_ms":{:.3},"schedule_ms":{:.3},"commit_ms":{:.3},"record_count":{},"success_count":{},"failure_count":{},"instance_count":{},"scheduled_actions":{}}}"#,
+            total_ms, tx_acquire_ms, loop_processing_ms, success_update_ms, failure_update_ms, schedule_ms, commit_ms, record_count, success_count, failure_count, instance_count, total_scheduled
+        );
+
         Ok(())
     }
 
@@ -2748,6 +2790,9 @@ impl Database {
         tx: &mut Transaction<'_, Postgres>,
         instance_id: WorkflowInstanceId,
     ) -> Result<usize> {
+        let fn_start = Instant::now();
+
+        let instance_lookup_start = Instant::now();
         let instance = sqlx::query_as::<_, WorkflowInstanceRow>(
             r#"
             SELECT id, partition_id, workflow_name, workflow_version_id, next_action_seq, input_payload, result_payload
@@ -2770,11 +2815,16 @@ impl Database {
             );
             return Ok(0);
         };
+        let instance_lookup_ms = instance_lookup_start.elapsed().as_secs_f64() * 1000.0;
+
         // Use cached workflow version to avoid repeated DB lookups
+        let cache_start = Instant::now();
         let cached_version = self.get_cached_version(version_id, tx).await?;
+        let cache_ms = cache_start.elapsed().as_secs_f64() * 1000.0;
         let workflow_input_bytes = instance.input_payload.clone().unwrap_or_default();
         let workflow_input = decode_arguments(&workflow_input_bytes, "workflow input")?;
         // Load instance state and build scheduling context in a single query
+        let state_load_start = Instant::now();
         let state = load_instance_state_and_context(
             tx,
             instance.id,
@@ -2782,6 +2832,9 @@ impl Database {
             &workflow_input,
         )
         .await?;
+        let state_load_ms = state_load_start.elapsed().as_secs_f64() * 1000.0;
+
+        let dag_start = Instant::now();
         let mut dag_state = InstanceDagState::new(state.known_nodes, state.completed_nodes);
         let dag_machine = DagStateMachine::new(&cached_version.dag, cached_version.concurrent);
         let mut scheduling_ctx = state.scheduling_ctx;
@@ -3285,6 +3338,9 @@ impl Database {
                 .execute(tx.as_mut())
                 .await?;
         }
+        let dag_ms = dag_start.elapsed().as_secs_f64() * 1000.0;
+
+        let finalize_start = Instant::now();
         store_instance_result_if_complete(
             tx,
             &instance,
@@ -3293,6 +3349,17 @@ impl Database {
             completed_count,
         )
         .await?;
+        let finalize_ms = finalize_start.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = fn_start.elapsed().as_secs_f64() * 1000.0;
+
+        // JSON timing output for analysis
+        debug!(
+            target: "db_timing",
+            r#"{{"fn":"schedule_workflow_instance_tx","total_ms":{:.3},"instance_lookup_ms":{:.3},"cache_ms":{:.3},"state_load_ms":{:.3},"dag_ms":{:.3},"finalize_ms":{:.3},"inserted":{}}}"#,
+            total_ms, instance_lookup_ms, cache_ms, state_load_ms, dag_ms, finalize_ms, inserted
+        );
+
         tracing::debug!(
             instance_id = %instance.id,
             workflow = instance.workflow_name,
