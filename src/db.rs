@@ -318,68 +318,99 @@ fn build_dependency_contexts(
     contexts
 }
 
-async fn build_scheduling_context(
+/// Combined result of loading instance state and building scheduling context.
+/// This combines two queries into one to reduce DB round-trips.
+struct InstanceStateAndContext {
+    known_nodes: HashSet<String>,
+    completed_nodes: HashSet<String>,
+    scheduling_ctx: SchedulingContext,
+}
+
+/// Load instance node state and build scheduling context in a single query.
+/// This replaces the separate `load_instance_node_state` and `build_scheduling_context` functions.
+async fn load_instance_state_and_context(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: WorkflowInstanceId,
     dag_nodes: &HashMap<String, WorkflowDagNode>,
     workflow_input: &WorkflowArguments,
-) -> Result<SchedulingContext> {
+) -> Result<InstanceStateAndContext> {
+    // Single query fetches all action ledger data for this instance
     let rows = sqlx::query(
         r#"
-        SELECT workflow_node_id, result_payload, success
+        SELECT workflow_node_id, status, result_payload, success
         FROM daemon_action_ledger
-        WHERE instance_id = $1 AND status = 'completed' AND workflow_node_id IS NOT NULL
+        WHERE instance_id = $1
         "#,
     )
     .bind(instance_id)
     .map(|row: PgRow| {
         (
             row.get::<Option<String>, _>(0),
-            row.get::<Option<Vec<u8>>, _>(1),
-            row.get::<Option<bool>, _>(2),
+            row.get::<String, _>(1),
+            row.get::<Option<Vec<u8>>, _>(2),
+            row.get::<Option<bool>, _>(3),
         )
     })
     .fetch_all(tx.as_mut())
     .await?;
+
+    // Build node state (known + completed)
+    let mut known_nodes = HashSet::new();
+    let mut completed_nodes = HashSet::new();
+
+    // Build scheduling context
     let mut eval_ctx: EvalContext = arguments_to_json(workflow_input)?;
     let mut payloads: HashMap<String, Vec<NodeContextEntry>> = HashMap::new();
     let mut exceptions: HashMap<String, Value> = HashMap::new();
-    for (node_id_opt, payload_opt, success_opt) in rows {
-        let Some(node_id) = node_id_opt else {
-            continue;
-        };
-        let Some(payload_bytes) = payload_opt else {
-            continue;
-        };
-        let Some(success) = success_opt else {
-            continue;
-        };
-        let Some(node) = dag_nodes.get(&node_id) else {
-            continue;
-        };
-        let arguments = decode_arguments(&payload_bytes, "context payload")?;
-        let decoded = decode_payload(&arguments)?;
-        if success {
-            let vars = extract_variables_from_result(node, &decoded);
-            for (name, value) in vars {
-                eval_ctx.insert(name, value);
+
+    for (node_id_opt, status, payload_opt, success_opt) in rows {
+        // Handle node state tracking
+        if let Some(ref node_id) = node_id_opt {
+            if status.eq_ignore_ascii_case("completed") {
+                completed_nodes.insert(node_id.clone());
             }
-        } else if let Some(error) = decoded.error.as_ref() {
-            exceptions.insert(node_id.clone(), error.clone());
+            known_nodes.insert(node_id.clone());
         }
-        let produced_vars = if node.produces.is_empty() {
-            vec![String::new()]
-        } else {
-            node.produces.clone()
-        };
-        let entries = payloads.entry(node_id).or_default();
-        for variable in produced_vars {
-            entries.push(NodeContextEntry {
-                variable,
-                payload: arguments.clone(),
-            });
+
+        // Handle scheduling context (only for completed actions with node_id)
+        if status.eq_ignore_ascii_case("completed") {
+            let Some(node_id) = node_id_opt else {
+                continue;
+            };
+            let Some(payload_bytes) = payload_opt else {
+                continue;
+            };
+            let Some(success) = success_opt else {
+                continue;
+            };
+            let Some(node) = dag_nodes.get(&node_id) else {
+                continue;
+            };
+            let arguments = decode_arguments(&payload_bytes, "context payload")?;
+            let decoded = decode_payload(&arguments)?;
+            if success {
+                let vars = extract_variables_from_result(node, &decoded);
+                for (name, value) in vars {
+                    eval_ctx.insert(name, value);
+                }
+            } else if let Some(error) = decoded.error.as_ref() {
+                exceptions.insert(node_id.clone(), error.clone());
+            }
+            let produced_vars = if node.produces.is_empty() {
+                vec![String::new()]
+            } else {
+                node.produces.clone()
+            };
+            let entries = payloads.entry(node_id).or_default();
+            for variable in produced_vars {
+                entries.push(NodeContextEntry {
+                    variable,
+                    payload: arguments.clone(),
+                });
+            }
         }
     }
+
     eval_ctx.insert(
         "__workflow_exceptions".to_string(),
         Value::Object(
@@ -389,10 +420,15 @@ async fn build_scheduling_context(
                 .collect(),
         ),
     );
-    Ok(SchedulingContext {
-        eval_ctx,
-        payloads,
-        exceptions,
+
+    Ok(InstanceStateAndContext {
+        known_nodes,
+        completed_nodes,
+        scheduling_ctx: SchedulingContext {
+            eval_ctx,
+            payloads,
+            exceptions,
+        },
     })
 }
 
@@ -994,34 +1030,6 @@ async fn store_instance_result_if_complete(
         .execute(tx.as_mut())
         .await?;
     Ok(())
-}
-
-async fn load_instance_node_state(
-    tx: &mut Transaction<'_, Postgres>,
-    instance_id: WorkflowInstanceId,
-) -> Result<(HashSet<String>, HashSet<String>)> {
-    let rows = sqlx::query(
-        r#"
-        SELECT workflow_node_id, status
-        FROM daemon_action_ledger
-        WHERE instance_id = $1
-        "#,
-    )
-    .bind(instance_id)
-    .map(|row: PgRow| (row.get::<Option<String>, _>(0), row.get::<String, _>(1)))
-    .fetch_all(tx.as_mut())
-    .await?;
-    let mut known_nodes = HashSet::new();
-    let mut completed_nodes = HashSet::new();
-    for (node_id_opt, status) in rows {
-        if let Some(node_id) = node_id_opt {
-            if status.eq_ignore_ascii_case("completed") {
-                completed_nodes.insert(node_id.clone());
-            }
-            known_nodes.insert(node_id);
-        }
-    }
-    Ok((known_nodes, completed_nodes))
 }
 
 fn decode_arguments(bytes: &[u8], label: &str) -> Result<WorkflowArguments> {
@@ -2764,13 +2772,19 @@ impl Database {
         };
         // Use cached workflow version to avoid repeated DB lookups
         let cached_version = self.get_cached_version(version_id, tx).await?;
-        let (known_nodes, completed_nodes) = load_instance_node_state(tx, instance.id).await?;
-        let mut dag_state = InstanceDagState::new(known_nodes, completed_nodes);
-        let dag_machine = DagStateMachine::new(&cached_version.dag, cached_version.concurrent);
         let workflow_input_bytes = instance.input_payload.clone().unwrap_or_default();
         let workflow_input = decode_arguments(&workflow_input_bytes, "workflow input")?;
-        let mut scheduling_ctx =
-            build_scheduling_context(tx, instance.id, &cached_version.node_map, &workflow_input).await?;
+        // Load instance state and build scheduling context in a single query
+        let state = load_instance_state_and_context(
+            tx,
+            instance.id,
+            &cached_version.node_map,
+            &workflow_input,
+        )
+        .await?;
+        let mut dag_state = InstanceDagState::new(state.known_nodes, state.completed_nodes);
+        let dag_machine = DagStateMachine::new(&cached_version.dag, cached_version.concurrent);
+        let mut scheduling_ctx = state.scheduling_ctx;
         let mut completed_count = dag_state.completed().len();
         let mut next_sequence = instance.next_action_seq;
         let mut inserted = 0usize;
