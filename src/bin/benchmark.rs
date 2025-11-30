@@ -3,9 +3,9 @@ use std::time::Duration;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use rappel::{
-    AppConfig, BenchmarkHarness, Database, HarnessConfig, PythonWorkerConfig,
-    StressBenchmarkConfig, StressBenchmarkHarness, WorkflowBenchmarkConfig,
-    WorkflowBenchmarkHarness,
+    AppConfig, BenchmarkHarness, Database, FanoutBenchmarkConfig, FanoutBenchmarkHarness,
+    HarnessConfig, PythonWorkerConfig, StressBenchmarkConfig, StressBenchmarkHarness,
+    WorkflowBenchmarkConfig, WorkflowBenchmarkHarness,
 };
 use tracing::info;
 
@@ -107,6 +107,37 @@ enum Commands {
         #[arg(long, default_value = "15")]
         log_interval: u64,
     },
+
+    /// Fan-out benchmark - simple parallel workflows with push-based scheduling
+    Fanout {
+        /// Number of workflow instances to create
+        #[arg(short = 'n', long, default_value = "100")]
+        instances: usize,
+
+        /// Number of parallel actions in fan-out phase
+        #[arg(short, long, default_value = "16")]
+        fan_out: usize,
+
+        /// CPU work iterations per action (controls intensity)
+        #[arg(short = 'i', long, default_value = "1000")]
+        work_intensity: usize,
+
+        /// Payload size in bytes
+        #[arg(short, long, default_value = "1024")]
+        payload_size: usize,
+
+        /// Maximum in-flight actions per worker
+        #[arg(short, long, default_value = "64")]
+        concurrency: usize,
+
+        /// Number of worker processes
+        #[arg(short, long, default_value = "4")]
+        workers: usize,
+
+        /// Progress reporting interval in seconds (0 to disable)
+        #[arg(long, default_value = "15")]
+        log_interval: u64,
+    },
 }
 
 #[tokio::main]
@@ -120,6 +151,7 @@ async fn main() -> Result<()> {
         Commands::Actions { workers, .. } => *workers,
         Commands::Instances { workers, .. } => *workers,
         Commands::Stress { workers, .. } => *workers,
+        Commands::Fanout { workers, .. } => *workers,
     };
 
     // Scale DB pool: base of 10 + 5 per worker to handle concurrent completions
@@ -181,6 +213,27 @@ async fn main() -> Result<()> {
                 instances,
                 fan_out,
                 loop_iterations,
+                work_intensity,
+                payload_size,
+                concurrency,
+                workers,
+                log_interval,
+            )
+            .await
+        }
+        Commands::Fanout {
+            instances,
+            fan_out,
+            work_intensity,
+            payload_size,
+            concurrency,
+            workers,
+            log_interval,
+        } => {
+            run_fanout_benchmark(
+                database,
+                instances,
+                fan_out,
                 work_intensity,
                 payload_size,
                 concurrency,
@@ -384,6 +437,82 @@ async fn run_stress_benchmark(
         total_actions,
         fan_out,
         loop_iterations,
+        work_intensity,
+        workers,
+        concurrency,
+        summary.elapsed,
+        summary.throughput_per_sec,
+        workflow_rate,
+        summary.p95_round_trip_ms,
+    );
+
+    harness.shutdown().await
+}
+
+async fn run_fanout_benchmark(
+    database: Database,
+    instances: usize,
+    fan_out: usize,
+    work_intensity: usize,
+    payload_size: usize,
+    concurrency: usize,
+    workers: usize,
+    log_interval: u64,
+) -> Result<()> {
+    // Actions per instance: 1 (setup) + fan_out (parallel) + 1 (finalize)
+    let actions_per_instance = 1 + fan_out + 1;
+    let total_actions = instances * actions_per_instance;
+
+    info!(
+        instances,
+        fan_out,
+        work_intensity,
+        actions_per_instance,
+        total_actions,
+        workers,
+        concurrency,
+        "starting fanout benchmark"
+    );
+
+    let worker_config = PythonWorkerConfig::default();
+    let harness = FanoutBenchmarkHarness::new(database, workers, worker_config).await?;
+
+    let config = FanoutBenchmarkConfig {
+        instance_count: instances,
+        fan_out_factor: fan_out,
+        work_intensity,
+        payload_size,
+        in_flight: concurrency,
+        progress_interval: if log_interval == 0 {
+            None
+        } else {
+            Some(Duration::from_secs(log_interval))
+        },
+    };
+
+    let summary = harness.run(&config).await?;
+    summary.log();
+
+    let workflow_rate = instances as f64 / summary.elapsed.as_secs_f64().max(1e-9);
+
+    println!(
+        "\n=== Fanout Benchmark Results ===\n\
+         Workflow instances:    {}\n\
+         Actions per instance:  {}\n\
+         Total actions:         {}\n\
+         Fan-out factor:        {}\n\
+         Work intensity:        {}\n\
+         Workers:               {}\n\
+         Concurrency/worker:    {}\n\
+         \n\
+         Elapsed time:          {:.2?}\n\
+         Throughput:            {:.0} actions/s\n\
+         Workflow rate:         {:.2} workflows/s\n\
+         P95 round-trip:        {:.2}ms\n",
+        instances,
+        actions_per_instance,
+        total_actions,
+        fan_out,
         work_intensity,
         workers,
         concurrency,

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use rappel::{
-    AppConfig, Database, PollingConfig, PollingDispatcher, PythonWorkerConfig, PythonWorkerPool,
+    AppConfig, Database, Dispatcher, DispatcherConfig, PythonWorkerConfig, PythonWorkerPool,
     server_worker::WorkerBridgeServer,
 };
 use tokio::{select, signal};
@@ -27,13 +27,13 @@ async fn main() -> Result<()> {
     let pool =
         Arc::new(PythonWorkerPool::new(config, worker_count, Arc::clone(&worker_server)).await?);
 
-    let polling_config = PollingConfig {
+    let dispatcher_config = DispatcherConfig {
         poll_interval: worker_settings.poll_interval,
         batch_size: worker_settings.batch_size,
         max_concurrent: worker_settings.max_concurrent,
     };
     let dispatcher =
-        PollingDispatcher::start(polling_config, Arc::clone(&database), Arc::clone(&pool));
+        Dispatcher::start(dispatcher_config, Arc::clone(&database), Arc::clone(&pool));
     info!(
         worker_count,
         max_concurrent = worker_settings.max_concurrent,
