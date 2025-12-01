@@ -1019,11 +1019,13 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         if parsed is None:
             return False
 
-        preamble_stmts, action_stmts, accumulator, result_var = parsed
+        preamble_stmts, action_stmts, accumulators = parsed
 
-        # Need at least 2 actions to use multi-action loop
-        # (single action handled by _handle_loop_controller)
-        if len(action_stmts) < 2:
+        # Use multi-action loop for:
+        # - Multiple actions in body, OR
+        # - Multiple accumulators (even with single action)
+        # Single action with single accumulator is handled by _handle_loop_controller
+        if len(action_stmts) < 2 and len(accumulators) < 2:
             return False
 
         loop_var = node.target.id
@@ -1039,19 +1041,22 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         # Generate unique loop ID
         loop_id = self._new_loop_id()
 
-        # 1. Create iterator source node (computes the iterable and initializes accumulator)
+        # 1. Create iterator source node (computes the iterable and initializes accumulators)
         iter_source_id = self._new_node_id()
-        iter_source_code = f"__iter_{loop_id} = list({iterable_expr})\n{accumulator} = []"
+        accumulator_inits = "\n".join(f"{acc} = []" for acc, _ in accumulators)
+        iter_source_code = f"__iter_{loop_id} = list({iterable_expr})\n{accumulator_inits}"
+        accumulator_names = [acc for acc, _ in accumulators]
         iter_source_node = DagNode(
             id=iter_source_id,
             action="python_block",
             kwargs={"code": iter_source_code, "imports": "", "definitions": ""},
             depends_on=sorted(set(dependencies)),
-            produces=[f"__iter_{loop_id}", accumulator],
+            produces=[f"__iter_{loop_id}"] + accumulator_names,
         )
         self.nodes.append(iter_source_node)
         self._record_variable_producer(f"__iter_{loop_id}", iter_source_id)
-        self._record_variable_producer(accumulator, iter_source_id)
+        for acc in accumulator_names:
+            self._record_variable_producer(acc, iter_source_id)
 
         # 2. Create loop_head synthetic node (ID reserved, added later)
         loop_head_id = self._new_node_id()
@@ -1143,13 +1148,18 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self.nodes.append(exit_node)
 
         # 5. Create loop_head node with metadata
+        # Build AccumulatorSpec for each accumulator with its source expression
+        accumulator_specs = [
+            AccumulatorSpec(var=acc_name, source_node=body_tail_id, source_expr=source_expr)
+            for acc_name, source_expr in accumulators
+        ]
         loop_head_meta = LoopHeadMeta(
             iterator_source=iter_source_id,
             loop_var=loop_var,
             body_entry=[body_node_ids[0]],  # First body node
             body_tail=body_tail_id,
             exit_target=exit_node_id,
-            accumulators=[AccumulatorSpec(var=accumulator, source_node=body_tail_id)],
+            accumulators=accumulator_specs,
             preamble=[
                 PreambleOp(op_type="set_iterator_index", var=f"__idx_{loop_id}"),
                 PreambleOp(op_type="set_iterator_value", var=loop_var),
@@ -1181,42 +1191,57 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self._add_edge(body_tail_id, loop_head_id, EdgeType.BACK)
         self._add_edge(loop_head_id, exit_node_id, EdgeType.BREAK)
 
-        # Update variable tracking - accumulator is "produced" by exit node for downstream deps
-        self._record_variable_producer(accumulator, exit_node_id)
-        self._collections.pop(accumulator, None)
+        # Update variable tracking - all accumulators are "produced" by exit node for downstream deps
+        for acc_name in accumulator_names:
+            self._record_variable_producer(acc_name, exit_node_id)
+            self._collections.pop(acc_name, None)
         self._last_node_id = exit_node_id
         return True
 
     def _parse_multi_action_loop_body(
         self, body: List[ast.stmt]
-    ) -> Optional[Tuple[List[ast.stmt], List[Tuple[str, ParsedActionCall]], str, str]]:
+    ) -> Optional[Tuple[List[ast.stmt], List[Tuple[str, ParsedActionCall]], List[Tuple[str, str]]]]:
         """Parse a loop body with potentially multiple action calls.
 
         Returns:
-            Tuple of (preamble_stmts, action_stmts, accumulator, result_var) or None
+            Tuple of (preamble_stmts, action_stmts, accumulators) or None
             - preamble_stmts: statements before any action
             - action_stmts: list of (target_var, ParsedActionCall) tuples
-            - accumulator: name of the accumulator list
-            - result_var: variable being appended to accumulator
+            - accumulators: list of (accumulator_name, source_var) tuples
         """
         if len(body) < 2:
             return None
 
-        # Last statement must be accumulator.append(var)
-        append_target = self._extract_append_target(body[-1])
-        if append_target is None:
-            return None
-        accumulator, appended_value = append_target
-        if not isinstance(appended_value, ast.Name):
-            return None
-        result_var = appended_value.id
+        # Extract trailing append statements (one or more)
+        append_stmts: List[Tuple[str, str]] = []  # (accumulator, source_var)
+        non_append_body = list(body)
 
-        # Scan body (excluding append) for action calls
+        while non_append_body:
+            append_target = self._extract_append_target(non_append_body[-1])
+            if append_target is None:
+                break
+            accumulator, appended_value = append_target
+            # Appended value can be a name or an attribute access (e.g., processed["result"])
+            if isinstance(appended_value, ast.Name):
+                source_var = appended_value.id
+            elif isinstance(appended_value, ast.Subscript):
+                # Allow subscript access like processed["result"]
+                source_var = ast.unparse(appended_value)
+            else:
+                break
+            append_stmts.insert(0, (accumulator, source_var))
+            non_append_body = non_append_body[:-1]
+
+        # Need at least one append
+        if not append_stmts:
+            return None
+
+        # Scan body (excluding appends) for action calls
         action_stmts: List[Tuple[str, ParsedActionCall]] = []
         preamble_stmts: List[ast.stmt] = []
         found_first_action = False
 
-        for stmt in body[:-1]:  # Exclude the append statement
+        for stmt in non_append_body:
             if isinstance(stmt, ast.Assign):
                 if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
                     action_call = self._extract_action_call(stmt.value)
@@ -1245,12 +1270,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         if not action_stmts:
             return None
 
-        # The result_var must match the output of the last action
-        last_action_var = action_stmts[-1][0]
-        if result_var != last_action_var:
-            return None
-
-        return preamble_stmts, action_stmts, accumulator, result_var
+        return preamble_stmts, action_stmts, append_stmts
 
     def _parse_loop_controller_body(
         self, body: List[ast.stmt]

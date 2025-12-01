@@ -574,7 +574,7 @@ struct MultiActionPhaseEvaluation {
 #[derive(Debug, Clone)]
 struct MultiActionLoopState {
     current_index: usize,
-    accumulator: Vec<Value>,
+    accumulators: HashMap<String, Vec<Value>>,
     completed_phases: HashSet<String>,
     phase_results: HashMap<String, Value>,
     preamble_results: HashMap<String, Value>,
@@ -600,6 +600,39 @@ fn extract_accumulator(ctx: &EvalContext, name: &str) -> Vec<Value> {
         Value::Null => Vec::new(),
         other => vec![other.clone()],
     }
+}
+
+/// Evaluate a source expression like "var_name['key']" or just "var_name"
+/// against an eval context. Supports patterns:
+///   - "var_name" -> look up var_name in context
+///   - "var_name['key']" -> look up var_name in context, then subscript with 'key'
+///   - "var_name[\"key\"]" -> same with double quotes
+fn evaluate_source_expr(expr: &str, ctx: &EvalContext) -> Option<Value> {
+    // Try to parse "var['key']" or "var[\"key\"]" pattern
+    if let Some(bracket_pos) = expr.find('[') {
+        let var_name = &expr[..bracket_pos];
+        let rest = &expr[bracket_pos..];
+
+        // Get the variable value
+        let var_value = ctx.get(var_name)?;
+
+        // Parse the key from ['key'] or ["key"]
+        // rest looks like "['key']" or "[\"key\"]"
+        if rest.starts_with("['") && rest.ends_with("']") {
+            let key = &rest[2..rest.len() - 2];
+            if let Value::Object(obj) = var_value {
+                return obj.get(key).cloned();
+            }
+        } else if rest.starts_with("[\"") && rest.ends_with("\"]") {
+            let key = &rest[2..rest.len() - 2];
+            if let Value::Object(obj) = var_value {
+                return obj.get(key).cloned();
+            }
+        }
+    }
+
+    // Simple variable lookup
+    ctx.get(expr).cloned()
 }
 
 fn evaluate_loop_iteration(
@@ -690,10 +723,11 @@ fn find_next_ready_phase(
         loop_ast.loop_var.clone(),
         items[state.current_index].clone(),
     );
-    local_ctx.insert(
-        loop_ast.accumulator.clone(),
-        Value::Array(state.accumulator.clone()),
-    );
+
+    // Insert all accumulators into context
+    for (acc_name, acc_values) in &state.accumulators {
+        local_ctx.insert(acc_name.clone(), Value::Array(acc_values.clone()));
+    }
 
     // Add phase results to context
     for (var_name, value) in &state.phase_results {
@@ -823,10 +857,13 @@ fn has_multi_action_body_graph(node: &WorkflowDagNode) -> bool {
 /// Extract multi-action loop state from context
 fn extract_multi_action_loop_state(
     ctx: &EvalContext,
-    accumulator_name: &str,
+    accumulator_names: &[String],
 ) -> MultiActionLoopState {
     let current_index = extract_loop_index(ctx);
-    let accumulator = extract_accumulator(ctx, accumulator_name);
+    let accumulators: HashMap<String, Vec<Value>> = accumulator_names
+        .iter()
+        .map(|name| (name.clone(), extract_accumulator(ctx, name)))
+        .collect();
 
     let completed_phases = ctx
         .get(LOOP_PHASE_VAR)
@@ -858,7 +895,7 @@ fn extract_multi_action_loop_state(
 
     MultiActionLoopState {
         current_index,
-        accumulator,
+        accumulators,
         completed_phases,
         phase_results,
         preamble_results,
@@ -1819,7 +1856,10 @@ impl Database {
         let ctx = eval_context_from_dispatch(dispatch)?;
 
         // Get current multi-action loop state
-        let mut state = extract_multi_action_loop_state(&ctx, &loop_ast.accumulator);
+        // For now, use the single accumulator from loop_ast (will be deprecated)
+        // TODO: Switch to loop_head_meta.accumulators when available
+        let accumulator_names = vec![loop_ast.accumulator.clone()];
+        let mut state = extract_multi_action_loop_state(&ctx, &accumulator_names);
 
         // Extract current phase info from context
         let current_phase_id = ctx
@@ -1980,14 +2020,24 @@ impl Database {
         }
 
         // No more phases - iteration is complete
-        // Extract result and add to accumulator
+        // Extract result and add to accumulator(s)
         let body_graph = loop_ast.body_graph.as_ref().context("missing body graph")?;
+
+        // For now, we use the single result_variable and single accumulator
+        // In the future, this should handle multiple accumulators with source expressions
         let result_value = state
             .phase_results
             .get(&body_graph.result_variable)
             .cloned();
         if let Some(val) = result_value {
-            state.accumulator.push(val);
+            // Push to the first (and currently only) accumulator
+            if let Some(acc_name) = accumulator_names.first() {
+                state
+                    .accumulators
+                    .entry(acc_name.clone())
+                    .or_default()
+                    .push(val);
+            }
         }
 
         // Check if there are more iterations
@@ -2003,7 +2053,7 @@ impl Database {
             let next_index = state.current_index + 1;
             let next_state = MultiActionLoopState {
                 current_index: next_index,
-                accumulator: state.accumulator.clone(),
+                accumulators: state.accumulators.clone(),
                 completed_phases: HashSet::new(),
                 phase_results: HashMap::new(),
                 preamble_results: HashMap::new(),
@@ -2014,10 +2064,11 @@ impl Database {
                 LOOP_INDEX_VAR.to_string(),
                 Value::Number(serde_json::Number::from(next_index as u64)),
             );
-            next_ctx.insert(
-                loop_ast.accumulator.clone(),
-                Value::Array(state.accumulator.clone()),
-            );
+
+            // Insert all accumulators into context
+            for (acc_name, acc_values) in &state.accumulators {
+                next_ctx.insert(acc_name.clone(), Value::Array(acc_values.clone()));
+            }
             next_ctx.remove(LOOP_PHASE_VAR);
             next_ctx.remove(LOOP_PHASE_RESULTS_VAR);
             next_ctx.remove(LOOP_PREAMBLE_RESULTS_VAR);
@@ -2027,8 +2078,6 @@ impl Database {
                 let mut new_dispatch = dispatch.clone();
 
                 // Update all context entries for new iteration
-                let accumulator_payload =
-                    encode_value_result(&Value::Array(state.accumulator.clone()))?;
                 let index_payload = encode_value_result(&Value::Number(serde_json::Number::from(
                     next_index as u64,
                 )))?;
@@ -2039,8 +2088,11 @@ impl Database {
                 let output_var_payload =
                     encode_value_result(&Value::String(next_phase.output_var.clone()))?;
 
+                // Remove old accumulator and phase context entries
+                let acc_names_set: std::collections::HashSet<String> =
+                    accumulator_names.iter().cloned().collect();
                 new_dispatch.context.retain(|ctx| {
-                    ctx.variable != loop_ast.accumulator
+                    !acc_names_set.contains(&ctx.variable)
                         && ctx.variable != LOOP_INDEX_VAR
                         && ctx.variable != LOOP_PHASE_VAR
                         && ctx.variable != LOOP_PHASE_RESULTS_VAR
@@ -2063,11 +2115,17 @@ impl Database {
                     };
                 let preamble_results_payload = encode_value_result(&preamble_results_value)?;
 
-                new_dispatch.context.push(WorkflowNodeContext {
-                    variable: loop_ast.accumulator.clone(),
-                    payload: Some(accumulator_payload),
-                    workflow_node_id: node_id.clone(),
-                });
+                // Push all accumulators to context
+                for (acc_name, acc_values) in &state.accumulators {
+                    let accumulator_payload =
+                        encode_value_result(&Value::Array(acc_values.clone()))?;
+                    new_dispatch.context.push(WorkflowNodeContext {
+                        variable: acc_name.clone(),
+                        payload: Some(accumulator_payload),
+                        workflow_node_id: node_id.clone(),
+                    });
+                }
+
                 new_dispatch.context.push(WorkflowNodeContext {
                     variable: LOOP_INDEX_VAR.to_string(),
                     payload: Some(index_payload),
@@ -2149,7 +2207,14 @@ impl Database {
         }
 
         // All iterations done - return final result
-        let final_payload = encode_value_result(&Value::Array(state.accumulator))?;
+        // For now, return the first (and currently only) accumulator
+        // TODO: Return all accumulators when multi-accumulator support is fully implemented
+        let final_accumulator = accumulator_names
+            .first()
+            .and_then(|name| state.accumulators.get(name))
+            .cloned()
+            .unwrap_or_default();
+        let final_payload = encode_value_result(&Value::Array(final_accumulator))?;
         let mut updated = record.clone();
         updated.result_payload = final_payload.encode_to_vec();
         Ok(Some(updated))
@@ -2816,21 +2881,24 @@ impl Database {
                 // Handle multi-action loops
                 if has_multi_action_body_graph(node) {
                     // Multi-action loop - dispatch first phase
-                    let state = extract_multi_action_loop_state(&eval_ctx, &loop_ast.accumulator);
+                    let accumulator_names = vec![loop_ast.accumulator.clone()];
+                    let state = extract_multi_action_loop_state(&eval_ctx, &accumulator_names);
                     let phase_eval = find_next_ready_phase(node, &eval_ctx, &state)?;
 
                     if let Some(phase_eval) = phase_eval {
                         // Build contexts for the phase
                         let mut contexts = Vec::new();
 
-                        // Add accumulator to context
-                        let accumulator_value = Value::Array(state.accumulator.clone());
-                        let accumulator_payload = encode_value_result(&accumulator_value)?;
-                        contexts.push(WorkflowNodeContext {
-                            variable: loop_ast.accumulator.clone(),
-                            payload: Some(accumulator_payload),
-                            workflow_node_id: node.id.clone(),
-                        });
+                        // Add all accumulators to context
+                        for (acc_name, acc_values) in &state.accumulators {
+                            let accumulator_value = Value::Array(acc_values.clone());
+                            let accumulator_payload = encode_value_result(&accumulator_value)?;
+                            contexts.push(WorkflowNodeContext {
+                                variable: acc_name.clone(),
+                                payload: Some(accumulator_payload),
+                                workflow_node_id: node.id.clone(),
+                            });
+                        }
 
                         // Add loop index to context
                         let index_value =
@@ -3322,8 +3390,8 @@ impl Database {
                 && let Some(loop_head_node) = dag.nodes.iter().find(|n| n.id == loop_head_id)
                 && let Some(loop_meta) = loop_head_node.loop_head_meta.as_ref()
             {
-                // Update loop state: increment index, append to accumulator
-                // First, get the result to append to accumulator
+                // Update loop state: increment index, append to accumulators
+                // First, get the result from which to extract accumulator values
                 let body_result = completion
                     .payload
                     .as_ref()
@@ -3334,7 +3402,7 @@ impl Database {
                 // Get current loop state
                 let loop_state: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
                     r#"
-                    SELECT current_index, accumulator
+                    SELECT current_index, accumulators
                     FROM loop_iteration_state
                     WHERE instance_id = $1 AND node_id = $2
                     "#,
@@ -3344,46 +3412,85 @@ impl Database {
                 .fetch_optional(tx.as_mut())
                 .await?;
 
-                let (current_index, accumulator_bytes) = loop_state.unwrap_or((0, None));
+                let (current_index, accumulators_bytes) = loop_state.unwrap_or((0, None));
 
-                // Parse accumulator and append new result
-                let mut accumulator: Vec<Value> = accumulator_bytes
+                // Parse accumulators map: { "var_name" -> [values...] }
+                let mut accumulators: HashMap<String, Vec<Value>> = accumulators_bytes
                     .as_ref()
                     .and_then(|b| serde_json::from_slice(b).ok())
                     .unwrap_or_default();
 
-                // Append the body result to the accumulator
-                accumulator.push(body_result);
+                // Create a context with the body result for evaluating source expressions
+                let mut eval_ctx = EvalContext::new();
+                // The body action produces output in a variable - for multi-action loops,
+                // we store intermediate phase results in phase_results. The last phase's
+                // result is available under the variable name it produces.
+                // For single-action multi-accumulator loops, the result is from the single action.
 
-                // Update loop state with incremented index and updated accumulator
+                // Get current eval context to have access to phase results
+                let ctx_value: Option<Value> = sqlx::query_scalar(
+                    "SELECT context_json FROM instance_eval_context WHERE instance_id = $1",
+                )
+                .bind(instance_id)
+                .fetch_optional(tx.as_mut())
+                .await?;
+
+                if let Some(Value::Object(map)) = ctx_value {
+                    for (k, v) in map {
+                        eval_ctx.insert(k, v);
+                    }
+                }
+
+                // For each accumulator, evaluate its source expression to get the value
+                for acc in &loop_meta.accumulators {
+                    let value = if let Some(source_expr) = &acc.source_expr {
+                        // Evaluate expression like "processed['result']" or just "result"
+                        // Handle patterns:
+                        //   "var_name" -> look up var_name in context
+                        //   "var_name['key']" -> look up var_name in context, then subscript
+                        evaluate_source_expr(source_expr, &eval_ctx).unwrap_or(body_result.clone())
+                    } else {
+                        // No source expression - use body result directly
+                        body_result.clone()
+                    };
+
+                    // Get or create the accumulator array and append
+                    let acc_vec = accumulators.entry(acc.var.clone()).or_default();
+                    acc_vec.push(value);
+                }
+
+                // Update loop state with incremented index and updated accumulators
                 sqlx::query(
                     r#"
                     UPDATE loop_iteration_state
-                    SET current_index = $3, accumulator = $4
+                    SET current_index = $3, accumulators = $4
                     WHERE instance_id = $1 AND node_id = $2
                     "#,
                 )
                 .bind(instance_id)
                 .bind(loop_head_id)
                 .bind(current_index + 1)
-                .bind(serde_json::to_vec(&accumulator)?)
+                .bind(serde_json::to_vec(&accumulators)?)
                 .execute(tx.as_mut())
                 .await?;
 
-                // Update the accumulator in eval_context so loop_head can see it
+                // Update each accumulator in eval_context so loop_head can see them
                 for acc in &loop_meta.accumulators {
-                    let acc_json = serde_json::json!({ &acc.var: accumulator.clone() });
-                    sqlx::query(
-                        r#"
-                        UPDATE instance_eval_context
-                        SET context_json = context_json || $2
-                        WHERE instance_id = $1
-                        "#,
-                    )
-                    .bind(instance_id)
-                    .bind(acc_json)
-                    .execute(tx.as_mut())
-                    .await?;
+                    if let Some(acc_values) = accumulators.get(&acc.var) {
+                        let acc_json =
+                            serde_json::json!({ &acc.var: Value::Array(acc_values.clone()) });
+                        sqlx::query(
+                            r#"
+                            UPDATE instance_eval_context
+                            SET context_json = context_json || $2
+                            WHERE instance_id = $1
+                            "#,
+                        )
+                        .bind(instance_id)
+                        .bind(acc_json)
+                        .execute(tx.as_mut())
+                        .await?;
+                    }
                 }
 
                 // Re-enable the loop_head by resetting it to ready state
@@ -3605,7 +3712,7 @@ impl Database {
                         // Get or initialize loop state from database
                         let loop_state: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
                             r#"
-                                SELECT current_index, accumulator
+                                SELECT current_index, accumulators
                                 FROM loop_iteration_state
                                 WHERE instance_id = $1 AND node_id = $2
                                 "#,
@@ -3616,7 +3723,7 @@ impl Database {
                         .await?;
 
                         let needs_init = loop_state.is_none();
-                        let (current_index, accumulator_bytes) = loop_state.unwrap_or((0, None));
+                        let (current_index, accumulators_bytes) = loop_state.unwrap_or((0, None));
 
                         // Get iterator length from eval_ctx
                         let iterator_source_var = dag
@@ -3638,8 +3745,8 @@ impl Database {
                             ready_node_id, iterator_source_var, iterator_len, current_index
                         );
 
-                        // Parse accumulator from bytes or default to empty array
-                        let accumulator: Vec<Value> = accumulator_bytes
+                        // Parse accumulators from bytes or default to empty map
+                        let accumulators: HashMap<String, Vec<Value>> = accumulators_bytes
                             .as_ref()
                             .and_then(|b| serde_json::from_slice(b).ok())
                             .unwrap_or_default();
@@ -3648,9 +3755,15 @@ impl Database {
                             // Continue edge: dispatch body nodes
                             // First, initialize loop state if not exists
                             if needs_init {
+                                // Initialize empty accumulators for each accumulator var
+                                let init_accumulators: HashMap<String, Vec<Value>> = loop_meta
+                                    .accumulators
+                                    .iter()
+                                    .map(|acc| (acc.var.clone(), Vec::new()))
+                                    .collect();
                                 sqlx::query(
                                         r#"
-                                        INSERT INTO loop_iteration_state (instance_id, node_id, current_index, accumulator)
+                                        INSERT INTO loop_iteration_state (instance_id, node_id, current_index, accumulators)
                                         VALUES ($1, $2, $3, $4)
                                         ON CONFLICT (instance_id, node_id) DO NOTHING
                                         "#,
@@ -3658,7 +3771,7 @@ impl Database {
                                     .bind(instance_id)
                                     .bind(&ready_node_id)
                                     .bind(0i32)
-                                    .bind(serde_json::to_vec(&accumulator)?)
+                                    .bind(serde_json::to_vec(&init_accumulators)?)
                                     .execute(tx.as_mut())
                                     .await?;
                             }
@@ -3683,7 +3796,8 @@ impl Database {
                                                 preamble_vars.insert(set_val.var.clone(), current_item.clone());
                                             }
                                             crate::messages::proto::preamble_op::Op::SetAccumulatorLen(set_len) => {
-                                                let acc_len = accumulator.len() as i64;
+                                                // Use the first accumulator's length (all should be same length in sync)
+                                                let acc_len = accumulators.values().next().map(|v| v.len()).unwrap_or(0) as i64;
                                                 preamble_vars.insert(set_len.var.clone(), Value::Number(serde_json::Number::from(acc_len)));
                                             }
                                         }
@@ -3742,8 +3856,6 @@ impl Database {
                             // Create synthetic completion to propagate context to body nodes
                             // Encode each variable separately to avoid extraction issues
                             let loop_var_payload = encode_value_result(&current_item)?;
-                            let accumulator_payload =
-                                encode_value_result(&Value::Array(accumulator.clone()))?;
 
                             // Push context to body entry nodes
                             for body_entry in &body_entries {
@@ -3763,8 +3875,12 @@ impl Database {
                                     .execute(tx.as_mut())
                                     .await?;
 
-                                // Push accumulators
+                                // Push each accumulator with its own values
                                 for acc in &loop_meta.accumulators {
+                                    let acc_values =
+                                        accumulators.get(&acc.var).cloned().unwrap_or_default();
+                                    let acc_payload =
+                                        encode_value_result(&Value::Array(acc_values))?;
                                     sqlx::query(
                                             r#"
                                             INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
@@ -3776,7 +3892,7 @@ impl Database {
                                         .bind(*body_entry)
                                         .bind(&ready_node_id)
                                         .bind(&acc.var)
-                                        .bind(Some(accumulator_payload.encode_to_vec()))
+                                        .bind(Some(acc_payload.encode_to_vec()))
                                         .execute(tx.as_mut())
                                         .await?;
                                 }
@@ -3802,9 +3918,12 @@ impl Database {
                                 .await?;
                             }
 
-                            // Store final accumulator result in eval_context
+                            // Store final accumulator results in eval_context
                             for acc in &loop_meta.accumulators {
-                                let acc_json = serde_json::json!({ &acc.var: accumulator.clone() });
+                                let acc_values =
+                                    accumulators.get(&acc.var).cloned().unwrap_or_default();
+                                let acc_json =
+                                    serde_json::json!({ &acc.var: Value::Array(acc_values) });
                                 sqlx::query(
                                     r#"
                                         UPDATE instance_eval_context
@@ -3846,7 +3965,14 @@ impl Database {
                             }
 
                             // Insert synthetic completion for the loop_head with the final accumulator
-                            let final_payload = encode_value_result(&Value::Array(accumulator))?;
+                            let final_accumulator = loop_meta
+                                .accumulators
+                                .first()
+                                .and_then(|acc_spec| accumulators.get(&acc_spec.var))
+                                .cloned()
+                                .unwrap_or_default();
+                            let final_payload =
+                                encode_value_result(&Value::Array(final_accumulator))?;
                             insert_synthetic_completion_simple_tx(
                                 tx,
                                 instance_id,
@@ -3859,10 +3985,14 @@ impl Database {
                             )
                             .await?;
 
-                            // Push context to exit targets
-                            let payload_bytes = Some(final_payload.encode_to_vec());
+                            // Push each accumulator to exit targets
                             for exit_target in &break_targets {
                                 for acc in &loop_meta.accumulators {
+                                    let acc_values =
+                                        accumulators.get(&acc.var).cloned().unwrap_or_default();
+                                    let acc_payload =
+                                        encode_value_result(&Value::Array(acc_values))?;
+                                    let payload_bytes = Some(acc_payload.encode_to_vec());
                                     sqlx::query(
                                             r#"
                                             INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
@@ -3918,19 +4048,23 @@ impl Database {
                         // Handle multi-action loops
                         if has_multi_action_body_graph(ready_node) {
                             // Multi-action loop - dispatch first phase
+                            let accumulator_names = vec![loop_ast.accumulator.clone()];
                             let state =
-                                extract_multi_action_loop_state(&eval_ctx, &loop_ast.accumulator);
+                                extract_multi_action_loop_state(&eval_ctx, &accumulator_names);
                             let phase_eval = find_next_ready_phase(ready_node, &eval_ctx, &state)?;
 
                             if let Some(phase_eval) = phase_eval {
-                                // Add accumulator to context
-                                let accumulator_value = Value::Array(state.accumulator.clone());
-                                let accumulator_payload = encode_value_result(&accumulator_value)?;
-                                contexts.push(WorkflowNodeContext {
-                                    variable: loop_ast.accumulator.clone(),
-                                    payload: Some(accumulator_payload),
-                                    workflow_node_id: ready_node_id.clone(),
-                                });
+                                // Add all accumulators to context
+                                for (acc_name, acc_values) in &state.accumulators {
+                                    let accumulator_value = Value::Array(acc_values.clone());
+                                    let accumulator_payload =
+                                        encode_value_result(&accumulator_value)?;
+                                    contexts.push(WorkflowNodeContext {
+                                        variable: acc_name.clone(),
+                                        payload: Some(accumulator_payload),
+                                        workflow_node_id: ready_node_id.clone(),
+                                    });
+                                }
 
                                 // Add loop index to context
                                 let index_value = Value::Number(serde_json::Number::from(
@@ -5013,9 +5147,10 @@ impl Database {
                 if let Some(loop_ast) = loop_ast {
                     // Check if this is a multi-action loop
                     if has_multi_action_body_graph(&node) {
+                        let accumulator_names = vec![loop_ast.accumulator.clone()];
                         let state = extract_multi_action_loop_state(
                             &scheduling_ctx.eval_ctx,
-                            &loop_ast.accumulator,
+                            &accumulator_names,
                         );
                         let phase_eval =
                             find_next_ready_phase(&node, &scheduling_ctx.eval_ctx, &state)?;
@@ -5025,14 +5160,16 @@ impl Database {
                             let mut contexts =
                                 build_dependency_contexts(&node, &scheduling_ctx.payloads);
 
-                            // Add accumulator to context
-                            let accumulator_value = Value::Array(state.accumulator.clone());
-                            let accumulator_payload = encode_value_result(&accumulator_value)?;
-                            contexts.push(WorkflowNodeContext {
-                                variable: loop_ast.accumulator.clone(),
-                                payload: Some(accumulator_payload),
-                                workflow_node_id: node_id.clone(),
-                            });
+                            // Add all accumulators to context
+                            for (acc_name, acc_values) in &state.accumulators {
+                                let accumulator_value = Value::Array(acc_values.clone());
+                                let accumulator_payload = encode_value_result(&accumulator_value)?;
+                                contexts.push(WorkflowNodeContext {
+                                    variable: acc_name.clone(),
+                                    payload: Some(accumulator_payload),
+                                    workflow_node_id: node_id.clone(),
+                                });
+                            }
 
                             // Add loop index to context
                             let index_value =
@@ -5182,11 +5319,17 @@ impl Database {
                         } else {
                             // No more phases - check if iteration complete
                             if is_iteration_complete(&node, &state) {
-                                // Extract result and add to accumulator
+                                // Extract result and add to accumulator(s)
                                 let result = extract_iteration_result(&node, &state);
-                                let mut new_accumulator = state.accumulator.clone();
+                                let mut new_accumulators = state.accumulators.clone();
                                 if let Some(result_value) = result {
-                                    new_accumulator.push(result_value);
+                                    // Push to the first (and currently only) accumulator
+                                    if let Some(acc_name) = accumulator_names.first() {
+                                        new_accumulators
+                                            .entry(acc_name.clone())
+                                            .or_default()
+                                            .push(result_value);
+                                    }
                                 }
 
                                 // Check if there are more iterations
@@ -5200,10 +5343,12 @@ impl Database {
 
                                 if state.current_index + 1 < items_len {
                                     // More iterations - update context and re-schedule
-                                    scheduling_ctx.eval_ctx.insert(
-                                        loop_ast.accumulator.clone(),
-                                        Value::Array(new_accumulator),
-                                    );
+                                    for (acc_name, acc_values) in &new_accumulators {
+                                        scheduling_ctx.eval_ctx.insert(
+                                            acc_name.clone(),
+                                            Value::Array(acc_values.clone()),
+                                        );
+                                    }
                                     scheduling_ctx.eval_ctx.insert(
                                         LOOP_INDEX_VAR.to_string(),
                                         Value::Number(serde_json::Number::from(
@@ -5218,8 +5363,14 @@ impl Database {
                                     continue;
                                 } else {
                                     // All iterations done - mark node complete
+                                    // Return the first (and currently only) accumulator
+                                    let final_accumulator = accumulator_names
+                                        .first()
+                                        .and_then(|name| new_accumulators.get(name))
+                                        .cloned()
+                                        .unwrap_or_default();
                                     let payload =
-                                        encode_value_result(&Value::Array(new_accumulator))?;
+                                        encode_value_result(&Value::Array(final_accumulator))?;
                                     insert_synthetic_completion_tx(
                                         tx,
                                         &instance,
