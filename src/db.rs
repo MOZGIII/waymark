@@ -52,27 +52,69 @@ fn compute_deps_required(node: &WorkflowDagNode, _concurrent: bool) -> i16 {
     (node.depends_on.len() + exception_sources.len()) as i16
 }
 
+use crate::messages::proto::{EdgeType, NodeType};
+
 /// Get all downstream node IDs that depend on a given node.
 /// Returns nodes that have this node in their `depends_on` list (data dependencies)
 /// or have an exception_edge referencing this node (exception handlers).
 /// Sync dependencies (wait_for_sync) are handled separately through guard evaluation.
+///
+/// For cycle-based loops: this excludes back edges (those are handled specially).
+/// Also excludes continue/break edges (those are handled by loop_head evaluation).
 fn get_downstream_nodes<'a>(
     node_id: &str,
     dag: &'a WorkflowDagDefinition,
     _concurrent: bool,
 ) -> Vec<&'a str> {
-    dag.nodes
+    use std::collections::HashSet;
+    let mut result: HashSet<&str> = HashSet::new();
+
+    // Always check depends_on for regular dependency edges
+    for n in &dag.nodes {
+        // Check if this node depends on the completed node
+        if n.depends_on.iter().any(|d| d == node_id) {
+            result.insert(n.id.as_str());
+        }
+        // Or if this node has an exception edge from the completed node
+        if n.exception_edges
+            .iter()
+            .any(|e| e.source_node_id == node_id)
+        {
+            result.insert(n.id.as_str());
+        }
+    }
+
+    // If explicit edges exist, also add forward edges (but exclude back/continue/break edges)
+    // Continue/break edges are handled specially by loop_head evaluation
+    // Back edges are handled by the back edge handler
+    for e in &dag.edges {
+        if e.from_node == node_id && e.edge_type == EdgeType::Forward as i32 {
+            result.insert(e.to_node.as_str());
+        }
+    }
+
+    result.into_iter().collect()
+}
+
+/// Get downstream nodes filtered by edge type.
+fn get_downstream_nodes_by_edge_type<'a>(
+    node_id: &str,
+    dag: &'a WorkflowDagDefinition,
+    edge_type: EdgeType,
+) -> Vec<&'a str> {
+    dag.edges
         .iter()
-        .filter(|n| {
-            // Check if this node depends on the completed node
-            n.depends_on.iter().any(|d| d == node_id)
-                // Or if this node has an exception edge from the completed node
-                || n.exception_edges
-                    .iter()
-                    .any(|e| e.source_node_id == node_id)
-        })
-        .map(|n| n.id.as_str())
+        .filter(|e| e.from_node == node_id && e.edge_type == edge_type as i32)
+        .map(|e| e.to_node.as_str())
         .collect()
+}
+
+/// Get the target of a back edge from a node.
+fn get_back_edge_target<'a>(node_id: &str, dag: &'a WorkflowDagDefinition) -> Option<&'a str> {
+    dag.edges
+        .iter()
+        .find(|e| e.from_node == node_id && e.edge_type == EdgeType::Back as i32)
+        .map(|e| e.to_node.as_str())
 }
 
 /// Cached workflow version data - avoids repeated DB lookups for the same version
@@ -158,7 +200,16 @@ fn is_truthy_value(value: &Value) -> bool {
     }
 }
 
-fn variable_map_from_value(value: &Value) -> Option<HashMap<String, Value>> {
+/// Result of extracting a variable map from a value
+#[derive(Debug)]
+enum VariableMapSource {
+    /// Variables from a WorkflowNodeResult (data.variables structure)
+    WorkflowNodeResult(HashMap<String, Value>),
+    /// Variables from a plain dict - only extract for internal temp variables
+    PlainDict(HashMap<String, Value>),
+}
+
+fn variable_map_from_value(value: &Value) -> Option<VariableMapSource> {
     if let Value::Object(map) = value {
         if let Some(Value::Object(data)) = map.get("data")
             && let Some(Value::Object(vars)) = data.get("variables")
@@ -167,13 +218,13 @@ fn variable_map_from_value(value: &Value) -> Option<HashMap<String, Value>> {
             for (k, v) in vars {
                 out.insert(k.clone(), v.clone());
             }
-            return Some(out);
+            return Some(VariableMapSource::WorkflowNodeResult(out));
         }
         let mut out = HashMap::new();
         for (k, v) in map {
             out.insert(k.clone(), v.clone());
         }
-        return Some(out);
+        return Some(VariableMapSource::PlainDict(out));
     }
     None
 }
@@ -188,15 +239,27 @@ fn extract_variables_from_result(
     };
     if node.produces.len() == 1 {
         let name = &node.produces[0];
-        if let Some(mapped) = variable_map_from_value(result).and_then(|m| m.get(name).cloned()) {
-            variables.insert(name.clone(), mapped);
-            return variables;
-        }
-        if let Value::Object(map) = result
-            && let Some(inner) = map.get(name)
-        {
-            variables.insert(name.clone(), inner.clone());
-            return variables;
+        // Check if result is a WorkflowNodeResult or plain dict
+        match variable_map_from_value(result) {
+            Some(VariableMapSource::WorkflowNodeResult(map)) => {
+                // Always extract from WorkflowNodeResult regardless of variable name
+                if let Some(value) = map.get(name) {
+                    variables.insert(name.clone(), value.clone());
+                    return variables;
+                }
+            }
+            Some(VariableMapSource::PlainDict(map)) => {
+                // Only extract from plain dict for internal temp variables (like __branch_*)
+                // For user-defined variables, we want to assign the entire dict even if it
+                // happens to contain a key matching the variable name.
+                if name.starts_with("__")
+                    && let Some(value) = map.get(name)
+                {
+                    variables.insert(name.clone(), value.clone());
+                    return variables;
+                }
+            }
+            None => {}
         }
         variables.insert(name.clone(), result.clone());
         return variables;
@@ -204,12 +267,30 @@ fn extract_variables_from_result(
     if node.produces.is_empty() {
         return variables;
     }
-    if let Some(nested) = variable_map_from_value(result) {
-        for name in &node.produces {
-            if let Some(value) = nested.get(name) {
-                variables.insert(name.clone(), value.clone());
+    // For multiple produces
+    match variable_map_from_value(result) {
+        Some(VariableMapSource::WorkflowNodeResult(nested)) => {
+            // Always extract from WorkflowNodeResult
+            for name in &node.produces {
+                if let Some(value) = nested.get(name) {
+                    variables.insert(name.clone(), value.clone());
+                }
             }
         }
+        Some(VariableMapSource::PlainDict(nested)) => {
+            // Only extract internal temp variables from plain dicts
+            for name in &node.produces {
+                if name.starts_with("__") {
+                    if let Some(value) = nested.get(name) {
+                        variables.insert(name.clone(), value.clone());
+                    }
+                } else {
+                    // For user-defined variables, assign the entire result
+                    variables.insert(name.clone(), result.clone());
+                }
+            }
+        }
+        None => {}
     }
     variables
 }
@@ -971,6 +1052,7 @@ async fn insert_synthetic_completion_tx(
 
 /// Insert a synthetic completion record directly using primitive values.
 /// This is a simpler variant of insert_synthetic_completion_tx for the push-based scheduler.
+#[allow(clippy::too_many_arguments)]
 async fn insert_synthetic_completion_simple_tx(
     tx: &mut Transaction<'_, Postgres>,
     instance_id: WorkflowInstanceId,
@@ -1071,12 +1153,20 @@ fn build_null_payload(node: &WorkflowDagNode) -> Result<Option<WorkflowArguments
     if node.produces.is_empty() {
         return Ok(None);
     }
-    let mut outer = HashMap::new();
-    let mut object = serde_json::Map::new();
+    // Create a WorkflowNodeResult-style payload with data.variables structure
+    // This ensures proper extraction for scheduler-generated null values
+    let mut variables = serde_json::Map::new();
     for name in &node.produces {
-        object.insert(name.clone(), Value::Null);
+        variables.insert(name.clone(), Value::Null);
     }
-    outer.insert("result".to_string(), Value::Object(object));
+    let data = serde_json::json!({
+        "variables": Value::Object(variables)
+    });
+    let result = serde_json::json!({
+        "data": data
+    });
+    let mut outer = HashMap::new();
+    outer.insert("result".to_string(), result);
     values_to_arguments(&outer).map(Some)
 }
 
@@ -1101,12 +1191,25 @@ fn eval_context_from_dispatch(dispatch: &WorkflowNodeDispatch) -> Result<EvalCon
             continue;
         }
         if let Some(value) = decoded.result {
-            let final_value = if let Some(mapped) =
-                variable_map_from_value(&value).and_then(|map| map.get(&entry.variable).cloned())
-            {
-                mapped
-            } else {
-                value
+            // Extract value based on source type:
+            // - WorkflowNodeResult: always extract the specific variable
+            // - PlainDict: only extract for internal temp variables (like __branch_*)
+            // For user-defined variables with plain dicts, we want to assign the entire
+            // dict even if it happens to contain a key matching the variable name.
+            let final_value = match variable_map_from_value(&value) {
+                Some(VariableMapSource::WorkflowNodeResult(map)) => {
+                    // Always extract from WorkflowNodeResult
+                    map.get(&entry.variable).cloned().unwrap_or(value)
+                }
+                Some(VariableMapSource::PlainDict(map)) => {
+                    // Only extract from plain dict for internal temp variables
+                    if entry.variable.starts_with("__") {
+                        map.get(&entry.variable).cloned().unwrap_or(value)
+                    } else {
+                        value
+                    }
+                }
+                None => value,
             };
             // Don't overwrite existing non-null values with null - this handles convergent
             // branches (try/except, if/else) where skipped nodes produce null values that
@@ -3128,6 +3231,7 @@ impl Database {
 
     /// Complete a node and propagate to downstream nodes using O(1) push logic.
     /// Uses a work queue to avoid recursion when synthetic completions trigger more completions.
+    #[allow(clippy::too_many_arguments)]
     async fn complete_node_push_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -3212,69 +3316,191 @@ impl Database {
                 }
             }
 
-            // Push context to downstream nodes
-            let payload_bytes = completion.payload.as_ref().map(|p| p.encode_to_vec());
-            let downstream = get_downstream_nodes(&completion.node_id, dag, concurrent);
+            // Handle back edges: if this node is a back edge source (loop body tail),
+            // we need to update loop state and re-enable the loop_head for next iteration
+            if let Some(loop_head_id) = get_back_edge_target(&completion.node_id, dag)
+                && let Some(loop_head_node) = dag.nodes.iter().find(|n| n.id == loop_head_id)
+                && let Some(loop_meta) = loop_head_node.loop_head_meta.as_ref()
+            {
+                // Update loop state: increment index, append to accumulator
+                // First, get the result to append to accumulator
+                let body_result = completion
+                    .payload
+                    .as_ref()
+                    .and_then(|p| decode_payload(p).ok())
+                    .and_then(|d| d.result)
+                    .unwrap_or(Value::Null);
 
-            for downstream_node_id in &downstream {
-                // Insert context for this dependency
-                let produced_vars = if node.produces.is_empty() {
-                    vec![String::new()]
-                } else {
-                    node.produces.clone()
-                };
+                // Get current loop state
+                let loop_state: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
+                    r#"
+                    SELECT current_index, accumulator
+                    FROM loop_iteration_state
+                    WHERE instance_id = $1 AND node_id = $2
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(loop_head_id)
+                .fetch_optional(tx.as_mut())
+                .await?;
 
-                for variable in &produced_vars {
+                let (current_index, accumulator_bytes) = loop_state.unwrap_or((0, None));
+
+                // Parse accumulator and append new result
+                let mut accumulator: Vec<Value> = accumulator_bytes
+                    .as_ref()
+                    .and_then(|b| serde_json::from_slice(b).ok())
+                    .unwrap_or_default();
+
+                // Append the body result to the accumulator
+                accumulator.push(body_result);
+
+                // Update loop state with incremented index and updated accumulator
+                sqlx::query(
+                    r#"
+                    UPDATE loop_iteration_state
+                    SET current_index = $3, accumulator = $4
+                    WHERE instance_id = $1 AND node_id = $2
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(loop_head_id)
+                .bind(current_index + 1)
+                .bind(serde_json::to_vec(&accumulator)?)
+                .execute(tx.as_mut())
+                .await?;
+
+                // Update the accumulator in eval_context so loop_head can see it
+                for acc in &loop_meta.accumulators {
+                    let acc_json = serde_json::json!({ &acc.var: accumulator.clone() });
                     sqlx::query(
                         r#"
-                        INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
-                        VALUES ($1, $2, $3, $4, $5)
-                        ON CONFLICT (instance_id, node_id, source_node_id, variable) DO UPDATE SET payload = $5
+                        UPDATE instance_eval_context
+                        SET context_json = context_json || $2
+                        WHERE instance_id = $1
                         "#,
                     )
                     .bind(instance_id)
-                    .bind(*downstream_node_id)
-                    .bind(&completion.node_id)
-                    .bind(variable)
-                    .bind(&payload_bytes)
+                    .bind(acc_json)
+                    .execute(tx.as_mut())
+                    .await?;
+                }
+
+                // Re-enable the loop_head by resetting it to ready state
+                // This allows it to be picked up again in the ready nodes query
+                sqlx::query(
+                    r#"
+                    UPDATE node_ready_state
+                    SET is_queued = FALSE, is_completed = FALSE, deps_satisfied = deps_required
+                    WHERE instance_id = $1 AND node_id = $2
+                    "#,
+                )
+                .bind(instance_id)
+                .bind(loop_head_id)
+                .execute(tx.as_mut())
+                .await?;
+
+                // Reset ALL body nodes so they can be unlocked again by the next continue edge
+                // Use body_nodes field which contains all nodes in the loop body
+                let body_nodes: Vec<&str> =
+                    loop_meta.body_nodes.iter().map(|s| s.as_str()).collect();
+                if !body_nodes.is_empty() {
+                    sqlx::query(
+                        r#"
+                        UPDATE node_ready_state
+                        SET is_queued = FALSE, is_completed = FALSE, deps_satisfied = 0
+                        WHERE instance_id = $1 AND node_id = ANY($2)
+                        "#,
+                    )
+                    .bind(instance_id)
+                    .bind(&body_nodes)
+                    .execute(tx.as_mut())
+                    .await?;
+                }
+
+                // Don't push context to downstream via normal mechanism for back edges
+                // The loop_head will handle distributing context when it evaluates
+                // But DO continue to the ready nodes query below
+            }
+
+            // Skip downstream context pushing for back edge sources
+            // The back edge handling already took care of re-enabling loop_head
+            let is_back_edge = get_back_edge_target(&completion.node_id, dag).is_some();
+            if !is_back_edge {
+                // Push context to downstream nodes
+                let payload_bytes = completion.payload.as_ref().map(|p| p.encode_to_vec());
+                let downstream = get_downstream_nodes(&completion.node_id, dag, concurrent);
+
+                for downstream_node_id in &downstream {
+                    // Insert context for this dependency
+                    let produced_vars = if node.produces.is_empty() {
+                        vec![String::new()]
+                    } else {
+                        node.produces.clone()
+                    };
+
+                    for variable in &produced_vars {
+                        sqlx::query(
+                            r#"
+                            INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
+                            VALUES ($1, $2, $3, $4, $5)
+                            ON CONFLICT (instance_id, node_id, source_node_id, variable) DO UPDATE SET payload = $5
+                            "#,
+                        )
+                        .bind(instance_id)
+                        .bind(*downstream_node_id)
+                        .bind(&completion.node_id)
+                        .bind(variable)
+                        .bind(&payload_bytes)
+                        .execute(tx.as_mut())
+                        .await?;
+                    }
+                }
+
+                // Increment deps_satisfied for all downstream nodes
+                if !downstream.is_empty() {
+                    let downstream_ids: Vec<&str> = downstream.to_vec();
+                    sqlx::query(
+                        r#"
+                        UPDATE node_ready_state
+                        SET deps_satisfied = deps_satisfied + 1
+                        WHERE instance_id = $1 AND node_id = ANY($2)
+                        "#,
+                    )
+                    .bind(instance_id)
+                    .bind(&downstream_ids)
                     .execute(tx.as_mut())
                     .await?;
                 }
             }
 
-            // Increment deps_satisfied for all downstream nodes
-            if !downstream.is_empty() {
-                let downstream_ids: Vec<&str> = downstream.iter().copied().collect();
-                sqlx::query(
+            // Loop until no more nodes become ready
+            // This is needed because processing synthetic nodes (like loop_head) can make other nodes ready
+            loop {
+                // Find newly ready nodes (deps_satisfied >= deps_required, not yet queued/completed)
+                let ready_nodes: Vec<String> = sqlx::query_scalar(
                     r#"
-                    UPDATE node_ready_state
-                    SET deps_satisfied = deps_satisfied + 1
-                    WHERE instance_id = $1 AND node_id = ANY($2)
+                    SELECT node_id
+                    FROM node_ready_state
+                    WHERE instance_id = $1
+                      AND deps_satisfied >= deps_required
+                      AND is_queued = FALSE
+                      AND is_completed = FALSE
                     "#,
                 )
                 .bind(instance_id)
-                .bind(&downstream_ids)
-                .execute(tx.as_mut())
+                .fetch_all(tx.as_mut())
                 .await?;
-            }
 
-            // Find newly ready nodes (deps_satisfied >= deps_required, not yet queued/completed)
-            let ready_nodes: Vec<String> = sqlx::query_scalar(
-                r#"
-                SELECT node_id
-                FROM node_ready_state
-                WHERE instance_id = $1
-                  AND deps_satisfied >= deps_required
-                  AND is_queued = FALSE
-                  AND is_completed = FALSE
-                "#,
-            )
-            .bind(instance_id)
-            .fetch_all(tx.as_mut())
-            .await?;
+                debug!(
+                    "ready_nodes after completion of {:?}: {:?}",
+                    completion.node_id, ready_nodes
+                );
 
-            // Process ready nodes - queue real actions, add synthetic completions to work queue
-            if !ready_nodes.is_empty() {
+                // Process ready nodes - queue real actions, add synthetic completions to work queue
+                if ready_nodes.is_empty() {
+                    break;
+                }
                 // Load current eval context
                 let (context_json, exceptions_json): (Value, Value) = sqlx::query_as(
                     r#"
@@ -3369,6 +3595,293 @@ impl Database {
                             success: false,
                         });
                         next_seq += 1;
+                        continue;
+                    }
+
+                    // Handle cycle-based loop_head nodes (synthetic, scheduler-evaluated)
+                    if ready_node.node_type == NodeType::LoopHead as i32
+                        && let Some(loop_meta) = ready_node.loop_head_meta.as_ref()
+                    {
+                        // Get or initialize loop state from database
+                        let loop_state: Option<(i32, Option<Vec<u8>>)> = sqlx::query_as(
+                            r#"
+                                SELECT current_index, accumulator
+                                FROM loop_iteration_state
+                                WHERE instance_id = $1 AND node_id = $2
+                                "#,
+                        )
+                        .bind(instance_id)
+                        .bind(&ready_node_id)
+                        .fetch_optional(tx.as_mut())
+                        .await?;
+
+                        let needs_init = loop_state.is_none();
+                        let (current_index, accumulator_bytes) = loop_state.unwrap_or((0, None));
+
+                        // Get iterator length from eval_ctx
+                        let iterator_source_var = dag
+                            .nodes
+                            .iter()
+                            .find(|n| n.id == loop_meta.iterator_source)
+                            .and_then(|n| n.produces.first())
+                            .map(|s| s.as_str())
+                            .unwrap_or("");
+
+                        let iterator_len = eval_ctx
+                            .get(iterator_source_var)
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+
+                        debug!(
+                            "loop_head {}: iterator_source_var={}, iterator_len={}, current_index={}",
+                            ready_node_id, iterator_source_var, iterator_len, current_index
+                        );
+
+                        // Parse accumulator from bytes or default to empty array
+                        let accumulator: Vec<Value> = accumulator_bytes
+                            .as_ref()
+                            .and_then(|b| serde_json::from_slice(b).ok())
+                            .unwrap_or_default();
+
+                        if (current_index as usize) < iterator_len {
+                            // Continue edge: dispatch body nodes
+                            // First, initialize loop state if not exists
+                            if needs_init {
+                                sqlx::query(
+                                        r#"
+                                        INSERT INTO loop_iteration_state (instance_id, node_id, current_index, accumulator)
+                                        VALUES ($1, $2, $3, $4)
+                                        ON CONFLICT (instance_id, node_id) DO NOTHING
+                                        "#,
+                                    )
+                                    .bind(instance_id)
+                                    .bind(&ready_node_id)
+                                    .bind(0i32)
+                                    .bind(serde_json::to_vec(&accumulator)?)
+                                    .execute(tx.as_mut())
+                                    .await?;
+                            }
+
+                            // Get the current item from the iterator
+                            let current_item = eval_ctx
+                                .get(iterator_source_var)
+                                .and_then(|v| v.as_array())
+                                .and_then(|a| a.get(current_index as usize))
+                                .cloned()
+                                .unwrap_or(Value::Null);
+
+                            // Evaluate preamble operations and store in eval_context
+                            let mut preamble_vars: HashMap<String, Value> = HashMap::new();
+                            for op in &loop_meta.preamble {
+                                if let Some(preamble_op) = &op.op {
+                                    match preamble_op {
+                                            crate::messages::proto::preamble_op::Op::SetIteratorIndex(set_idx) => {
+                                                preamble_vars.insert(set_idx.var.clone(), Value::Number(serde_json::Number::from(current_index)));
+                                            }
+                                            crate::messages::proto::preamble_op::Op::SetIteratorValue(set_val) => {
+                                                preamble_vars.insert(set_val.var.clone(), current_item.clone());
+                                            }
+                                            crate::messages::proto::preamble_op::Op::SetAccumulatorLen(set_len) => {
+                                                let acc_len = accumulator.len() as i64;
+                                                preamble_vars.insert(set_len.var.clone(), Value::Number(serde_json::Number::from(acc_len)));
+                                            }
+                                        }
+                                }
+                            }
+
+                            // Update eval_context with preamble results
+                            if !preamble_vars.is_empty() {
+                                let preamble_json = serde_json::to_value(&preamble_vars)?;
+                                sqlx::query(
+                                    r#"
+                                        UPDATE instance_eval_context
+                                        SET context_json = context_json || $2
+                                        WHERE instance_id = $1
+                                        "#,
+                                )
+                                .bind(instance_id)
+                                .bind(preamble_json)
+                                .execute(tx.as_mut())
+                                .await?;
+                            }
+
+                            // Unlock body_entry nodes via continue edges
+                            let body_entries = get_downstream_nodes_by_edge_type(
+                                &ready_node_id,
+                                dag,
+                                EdgeType::Continue,
+                            );
+                            debug!(
+                                "loop_head {} continue edge targets: {:?}",
+                                ready_node_id, body_entries
+                            );
+                            if !body_entries.is_empty() {
+                                sqlx::query(
+                                    r#"
+                                        UPDATE node_ready_state
+                                        SET deps_satisfied = deps_satisfied + 1
+                                        WHERE instance_id = $1 AND node_id = ANY($2)
+                                        "#,
+                                )
+                                .bind(instance_id)
+                                .bind(&body_entries)
+                                .execute(tx.as_mut())
+                                .await?;
+                            }
+
+                            // Mark loop_head as queued (NOT completed - it will be re-evaluated on back edge)
+                            sqlx::query(
+                                    "UPDATE node_ready_state SET is_queued = TRUE WHERE instance_id = $1 AND node_id = $2",
+                                )
+                                .bind(instance_id)
+                                .bind(&ready_node_id)
+                                .execute(tx.as_mut())
+                                .await?;
+
+                            // Create synthetic completion to propagate context to body nodes
+                            // Encode each variable separately to avoid extraction issues
+                            let loop_var_payload = encode_value_result(&current_item)?;
+                            let accumulator_payload =
+                                encode_value_result(&Value::Array(accumulator.clone()))?;
+
+                            // Push context to body entry nodes
+                            for body_entry in &body_entries {
+                                // Push loop variable
+                                sqlx::query(
+                                        r#"
+                                        INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
+                                        VALUES ($1, $2, $3, $4, $5)
+                                        ON CONFLICT (instance_id, node_id, source_node_id, variable) DO UPDATE SET payload = $5
+                                        "#,
+                                    )
+                                    .bind(instance_id)
+                                    .bind(*body_entry)
+                                    .bind(&ready_node_id)
+                                    .bind(&loop_meta.loop_var)
+                                    .bind(Some(loop_var_payload.encode_to_vec()))
+                                    .execute(tx.as_mut())
+                                    .await?;
+
+                                // Push accumulators
+                                for acc in &loop_meta.accumulators {
+                                    sqlx::query(
+                                            r#"
+                                            INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
+                                            VALUES ($1, $2, $3, $4, $5)
+                                            ON CONFLICT (instance_id, node_id, source_node_id, variable) DO UPDATE SET payload = $5
+                                            "#,
+                                        )
+                                        .bind(instance_id)
+                                        .bind(*body_entry)
+                                        .bind(&ready_node_id)
+                                        .bind(&acc.var)
+                                        .bind(Some(accumulator_payload.encode_to_vec()))
+                                        .execute(tx.as_mut())
+                                        .await?;
+                                }
+                            }
+                        } else {
+                            // Break edge: loop finished, unlock exit_target
+                            let break_targets = get_downstream_nodes_by_edge_type(
+                                &ready_node_id,
+                                dag,
+                                EdgeType::Break,
+                            );
+                            if !break_targets.is_empty() {
+                                sqlx::query(
+                                    r#"
+                                        UPDATE node_ready_state
+                                        SET deps_satisfied = deps_satisfied + 1
+                                        WHERE instance_id = $1 AND node_id = ANY($2)
+                                        "#,
+                                )
+                                .bind(instance_id)
+                                .bind(&break_targets)
+                                .execute(tx.as_mut())
+                                .await?;
+                            }
+
+                            // Store final accumulator result in eval_context
+                            for acc in &loop_meta.accumulators {
+                                let acc_json = serde_json::json!({ &acc.var: accumulator.clone() });
+                                sqlx::query(
+                                    r#"
+                                        UPDATE instance_eval_context
+                                        SET context_json = context_json || $2
+                                        WHERE instance_id = $1
+                                        "#,
+                                )
+                                .bind(instance_id)
+                                .bind(acc_json)
+                                .execute(tx.as_mut())
+                                .await?;
+                            }
+
+                            // Mark loop_head as completed
+                            sqlx::query(
+                                    "UPDATE node_ready_state SET is_queued = TRUE, is_completed = TRUE WHERE instance_id = $1 AND node_id = $2",
+                                )
+                                .bind(instance_id)
+                                .bind(&ready_node_id)
+                                .execute(tx.as_mut())
+                                .await?;
+
+                            // Mark all body nodes as completed too since the loop is done
+                            // (They were reset by the last back edge, but won't execute again)
+                            let body_nodes: Vec<&str> =
+                                loop_meta.body_nodes.iter().map(|s| s.as_str()).collect();
+                            if !body_nodes.is_empty() {
+                                sqlx::query(
+                                    r#"
+                                        UPDATE node_ready_state
+                                        SET is_queued = TRUE, is_completed = TRUE
+                                        WHERE instance_id = $1 AND node_id = ANY($2)
+                                        "#,
+                                )
+                                .bind(instance_id)
+                                .bind(&body_nodes)
+                                .execute(tx.as_mut())
+                                .await?;
+                            }
+
+                            // Insert synthetic completion for the loop_head with the final accumulator
+                            let final_payload = encode_value_result(&Value::Array(accumulator))?;
+                            insert_synthetic_completion_simple_tx(
+                                tx,
+                                instance_id,
+                                partition_id,
+                                ready_node,
+                                workflow_input,
+                                next_seq,
+                                Some(final_payload.clone()),
+                                true,
+                            )
+                            .await?;
+
+                            // Push context to exit targets
+                            let payload_bytes = Some(final_payload.encode_to_vec());
+                            for exit_target in &break_targets {
+                                for acc in &loop_meta.accumulators {
+                                    sqlx::query(
+                                            r#"
+                                            INSERT INTO node_pending_context (instance_id, node_id, source_node_id, variable, payload)
+                                            VALUES ($1, $2, $3, $4, $5)
+                                            ON CONFLICT (instance_id, node_id, source_node_id, variable) DO UPDATE SET payload = $5
+                                            "#,
+                                        )
+                                        .bind(instance_id)
+                                        .bind(*exit_target)
+                                        .bind(&ready_node_id)
+                                        .bind(&acc.var)
+                                        .bind(&payload_bytes)
+                                        .execute(tx.as_mut())
+                                        .await?;
+                                }
+                            }
+
+                            next_seq += 1;
+                        }
                         continue;
                     }
 
@@ -3787,9 +4300,9 @@ impl Database {
 
                     total_queued += 1;
                     next_seq += 1;
-                }
-            }
-        }
+                } // end for ready_node_id
+            } // end loop for re-querying ready nodes
+        } // end while work_queue
 
         // Update next_action_seq
         sqlx::query("UPDATE workflow_instances SET next_action_seq = $2 WHERE id = $1")
@@ -3833,7 +4346,7 @@ impl Database {
                 )
                 .bind(instance_id)
                 .bind(
-                    &dag.nodes
+                    dag.nodes
                         .iter()
                         .filter(|n| n.produces.contains(return_variable))
                         .map(|n| n.id.as_str())

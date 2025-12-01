@@ -362,6 +362,7 @@ async fn run_instances_benchmark(
     harness.shutdown().await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_stress_benchmark(
     database: Database,
     instances: usize,
@@ -442,6 +443,7 @@ async fn run_stress_benchmark(
     harness.shutdown().await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_fanout_benchmark(
     database: Database,
     instances: usize,

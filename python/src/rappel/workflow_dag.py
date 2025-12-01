@@ -9,6 +9,22 @@ if TYPE_CHECKING:  # pragma: no cover
     from .workflow import BackoffPolicy, ExponentialBackoff, LinearBackoff, Workflow
 
 
+class EdgeType:
+    """Edge types for DAG traversal."""
+
+    FORWARD = "forward"  # Normal dependency edge
+    CONTINUE = "continue"  # Loop head -> body (more iterations)
+    BREAK = "break"  # Loop head -> exit (iterator exhausted)
+    BACK = "back"  # Loop body tail -> loop head (iteration complete)
+
+
+class NodeType:
+    """Node types for distinguishing action nodes from synthetic control nodes."""
+
+    ACTION = "action"  # Regular action node executed by workers
+    LOOP_HEAD = "loop_head"  # Synthetic loop control node (evaluated by scheduler)
+
+
 @dataclass
 class DagNode:
     id: str
@@ -27,6 +43,10 @@ class DagNode:
     multi_action_loop: Optional["MultiActionLoopSpec"] = None  # New: multi-action loops
     sleep_duration_expr: Optional[str] = None  # Expression evaluated at scheduling time
     backoff: Optional["BackoffPolicy"] = None
+    # Cycle-based loop support
+    node_type: str = NodeType.ACTION  # "action" or "loop_head"
+    loop_head_meta: Optional["LoopHeadMeta"] = None  # Metadata for loop_head nodes
+    loop_id: Optional[str] = None  # For body nodes: which loop they belong to
 
 
 RETURN_VARIABLE = "__workflow_return"
@@ -34,9 +54,51 @@ UNLIMITED_RETRIES = 2_147_483_647
 
 
 @dataclass
+class DagEdge:
+    """Represents an edge in the DAG with its type."""
+
+    from_node: str
+    to_node: str
+    edge_type: str = EdgeType.FORWARD
+
+
+@dataclass
+class PreambleOp:
+    """Pure computation operations evaluated by scheduler."""
+
+    op_type: str  # "set_iterator_index", "set_iterator_value", "set_accumulator_len"
+    var: str
+    accumulator: Optional[str] = None  # For set_accumulator_len
+
+
+@dataclass
+class AccumulatorSpec:
+    """Specifies how to collect values into an accumulator across iterations."""
+
+    var: str  # Python variable name (e.g., "results")
+    source_node: Optional[str] = None  # Node whose result to append
+    source_expr: Optional[str] = None  # Expression to evaluate
+
+
+@dataclass
+class LoopHeadMeta:
+    """Metadata for loop_head synthetic nodes."""
+
+    iterator_source: str  # Node ID that produces the iterator
+    loop_var: str  # Variable name for current item
+    body_entry: List[str]  # Entry node(s) for loop body
+    body_tail: str  # Last node before back edge
+    exit_target: str  # Node to execute after loop completes
+    accumulators: List[AccumulatorSpec]  # Variables to collect across iterations
+    preamble: List[PreambleOp]  # Pure computations before each iteration
+    body_nodes: List[str] = field(default_factory=list)  # All nodes in loop body
+
+
+@dataclass
 class WorkflowDag:
     nodes: List[DagNode]
     return_variable: Optional[str] = None
+    edges: List[DagEdge] = field(default_factory=list)  # Explicit edges with types
 
 
 @dataclass
@@ -221,7 +283,11 @@ def build_workflow_dag(workflow_cls: type["Workflow"]) -> WorkflowDag:
     builder = WorkflowDagBuilder(action_defs, module_index, function_source)
     builder.visit(tree)
     builder.ensure_return_variable()
-    return WorkflowDag(nodes=builder.nodes, return_variable=builder.return_variable)
+    return WorkflowDag(
+        nodes=builder.nodes,
+        return_variable=builder.return_variable,
+        edges=builder.edges,
+    )
 
 
 def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
@@ -312,6 +378,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         source: str,
     ) -> None:
         self.nodes: List[DagNode] = []
+        self.edges: List[DagEdge] = []  # Explicit edges for cycle-based loops
         # Track the latest producer of each variable for dependency lookup
         self._var_to_node: Dict[str, str] = {}
         # Track ALL producers of each variable (for convergent branches like try/except, if/else)
@@ -325,6 +392,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         self._return_variable: Optional[str] = None
         self._try_stack: List[_TryScope] = []
         self._handler_stack: List[_ExceptionHandlerContext] = []
+        self._loop_counter = 0  # Counter for generating unique loop IDs
 
     # pylint: disable=too-many-return-statements
     def visit_Assign(self, node: ast.Assign) -> Any:
@@ -801,27 +869,133 @@ class WorkflowDagBuilder(ast.NodeVisitor):
             dependencies.extend(self._dependencies_from_node(stmt))
         body_kwargs, kw_deps, action_name, action_module = self._loop_body_metadata(action_call)
         dependencies.extend(kw_deps)
-        loop_spec = LoopSpec(
-            iterable_expr=iterable_expr,
-            loop_var=loop_var,
-            accumulator=accumulator,
-            body_action=action_name,
-            body_kwargs=body_kwargs,
-            preamble=self._format_preamble_snippet(preamble) if preamble else None,
-            body_module=action_module,
-        )
-        dag_node = DagNode(
-            id=self._new_node_id(),
-            action="loop",
-            kwargs={},
+
+        # Generate unique loop ID
+        loop_id = self._new_loop_id()
+
+        # 1. Create iterator source node (computes the iterable and initializes accumulator)
+        iter_source_id = self._new_node_id()
+        iter_source_code = f"__iter_{loop_id} = list({iterable_expr})\n{accumulator} = []"
+        iter_source_node = DagNode(
+            id=iter_source_id,
+            action="python_block",
+            kwargs={"code": iter_source_code, "imports": "", "definitions": ""},
             depends_on=sorted(set(dependencies)),
-            produces=[accumulator],
-            module="rappel.workflow_runtime",
-            loop=loop_spec,
+            produces=[f"__iter_{loop_id}", accumulator],
         )
-        self._record_variable_producer(accumulator, dag_node.id)
+        self.nodes.append(iter_source_node)
+        self._record_variable_producer(f"__iter_{loop_id}", iter_source_id)
+        self._record_variable_producer(accumulator, iter_source_id)
+
+        # 2. Create loop_head synthetic node
+        loop_head_id = self._new_node_id()
+
+        # 2b. Create preamble node if there are preamble statements
+        preamble_node_id: Optional[str] = None
+        if preamble:
+            preamble_node_id = self._new_node_id()
+            preamble_code = "\n".join(ast.unparse(stmt) for stmt in preamble)
+            preamble_produces: List[str] = []
+            for stmt in preamble:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            preamble_produces.append(target.id)
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    preamble_produces.append(stmt.target.id)
+            preamble_node = DagNode(
+                id=preamble_node_id,
+                action="python_block",
+                kwargs={"code": preamble_code, "imports": "", "definitions": ""},
+                depends_on=[loop_head_id],
+                produces=preamble_produces,
+                loop_id=loop_id,
+            )
+            self.nodes.append(preamble_node)
+            for var in preamble_produces:
+                self._record_variable_producer(var, preamble_node_id)
+
+        # Determine what the body action depends on
+        body_depends_on = preamble_node_id if preamble_node_id else loop_head_id
+
+        # 3. Create body action node
+        body_node_id = self._new_node_id()
+        body_node = DagNode(
+            id=body_node_id,
+            action=action_name,
+            kwargs=body_kwargs,
+            module=action_module,
+            depends_on=[body_depends_on],  # Depends on preamble or loop_head
+            produces=[],  # Result captured by accumulator update
+            loop_id=loop_id,
+        )
+        if action_call.config:
+            if action_call.config.timeout_seconds is not None:
+                body_node.timeout_seconds = action_call.config.timeout_seconds
+            if action_call.config.max_retries is not None:
+                body_node.max_retries = action_call.config.max_retries
+            if action_call.config.backoff is not None:
+                body_node.backoff = action_call.config.backoff
+        self.nodes.append(body_node)
+
+        # 4. Create exit node (finalizes the accumulator)
+        exit_node_id = self._new_node_id()
+        exit_node = DagNode(
+            id=exit_node_id,
+            action="python_block",
+            kwargs={"code": f"pass  # Loop {loop_id} complete", "imports": "", "definitions": ""},
+            depends_on=[loop_head_id],  # Will be unlocked via break edge
+            produces=[],
+        )
+        self.nodes.append(exit_node)
+
+        # 5. Create loop_head node with metadata
+        # body_entry is the first node after continue edge (preamble or body action)
+        # body_tail is the last node before back edge (always the body action)
+        body_entry_id = preamble_node_id if preamble_node_id else body_node_id
+        # Collect all body nodes for reset on back edge
+        all_body_nodes = [preamble_node_id, body_node_id] if preamble_node_id else [body_node_id]
+        loop_head_meta = LoopHeadMeta(
+            iterator_source=iter_source_id,
+            loop_var=loop_var,
+            body_entry=[body_entry_id],
+            body_tail=body_node_id,
+            exit_target=exit_node_id,
+            accumulators=[AccumulatorSpec(var=accumulator, source_node=body_node_id)],
+            preamble=[
+                PreambleOp(op_type="set_iterator_index", var=f"__idx_{loop_id}"),
+                PreambleOp(op_type="set_iterator_value", var=loop_var),
+            ],
+            body_nodes=all_body_nodes,
+        )
+        loop_head_node = DagNode(
+            id=loop_head_id,
+            action="loop_head",
+            kwargs={},
+            module="rappel.workflow_runtime",
+            depends_on=[iter_source_id],
+            produces=[loop_var, f"__idx_{loop_id}"],
+            node_type=NodeType.LOOP_HEAD,
+            loop_head_meta=loop_head_meta,
+            loop_id=loop_id,
+        )
+        self.nodes.append(loop_head_node)
+
+        # 6. Add edges
+        self._add_edge(iter_source_id, loop_head_id, EdgeType.FORWARD)
+        # Continue edge goes to body_entry (preamble or body action)
+        self._add_edge(loop_head_id, body_entry_id, EdgeType.CONTINUE)
+        # If we have a preamble, add forward edge from preamble to body action
+        if preamble_node_id:
+            self._add_edge(preamble_node_id, body_node_id, EdgeType.FORWARD)
+        # Back edge comes from body_tail (body action)
+        self._add_edge(body_node_id, loop_head_id, EdgeType.BACK)
+        self._add_edge(loop_head_id, exit_node_id, EdgeType.BREAK)
+
+        # Update variable tracking - accumulator is "produced" by exit node for downstream deps
+        self._record_variable_producer(accumulator, exit_node_id)
         self._collections.pop(accumulator, None)
-        self._append_node(dag_node)
+        self._last_node_id = exit_node_id
         return True
 
     def _handle_multi_action_loop(self, node: ast.For) -> bool:
@@ -835,6 +1009,8 @@ class WorkflowDagBuilder(ast.NodeVisitor):
                 b = await action_two(y=a)
                 # ... more actions
                 results.append(final_var)
+
+        Emits cycle-based loop structure with multiple body action nodes.
         """
         if node.orelse or not isinstance(node.target, ast.Name):
             return False
@@ -846,7 +1022,7 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         preamble_stmts, action_stmts, accumulator, result_var = parsed
 
         # Need at least 2 actions to use multi-action loop
-        # (single action handled by legacy _handle_loop_controller)
+        # (single action handled by _handle_loop_controller)
         if len(action_stmts) < 2:
             return False
 
@@ -860,21 +1036,31 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         for stmt in preamble_stmts:
             dependencies.extend(self._dependencies_from_node(stmt))
 
-        # Extract dependencies from action kwargs
-        for _, action_call in action_stmts:
-            call = action_call.call
-            for kw in call.keywords:
-                if kw.arg is not None:
-                    dependencies.extend(self._dependencies_from_node(kw.value))
-            for arg in call.args:
-                dependencies.extend(self._dependencies_from_node(arg))
+        # Generate unique loop ID
+        loop_id = self._new_loop_id()
 
-        # Build the body graph nodes
-        body_nodes: List[LoopBodyNode] = []
-        phase_var_to_id: Dict[str, str] = {}  # Maps output_var -> phase_id
+        # 1. Create iterator source node (computes the iterable and initializes accumulator)
+        iter_source_id = self._new_node_id()
+        iter_source_code = f"__iter_{loop_id} = list({iterable_expr})\n{accumulator} = []"
+        iter_source_node = DagNode(
+            id=iter_source_id,
+            action="python_block",
+            kwargs={"code": iter_source_code, "imports": "", "definitions": ""},
+            depends_on=sorted(set(dependencies)),
+            produces=[f"__iter_{loop_id}", accumulator],
+        )
+        self.nodes.append(iter_source_node)
+        self._record_variable_producer(f"__iter_{loop_id}", iter_source_id)
+        self._record_variable_producer(accumulator, iter_source_id)
+
+        # 2. Create loop_head synthetic node (ID reserved, added later)
+        loop_head_id = self._new_node_id()
+
+        # 3. Create body action nodes
+        body_node_ids: List[str] = []
+        prev_body_node_id: Optional[str] = None
 
         for idx, (target_var, action_call) in enumerate(action_stmts):
-            phase_id = f"phase_{idx}"
             call = action_call.call
 
             # Get action metadata
@@ -883,18 +1069,10 @@ class WorkflowDagBuilder(ast.NodeVisitor):
 
             # Build kwargs
             kwargs: Dict[str, str] = {}
-            phase_deps: List[str] = []
-
             for kw in call.keywords:
                 if kw.arg is None:
                     continue
-                expr_str = ast.unparse(kw.value)
-                kwargs[kw.arg] = expr_str
-
-                # Check if this kwarg references another phase's output
-                for ref_var, ref_phase_id in phase_var_to_id.items():
-                    if ref_var in expr_str:
-                        phase_deps.append(ref_phase_id)
+                kwargs[kw.arg] = ast.unparse(kw.value)
 
             # Handle positional arguments
             if call.args:
@@ -908,9 +1086,6 @@ class WorkflowDagBuilder(ast.NodeVisitor):
                 arg_mappings = self._map_positional_args(call, action_def, used_keys)
                 for key, expr in arg_mappings:
                     kwargs[key] = expr
-                    for ref_var, ref_phase_id in phase_var_to_id.items():
-                        if ref_var in expr:
-                            phase_deps.append(ref_phase_id)
 
             # Determine module
             if action_def:
@@ -920,51 +1095,96 @@ class WorkflowDagBuilder(ast.NodeVisitor):
                 module_name = None
                 resolved_action_name = action_name
 
-            # Get timeout/retry config if present
-            config = action_call.config
+            body_node_id = self._new_node_id()
+            body_node_ids.append(body_node_id)
 
-            body_node = LoopBodyNode(
-                id=phase_id,
+            # First body node depends on loop_head, subsequent nodes depend on previous
+            if idx == 0:
+                node_deps = [loop_head_id]
+            else:
+                node_deps = [prev_body_node_id] if prev_body_node_id else []
+
+            body_node = DagNode(
+                id=body_node_id,
                 action=resolved_action_name,
-                module=module_name,
                 kwargs=kwargs,
-                depends_on=sorted(set(phase_deps)),
-                output_var=target_var,
-                timeout_seconds=config.timeout_seconds if config else None,
-                max_retries=config.max_retries if config else None,
+                module=module_name,
+                depends_on=node_deps,
+                produces=[target_var],
+                loop_id=loop_id,
             )
-            body_nodes.append(body_node)
-            phase_var_to_id[target_var] = phase_id
 
-        # Build the body graph
-        body_graph = LoopBodyGraph(
-            nodes=body_nodes,
-            result_variable=result_var,
+            # Apply timeout/retry config if present
+            config = action_call.config
+            if config:
+                if config.timeout_seconds is not None:
+                    body_node.timeout_seconds = config.timeout_seconds
+                if config.max_retries is not None:
+                    body_node.max_retries = config.max_retries
+                if config.backoff is not None:
+                    body_node.backoff = config.backoff
+
+            self.nodes.append(body_node)
+            self._record_variable_producer(target_var, body_node_id)
+            prev_body_node_id = body_node_id
+
+        # The last body node is the tail
+        body_tail_id = body_node_ids[-1]
+
+        # 4. Create exit node (finalizes the accumulator)
+        exit_node_id = self._new_node_id()
+        exit_node = DagNode(
+            id=exit_node_id,
+            action="python_block",
+            kwargs={"code": f"pass  # Loop {loop_id} complete", "imports": "", "definitions": ""},
+            depends_on=[loop_head_id],  # Will be unlocked via break edge
+            produces=[],
         )
+        self.nodes.append(exit_node)
 
-        # Build the loop spec
-        loop_spec = MultiActionLoopSpec(
-            iterable_expr=iterable_expr,
+        # 5. Create loop_head node with metadata
+        loop_head_meta = LoopHeadMeta(
+            iterator_source=iter_source_id,
             loop_var=loop_var,
-            accumulator=accumulator,
-            body_graph=body_graph,
-            preamble=self._format_preamble_snippet(preamble_stmts) if preamble_stmts else None,
+            body_entry=[body_node_ids[0]],  # First body node
+            body_tail=body_tail_id,
+            exit_target=exit_node_id,
+            accumulators=[AccumulatorSpec(var=accumulator, source_node=body_tail_id)],
+            preamble=[
+                PreambleOp(op_type="set_iterator_index", var=f"__idx_{loop_id}"),
+                PreambleOp(op_type="set_iterator_value", var=loop_var),
+            ],
+            body_nodes=body_node_ids,  # All body nodes for reset on back edge
         )
-
-        # Create the DAG node
-        dag_node = DagNode(
-            id=self._new_node_id(),
-            action="multi_action_loop",
+        loop_head_node = DagNode(
+            id=loop_head_id,
+            action="loop_head",
             kwargs={},
-            depends_on=sorted(set(dependencies)),
-            produces=[accumulator],
             module="rappel.workflow_runtime",
-            multi_action_loop=loop_spec,
+            depends_on=[iter_source_id],
+            produces=[loop_var, f"__idx_{loop_id}"],
+            node_type=NodeType.LOOP_HEAD,
+            loop_head_meta=loop_head_meta,
+            loop_id=loop_id,
         )
+        self.nodes.append(loop_head_node)
 
-        self._record_variable_producer(accumulator, dag_node.id)
+        # 6. Add edges
+        self._add_edge(iter_source_id, loop_head_id, EdgeType.FORWARD)
+        self._add_edge(loop_head_id, body_node_ids[0], EdgeType.CONTINUE)
+
+        # Add forward edges between consecutive body nodes
+        for i in range(len(body_node_ids) - 1):
+            self._add_edge(body_node_ids[i], body_node_ids[i + 1], EdgeType.FORWARD)
+
+        # Back edge from last body node to loop head
+        self._add_edge(body_tail_id, loop_head_id, EdgeType.BACK)
+        self._add_edge(loop_head_id, exit_node_id, EdgeType.BREAK)
+
+        # Update variable tracking - accumulator is "produced" by exit node for downstream deps
+        self._record_variable_producer(accumulator, exit_node_id)
         self._collections.pop(accumulator, None)
-        self._append_node(dag_node)
+        self._last_node_id = exit_node_id
         return True
 
     def _parse_multi_action_loop_body(
@@ -1979,6 +2199,15 @@ class WorkflowDagBuilder(ast.NodeVisitor):
         node_id = f"node_{self._counter}"
         self._counter += 1
         return node_id
+
+    def _new_loop_id(self) -> str:
+        loop_id = f"loop_{self._loop_counter}"
+        self._loop_counter += 1
+        return loop_id
+
+    def _add_edge(self, from_node: str, to_node: str, edge_type: str = EdgeType.FORWARD) -> None:
+        """Add an explicit edge to the DAG."""
+        self.edges.append(DagEdge(from_node=from_node, to_node=to_node, edge_type=edge_type))
 
     def _format_call_name(self, func_ref: ast.AST) -> str:
         name = _extract_action_name(func_ref)

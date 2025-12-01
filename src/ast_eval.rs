@@ -99,14 +99,12 @@ pub fn eval_stmt(stmt: &proto::Stmt, ctx: &mut EvalContext) -> Result<()> {
         }
         proto::stmt::Kind::Expr(expr) => {
             // Handle list.append() specially since it mutates the list
-            if let Some(proto::expr::Kind::Call(call)) = &expr.kind {
-                if let Some(func) = &call.func {
-                    if let Some(proto::expr::Kind::Attribute(attr)) = &func.kind {
-                        if attr.attr == "append" {
-                            return eval_list_append(attr, &call.args, ctx);
-                        }
-                    }
-                }
+            if let Some(proto::expr::Kind::Call(call)) = &expr.kind
+                && let Some(func) = &call.func
+                && let Some(proto::expr::Kind::Attribute(attr)) = &func.kind
+                && attr.attr == "append"
+            {
+                return eval_list_append(attr, &call.args, ctx);
             }
             let _ = eval_expr(expr, ctx)?;
             Ok(())
@@ -342,13 +340,13 @@ where
     F: Fn(f64, f64) -> f64,
 {
     // Try integer arithmetic first for better precision and compatibility with subscript indexing
-    if let (Value::Number(ln), Value::Number(rn)) = (left, right) {
-        if let (Some(li), Some(ri)) = (ln.as_i64(), rn.as_i64()) {
-            let res = f(li as f64, ri as f64);
-            // If result is a whole number and fits in i64, return as integer
-            if res.fract() == 0.0 && res >= i64::MIN as f64 && res <= i64::MAX as f64 {
-                return Ok(Value::Number(Number::from(res as i64)));
-            }
+    if let (Value::Number(ln), Value::Number(rn)) = (left, right)
+        && let (Some(li), Some(ri)) = (ln.as_i64(), rn.as_i64())
+    {
+        let res = f(li as f64, ri as f64);
+        // If result is a whole number and fits in i64, return as integer
+        if res.fract() == 0.0 && res >= i64::MIN as f64 && res <= i64::MAX as f64 {
+            return Ok(Value::Number(Number::from(res as i64)));
         }
     }
     let a = to_f64(left)?;
