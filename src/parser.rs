@@ -376,7 +376,7 @@ impl<'source> Parser<'source> {
                 Token::LParen => {
                     // Function call on variable
                     self.advance();
-                    let kwargs = self.parse_kwargs()?;
+                    let (args, kwargs) = self.parse_call_args()?;
                     let end_span = self.peek_span();
                     self.expect(&Token::RParen)?;
 
@@ -384,6 +384,7 @@ impl<'source> Parser<'source> {
                         expr = ast::Expr {
                             kind: Some(ast::expr::Kind::FunctionCall(ast::FunctionCall {
                                 name: var.name,
+                                args,
                                 kwargs,
                             })),
                             span: self.make_span(span, end_span),
@@ -560,11 +561,12 @@ impl<'source> Parser<'source> {
             } else {
                 let (name, _) = self.expect_ident()?;
                 self.expect(&Token::LParen)?;
-                let kwargs = self.parse_kwargs()?;
+                let (args, kwargs) = self.parse_call_args()?;
                 self.expect(&Token::RParen)?;
                 calls.push(ast::Call {
                     kind: Some(ast::call::Kind::Function(ast::FunctionCall {
                         name,
+                        args,
                         kwargs,
                     })),
                 });
@@ -614,6 +616,61 @@ impl<'source> Parser<'source> {
         }
 
         Ok(kwargs)
+    }
+
+    /// Parse function call arguments - can be positional or keyword
+    /// Returns (positional_args, keyword_args)
+    fn parse_call_args(&mut self) -> Result<(Vec<ast::Expr>, Vec<ast::Kwarg>), ParseError> {
+        let mut args = Vec::new();
+        let mut kwargs = Vec::new();
+        let mut seen_kwarg = false;
+
+        if self.check(&Token::RParen) {
+            return Ok((args, kwargs));
+        }
+
+        loop {
+            // Check if this is a kwarg (ident followed by =)
+            if let Token::Ident(name) = self.peek() {
+                // Look ahead to see if there's an = after the ident
+                let save_pos = self.pos;
+                self.advance();
+                if self.check(&Token::Eq) {
+                    // It's a kwarg
+                    self.advance();
+                    let value = self.parse_expr()?;
+                    kwargs.push(ast::Kwarg {
+                        name,
+                        value: Some(value),
+                    });
+                    seen_kwarg = true;
+                } else {
+                    // It's a positional arg - restore position and parse as expr
+                    self.pos = save_pos;
+                    if seen_kwarg {
+                        return Err(self.error("positional argument follows keyword argument".to_string()));
+                    }
+                    args.push(self.parse_expr()?);
+                }
+            } else {
+                // Not an ident, must be a positional arg expression
+                if seen_kwarg {
+                    return Err(self.error("positional argument follows keyword argument".to_string()));
+                }
+                args.push(self.parse_expr()?);
+            }
+
+            if self.check(&Token::Comma) {
+                self.advance();
+                if self.check(&Token::RParen) {
+                    break; // Trailing comma
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok((args, kwargs))
     }
 
     fn parse_kwarg(&mut self) -> Result<ast::Kwarg, ParseError> {
@@ -958,12 +1015,13 @@ impl<'source> Parser<'source> {
                     if let Some(ast::expr::Kind::Variable(var)) = &expr.kind {
                         let name = var.name.clone();
                         self.advance();
-                        let kwargs = self.parse_kwargs()?;
+                        let (args, kwargs) = self.parse_call_args()?;
                         let end_span = self.peek_span();
                         self.expect(&Token::RParen)?;
                         expr = ast::Expr {
                             kind: Some(ast::expr::Kind::FunctionCall(ast::FunctionCall {
                                 name,
+                                args,
                                 kwargs,
                             })),
                             span: self.make_span(start_span, end_span),
@@ -1268,5 +1326,264 @@ mod tests {
 
         // try/except + return
         assert_eq!(body.statements.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_for_loop_with_unpacking() {
+        let source = r#"fn process(input: [items], output: [results]):
+    results = []
+    for i, item in enumerate(items):
+        result = @process_item(index=i, item=item)
+        results = results + [result]
+    return results"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        // Check for loop has two loop vars
+        if let Some(ast::statement::Kind::ForLoop(for_loop)) = &body.statements[1].kind {
+            assert_eq!(for_loop.loop_vars, vec!["i", "item"]);
+        } else {
+            panic!("expected for loop");
+        }
+    }
+
+    #[test]
+    fn test_parse_exception_type_arrow_syntax() {
+        let source = r#"fn fetch(input: [url], output: [data]):
+    data = @http_get(url=url) [NetworkError -> retry: 5, backoff: 2m]
+    return data"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        // Check the action call has a retry policy with exception type
+        if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
+            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind {
+                assert_eq!(action.policies.len(), 1);
+                if let Some(ast::policy_bracket::Kind::Retry(retry)) = &action.policies[0].kind {
+                    assert_eq!(retry.exception_types, vec!["NetworkError"]);
+                    assert_eq!(retry.max_retries, 5);
+                    assert_eq!(retry.backoff.as_ref().unwrap().seconds, 120); // 2m = 120s
+                } else {
+                    panic!("expected retry policy");
+                }
+            } else {
+                panic!("expected action call");
+            }
+        } else {
+            panic!("expected assignment");
+        }
+    }
+
+    #[test]
+    fn test_parse_multiple_policy_brackets() {
+        let source = r#"fn fetch(input: [url], output: [data]):
+    data = @http_get(url=url) [retry: 3, backoff: 30s] [timeout: 60s]
+    return data"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
+            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind {
+                assert_eq!(action.policies.len(), 2);
+                // First is retry
+                assert!(matches!(&action.policies[0].kind, Some(ast::policy_bracket::Kind::Retry(_))));
+                // Second is timeout
+                if let Some(ast::policy_bracket::Kind::Timeout(timeout)) = &action.policies[1].kind {
+                    assert_eq!(timeout.timeout.as_ref().unwrap().seconds, 60);
+                } else {
+                    panic!("expected timeout policy");
+                }
+            } else {
+                panic!("expected action call");
+            }
+        } else {
+            panic!("expected assignment");
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_block() {
+        let source = r#"fn fetch_all(input: [ids], output: [results]):
+    results = parallel:
+        @fetch_user(id=1)
+        @fetch_user(id=2)
+        @fetch_user(id=3)
+    return results"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        if let Some(ast::statement::Kind::ParallelBlock(parallel)) = &body.statements[0].kind {
+            assert_eq!(parallel.target, Some("results".to_string()));
+            assert_eq!(parallel.calls.len(), 3);
+        } else {
+            panic!("expected parallel block");
+        }
+    }
+
+    #[test]
+    fn test_parse_in_operator() {
+        let source = r#"fn check(input: [item, items], output: [result]):
+    if item in items:
+        result = True
+    else:
+        result = False
+    return result"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        if let Some(ast::statement::Kind::Conditional(cond)) = &body.statements[0].kind {
+            let if_branch = cond.if_branch.as_ref().unwrap();
+            if let Some(ast::expr::Kind::BinaryOp(binop)) = &if_branch.condition.as_ref().unwrap().kind {
+                assert_eq!(binop.op, ast::BinaryOperator::BinaryOpIn as i32);
+            } else {
+                panic!("expected binary op");
+            }
+        } else {
+            panic!("expected conditional");
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_subscript() {
+        let source = r#"fn get(input: [data], output: [result]):
+    result = data["users"][0]["name"]
+    return result"#;
+
+        let program = parse(source).unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_comprehensive_workflow() {
+        // This is the comprehensive example from the IR spec
+        let source = r#"fn process_orders(input: [orders, config], output: [summary]):
+    inventory = @fetch_inventory(warehouse=config["warehouse"])
+
+    valid_orders = []
+    rejected = []
+    for order in orders:
+        if order["sku"] in inventory and inventory[order["sku"]] >= order["qty"]:
+            valid_orders = valid_orders + [order]
+        else:
+            rejected = rejected + [{"order": order, "reason": "out_of_stock"}]
+
+    if len(valid_orders) > 0:
+        payments = spread valid_orders:order -> @process_payment(
+            order_id=order["id"],
+            amount=order["total"],
+            customer=order["customer_id"]
+        )
+
+        shipping = spread valid_orders:order -> @get_shipping_quote(
+            destination=order["address"],
+            weight=order["weight"]
+        )
+
+        confirmations = []
+        for i, order in enumerate(valid_orders):
+            confirmation = {
+                "order_id": order["id"],
+                "payment": payments[i],
+                "shipping": shipping[i],
+                "status": "confirmed"
+            }
+            confirmations = confirmations + [confirmation]
+    else:
+        confirmations = []
+
+    notification_result = @send_notifications(
+        confirmations=confirmations,
+        rejected=rejected
+    ) [NetworkError -> retry: 3, backoff: 30s] [timeout: 60s]
+
+    summary = {
+        "processed": len(confirmations),
+        "rejected": len(rejected),
+        "notification_id": notification_result["id"]
+    }
+
+    return summary"#;
+
+        let program = parse(source).unwrap();
+        assert_eq!(program.functions.len(), 1);
+
+        let func = &program.functions[0];
+        assert_eq!(func.name, "process_orders");
+
+        let io = func.io.as_ref().unwrap();
+        assert_eq!(io.inputs, vec!["orders", "config"]);
+        assert_eq!(io.outputs, vec!["summary"]);
+
+        let body = func.body.as_ref().unwrap();
+        // inventory assignment, valid_orders, rejected, for loop, if/else, notification, summary, return
+        assert!(body.statements.len() >= 7);
+    }
+
+    #[test]
+    fn test_parse_function_call_in_expr() {
+        let source = r#"fn check(input: [items], output: [result]):
+    result = len(items) > 0
+    return result"#;
+
+        let program = parse(source).unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_dot_access() {
+        let source = r#"fn get_name(input: [user], output: [name]):
+    name = user.profile.name
+    return name"#;
+
+        let program = parse(source).unwrap();
+        assert_eq!(program.functions.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_empty_io() {
+        let source = r#"fn noop(input: [], output: []):
+    x = 1
+    return x"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let io = func.io.as_ref().unwrap();
+        assert!(io.inputs.is_empty());
+        assert!(io.outputs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_multiline_action_kwargs() {
+        let source = r#"fn send(input: [user], output: [result]):
+    result = @send_email(
+        to=user["email"],
+        subject="Hello",
+        body="Welcome!"
+    )
+    return result"#;
+
+        let program = parse(source).unwrap();
+        let func = &program.functions[0];
+        let body = func.body.as_ref().unwrap();
+
+        if let Some(ast::statement::Kind::Assignment(assign)) = &body.statements[0].kind {
+            if let Some(ast::expr::Kind::ActionCall(action)) = &assign.value.as_ref().unwrap().kind {
+                assert_eq!(action.kwargs.len(), 3);
+            } else {
+                panic!("expected action call");
+            }
+        } else {
+            panic!("expected assignment");
+        }
     }
 }

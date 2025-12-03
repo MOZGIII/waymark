@@ -259,9 +259,11 @@ message DotAccess {
 }
 
 // Function call: range(10), len(items)
+// Built-in functions can use positional args, user functions use kwargs
 message FunctionCall {
   string name = 1;
-  repeated Kwarg kwargs = 2;
+  repeated Expr args = 2;        // Positional arguments (for built-ins)
+  repeated Kwarg kwargs = 3;     // Keyword arguments
 }
 
 // Keyword argument: name=value

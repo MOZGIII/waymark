@@ -271,6 +271,8 @@ pub struct Lexer<'source> {
     at_line_start: bool,
     current_pos: usize,
     done: bool,
+    /// Track bracket nesting depth - no INDENT/DEDENT inside brackets
+    bracket_depth: usize,
 }
 
 impl<'source> Lexer<'source> {
@@ -283,6 +285,7 @@ impl<'source> Lexer<'source> {
             at_line_start: true,
             current_pos: 0,
             done: false,
+            bracket_depth: 0,
         }
     }
 
@@ -387,14 +390,28 @@ impl<'source> Iterator for Lexer<'source> {
                 Some((Ok(token), span)) => {
                     let span = Span::new(span.start, span.end);
 
-                    // Handle indentation at line start
-                    if self.at_line_start {
+                    // Track bracket depth for opening brackets
+                    match &token {
+                        Token::LParen | Token::LBracket | Token::LBrace => {
+                            self.bracket_depth += 1;
+                        }
+                        Token::RParen | Token::RBracket | Token::RBrace => {
+                            self.bracket_depth = self.bracket_depth.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
+
+                    // Handle indentation at line start (only when not inside brackets)
+                    if self.at_line_start && self.bracket_depth == 0 {
                         let line_start = self.line_start(span.start);
 
                         // Skip blank lines
                         if !self.is_blank_line(line_start) {
                             self.process_indentation(line_start, span.start);
                         }
+                        self.at_line_start = false;
+                    } else if self.at_line_start {
+                        // Inside brackets, just clear the flag
                         self.at_line_start = false;
                     }
 
