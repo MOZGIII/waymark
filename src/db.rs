@@ -244,6 +244,7 @@ pub struct QueuedAction {
     pub delivery_token: Uuid,
     pub timeout_retry_limit: i32,
     pub retry_kind: String,
+    pub node_id: Option<String>,
 }
 
 /// Record for completing an action
@@ -597,7 +598,8 @@ impl Database {
                 aq.attempt_number,
                 aq.delivery_token,
                 aq.timeout_retry_limit,
-                aq.retry_kind
+                aq.retry_kind,
+                aq.node_id
             "#
         )
         .bind(limit)
@@ -619,6 +621,7 @@ impl Database {
                 delivery_token: row.get("delivery_token"),
                 timeout_retry_limit: row.get("timeout_retry_limit"),
                 retry_kind: row.get("retry_kind"),
+                node_id: row.get("node_id"),
             }
         }).collect();
 
@@ -738,7 +741,8 @@ impl Database {
                 attempt_number,
                 COALESCE(delivery_token, gen_random_uuid()) as delivery_token,
                 timeout_retry_limit,
-                retry_kind
+                retry_kind,
+                node_id
             FROM action_queue
             WHERE instance_id = $1
             ORDER BY action_seq
@@ -763,6 +767,7 @@ impl Database {
                 delivery_token: row.get("delivery_token"),
                 timeout_retry_limit: row.get("timeout_retry_limit"),
                 retry_kind: row.get("retry_kind"),
+                node_id: row.get("node_id"),
             }
         }).collect();
 

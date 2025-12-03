@@ -22,10 +22,12 @@
 pub mod ast_printer;
 pub mod config;
 pub mod dag;
+pub mod dag_state;
 pub mod db;
 pub mod lexer;
 pub mod messages;
 pub mod parser;
+pub mod runner;
 pub mod server_worker;
 pub mod worker;
 
@@ -55,3 +57,13 @@ pub use dag::{convert_to_dag, DAG, DAGConverter, DAGEdge, DAGNode, EdgeType};
 
 // AST Printer
 pub use ast_printer::{print_expr, print_program, print_statement, AstPrinter};
+
+// DAG State Helper
+pub use dag_state::{DAGHelper, DataFlowTarget, ExecutionMode, SuccessorInfo};
+
+// Runner
+pub use runner::{
+    CompletionBatch, DAGRunner, ExpressionEvaluator, InFlightTracker, InstanceContext,
+    RunnerConfig, RunnerError, RunnerResult, WorkCompletionHandler, WorkQueueHandler,
+    WorkerSlotTracker,
+};
