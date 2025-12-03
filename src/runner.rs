@@ -275,20 +275,138 @@ impl CompletionBatch {
 // Work Queue Handler
 // ============================================================================
 
-/// Handles fetching work from the database action queue.
+/// Handles fetching and dispatching work from the database action queue to workers.
+///
+/// Responsibilities:
+/// - Fetching batched actions from the DB (respecting available worker slots)
+/// - Building dispatch payloads
+/// - Sending actions to workers
+/// - Tracking in-flight actions
 pub struct WorkQueueHandler {
     db: Arc<Database>,
+    worker_pool: Arc<PythonWorkerPool>,
+    slot_tracker: Arc<WorkerSlotTracker>,
+    in_flight: Arc<Mutex<InFlightTracker>>,
 }
 
 impl WorkQueueHandler {
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new(
+        db: Arc<Database>,
+        worker_pool: Arc<PythonWorkerPool>,
+        slot_tracker: Arc<WorkerSlotTracker>,
+        in_flight: Arc<Mutex<InFlightTracker>>,
+    ) -> Self {
+        Self { db, worker_pool, slot_tracker, in_flight }
     }
 
-    /// Fetch a batch of actions up to the available slot count.
-    pub async fn fetch_batch(&self, limit: usize) -> RunnerResult<Vec<QueuedAction>> {
+    /// Get the number of available worker slots.
+    pub fn available_slots(&self) -> usize {
+        self.slot_tracker.available_slots()
+    }
+
+    /// Fetch and dispatch a batch of actions to workers.
+    ///
+    /// Returns immediately after dispatching. Completions are sent to the provided channel.
+    pub async fn fetch_and_dispatch(
+        &self,
+        batch_size: usize,
+        completion_tx: mpsc::Sender<(InFlightAction, RoundTripMetrics)>,
+    ) -> RunnerResult<usize> {
+        let available = self.slot_tracker.available_slots();
+        if available == 0 {
+            return Ok(0);
+        }
+
+        let limit = available.min(batch_size);
         let actions = self.db.dispatch_actions(limit as i32).await?;
-        Ok(actions)
+        let dispatched = actions.len();
+
+        for action in actions {
+            self.dispatch_action(action, completion_tx.clone()).await?;
+        }
+
+        Ok(dispatched)
+    }
+
+    /// Dispatch a single action to a worker.
+    async fn dispatch_action(
+        &self,
+        action: QueuedAction,
+        completion_tx: mpsc::Sender<(InFlightAction, RoundTripMetrics)>,
+    ) -> RunnerResult<()> {
+        // Acquire a worker slot
+        let worker_idx = match self.slot_tracker.acquire_slot() {
+            Some(idx) => idx,
+            None => {
+                warn!("No worker slots available, action will remain dispatched in DB");
+                return Ok(());
+            }
+        };
+
+        // Track in-flight
+        {
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.add(action.clone(), worker_idx);
+        }
+
+        // Build dispatch payload
+        // TODO: Parse dispatch_payload JSON and convert to WorkflowArguments
+        let kwargs = proto::WorkflowArguments {
+            arguments: vec![],
+        };
+
+        let dispatch = ActionDispatchPayload {
+            action_id: action.id.to_string(),
+            instance_id: action.instance_id.to_string(),
+            sequence: action.action_seq as u32,
+            action_name: action.action_name.clone(),
+            module_name: action.module_name.clone(),
+            kwargs,
+            timeout_seconds: action.timeout_seconds as u32,
+            max_retries: action.max_retries as u32,
+            attempt_number: action.attempt_number as u32,
+            dispatch_token: action.delivery_token,
+        };
+
+        // Get worker and send
+        let worker = Arc::clone(&self.worker_pool.workers()[worker_idx]);
+        let delivery_token = action.delivery_token;
+        let in_flight_tracker = Arc::clone(&self.in_flight);
+        let slot_tracker = Arc::clone(&self.slot_tracker);
+
+        tokio::spawn(async move {
+            match worker.send_action(dispatch).await {
+                Ok(metrics) => {
+                    // Get in-flight info and release slot
+                    let in_flight_action = {
+                        let mut tracker = in_flight_tracker.lock().await;
+                        tracker.remove(&delivery_token)
+                    };
+
+                    if let Some(in_flight) = in_flight_action {
+                        slot_tracker.release_slot(in_flight.worker_idx);
+                        if let Err(e) = completion_tx.send((in_flight, metrics)).await {
+                            error!("Failed to send completion: {}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Worker dispatch failed: {}", e);
+                    // Remove from in-flight tracking and release slot
+                    let mut tracker = in_flight_tracker.lock().await;
+                    if let Some(in_flight) = tracker.remove(&delivery_token) {
+                        slot_tracker.release_slot(in_flight.worker_idx);
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Get count of in-flight actions.
+    pub async fn in_flight_count(&self) -> usize {
+        self.in_flight.lock().await.count()
     }
 }
 
@@ -560,6 +678,23 @@ impl WorkCompletionHandler {
             backoff_base_delay_ms: 1000,
             node_id: Some(node.id.clone()),
         }))
+    }
+
+    /// Write a completion batch to the database in a single transaction.
+    pub async fn write_batch(&self, batch: CompletionBatch) -> RunnerResult<()> {
+        // Complete actions
+        for completion in batch.completions {
+            self.db.complete_action(completion).await?;
+        }
+
+        // Enqueue new actions
+        for new_action in batch.new_actions {
+            self.db.enqueue_action(new_action).await?;
+        }
+
+        // TODO: Update contexts in DB
+
+        Ok(())
     }
 }
 
@@ -1056,14 +1191,16 @@ impl Default for RunnerConfig {
 }
 
 /// The main DAG runner that orchestrates workflow execution.
+///
+/// The runner coordinates between:
+/// - `WorkQueueHandler`: Fetching and dispatching work to workers
+/// - `WorkCompletionHandler`: Processing results and creating next actions
+///
+/// The runner itself just manages the event loop and shared state.
 pub struct DAGRunner {
     config: RunnerConfig,
-    db: Arc<Database>,
-    worker_pool: Arc<PythonWorkerPool>,
-    slot_tracker: WorkerSlotTracker,
-    work_handler: WorkQueueHandler,
+    work_handler: Arc<WorkQueueHandler>,
     completion_handler: WorkCompletionHandler,
-    in_flight: Arc<Mutex<InFlightTracker>>,
     /// Cached DAGs by workflow version ID
     dag_cache: Arc<RwLock<HashMap<Uuid, Arc<DAG>>>>,
     /// Instance contexts by instance ID
@@ -1080,18 +1217,21 @@ impl DAGRunner {
         worker_pool: Arc<PythonWorkerPool>,
     ) -> Self {
         let num_workers = worker_pool.len();
-        let slot_tracker = WorkerSlotTracker::new(num_workers, config.max_slots_per_worker);
-        let work_handler = WorkQueueHandler::new(Arc::clone(&db));
-        let completion_handler = WorkCompletionHandler::new(Arc::clone(&db));
+        let slot_tracker = Arc::new(WorkerSlotTracker::new(num_workers, config.max_slots_per_worker));
+        let in_flight = Arc::new(Mutex::new(InFlightTracker::new()));
+
+        let work_handler = Arc::new(WorkQueueHandler::new(
+            Arc::clone(&db),
+            worker_pool,
+            slot_tracker,
+            in_flight,
+        ));
+        let completion_handler = WorkCompletionHandler::new(db);
 
         Self {
             config,
-            db,
-            worker_pool,
-            slot_tracker,
             work_handler,
             completion_handler,
-            in_flight: Arc::new(Mutex::new(InFlightTracker::new())),
             dag_cache: Arc::new(RwLock::new(HashMap::new())),
             instance_contexts: Arc::new(RwLock::new(HashMap::new())),
             shutdown: Arc::new(tokio::sync::Notify::new()),
@@ -1100,17 +1240,10 @@ impl DAGRunner {
 
     /// Run the main execution loop.
     pub async fn run(&self) -> RunnerResult<()> {
-        info!("Starting DAG runner with {} workers", self.worker_pool.len());
+        info!("Starting DAG runner");
 
         // Channel for completion results
         let (completion_tx, mut completion_rx) = mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
-
-        // Spawn completion processing task
-        let completion_handler = self.completion_handler.clone();
-        let db = Arc::clone(&self.db);
-        let dag_cache = Arc::clone(&self.dag_cache);
-        let instance_contexts = Arc::clone(&self.instance_contexts);
-        let slot_tracker_ref = &self.slot_tracker;
 
         loop {
             tokio::select! {
@@ -1122,19 +1255,14 @@ impl DAGRunner {
 
                 // Process completions
                 Some((in_flight, metrics)) = completion_rx.recv() => {
-                    // Release worker slot
-                    slot_tracker_ref.release_slot(in_flight.worker_idx);
-
                     // Spawn tokio task for parallel processing
-                    let handler = completion_handler.clone();
-                    let db = Arc::clone(&db);
-                    let dag_cache = Arc::clone(&dag_cache);
-                    let instance_contexts = Arc::clone(&instance_contexts);
+                    let handler = self.completion_handler.clone();
+                    let dag_cache = Arc::clone(&self.dag_cache);
+                    let instance_contexts = Arc::clone(&self.instance_contexts);
 
                     tokio::spawn(async move {
                         if let Err(e) = Self::process_completion_task(
                             handler,
-                            db,
                             dag_cache,
                             instance_contexts,
                             in_flight,
@@ -1145,104 +1273,28 @@ impl DAGRunner {
                     });
                 }
 
-                // Fetch and dispatch work
+                // Fetch and dispatch work (delegated to WorkQueueHandler)
                 _ = tokio::time::sleep(tokio::time::Duration::from_millis(self.config.poll_interval_ms)) => {
-                    let available = self.slot_tracker.available_slots();
-                    if available == 0 {
+                    if self.work_handler.available_slots() == 0 {
                         continue;
                     }
 
-                    let limit = available.min(self.config.batch_size);
-                    match self.work_handler.fetch_batch(limit).await {
-                        Ok(actions) if !actions.is_empty() => {
-                            debug!("Fetched {} actions", actions.len());
-                            self.dispatch_actions(actions, completion_tx.clone()).await?;
+                    match self.work_handler.fetch_and_dispatch(
+                        self.config.batch_size,
+                        completion_tx.clone(),
+                    ).await {
+                        Ok(count) if count > 0 => {
+                            debug!("Dispatched {} actions", count);
                         }
                         Ok(_) => {
                             // No work available
                         }
                         Err(e) => {
-                            error!("Failed to fetch actions: {}", e);
+                            error!("Failed to fetch/dispatch actions: {}", e);
                         }
                     }
                 }
             }
-        }
-
-        Ok(())
-    }
-
-    /// Dispatch a batch of actions to workers.
-    async fn dispatch_actions(
-        &self,
-        actions: Vec<QueuedAction>,
-        completion_tx: mpsc::Sender<(InFlightAction, RoundTripMetrics)>,
-    ) -> RunnerResult<()> {
-        for action in actions {
-            // Acquire a worker slot
-            let worker_idx = match self.slot_tracker.acquire_slot() {
-                Some(idx) => idx,
-                None => {
-                    warn!("No worker slots available, requeueing action");
-                    // In a real implementation, we'd requeue the action
-                    continue;
-                }
-            };
-
-            // Track in-flight
-            {
-                let mut in_flight = self.in_flight.lock().await;
-                in_flight.add(action.clone(), worker_idx);
-            }
-
-            // Build dispatch payload
-            // TODO: Parse dispatch_payload JSON and convert to WorkflowArguments
-            let kwargs = proto::WorkflowArguments {
-                arguments: vec![],
-            };
-
-            let dispatch = ActionDispatchPayload {
-                action_id: action.id.to_string(),
-                instance_id: action.instance_id.to_string(),
-                sequence: action.action_seq as u32,
-                action_name: action.action_name.clone(),
-                module_name: action.module_name.clone(),
-                kwargs,
-                timeout_seconds: action.timeout_seconds as u32,
-                max_retries: action.max_retries as u32,
-                attempt_number: action.attempt_number as u32,
-                dispatch_token: action.delivery_token,
-            };
-
-            // Get worker and send
-            let worker = Arc::clone(&self.worker_pool.workers()[worker_idx]);
-            let tx = completion_tx.clone();
-            let delivery_token = action.delivery_token;
-            let in_flight_tracker = Arc::clone(&self.in_flight);
-
-            tokio::spawn(async move {
-                match worker.send_action(dispatch).await {
-                    Ok(metrics) => {
-                        // Get in-flight info
-                        let in_flight_action = {
-                            let mut tracker = in_flight_tracker.lock().await;
-                            tracker.remove(&delivery_token)
-                        };
-
-                        if let Some(in_flight) = in_flight_action {
-                            if let Err(e) = tx.send((in_flight, metrics)).await {
-                                error!("Failed to send completion: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Worker dispatch failed: {}", e);
-                        // Remove from in-flight tracking
-                        let mut tracker = in_flight_tracker.lock().await;
-                        tracker.remove(&delivery_token);
-                    }
-                }
-            });
         }
 
         Ok(())
@@ -1251,7 +1303,6 @@ impl DAGRunner {
     /// Process a completion in a tokio task.
     async fn process_completion_task(
         handler: WorkCompletionHandler,
-        db: Arc<Database>,
         dag_cache: Arc<RwLock<HashMap<Uuid, Arc<DAG>>>>,
         instance_contexts: Arc<RwLock<HashMap<Uuid, InstanceContext>>>,
         in_flight: InFlightAction,
@@ -1287,31 +1338,14 @@ impl DAGRunner {
             batch
         };
 
-        // Write batch to database in a single transaction
-        Self::write_batch(&db, batch).await?;
+        // Write batch to database (delegated to completion handler)
+        handler.write_batch(batch).await?;
 
         // Update context cache
         {
             let mut contexts = instance_contexts.write().await;
             contexts.insert(instance_id, context);
         }
-
-        Ok(())
-    }
-
-    /// Write a completion batch to the database.
-    async fn write_batch(db: &Database, batch: CompletionBatch) -> RunnerResult<()> {
-        // Complete actions
-        for completion in batch.completions {
-            db.complete_action(completion).await?;
-        }
-
-        // Enqueue new actions
-        for new_action in batch.new_actions {
-            db.enqueue_action(new_action).await?;
-        }
-
-        // TODO: Update contexts in DB
 
         Ok(())
     }
@@ -1325,6 +1359,11 @@ impl DAGRunner {
     pub async fn register_dag(&self, version_id: Uuid, dag: DAG) {
         let mut cache = self.dag_cache.write().await;
         cache.insert(version_id, Arc::new(dag));
+    }
+
+    /// Get count of in-flight actions.
+    pub async fn in_flight_count(&self) -> usize {
+        self.work_handler.in_flight_count().await
     }
 }
 
