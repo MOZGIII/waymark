@@ -18,6 +18,9 @@ use harness::{HarnessConfig, IntegrationHarness};
 use rappel::proto;
 
 const SIMPLE_WORKFLOW_MODULE: &str = include_str!("fixtures/simple_workflow.py");
+const SEQUENTIAL_WORKFLOW_MODULE: &str = include_str!("fixtures/sequential_workflow.py");
+const CONDITIONAL_WORKFLOW_MODULE: &str = include_str!("fixtures/conditional_workflow.py");
+const EXCEPTION_WORKFLOW_MODULE: &str = include_str!("fixtures/exception_workflow.py");
 
 /// Registration script that imports and runs the workflow.
 /// This triggers the workflow decorator which registers the IR via gRPC.
@@ -124,6 +127,222 @@ async fn simple_workflow_executes_end_to_end() -> Result<()> {
         if let Some(msg) = message {
             assert_eq!(msg, "hello world", "unexpected workflow result");
         }
+    }
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Sequential Workflow Test
+// =============================================================================
+
+const REGISTER_SEQUENTIAL_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from sequential_workflow import SequentialWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = SequentialWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that sequential workflows execute the first action correctly.
+///
+/// NOTE: Full sequential execution (chaining actions based on results)
+/// requires the complete DAG runner with completion handling. This test
+/// verifies that:
+/// 1. The workflow registers via gRPC
+/// 2. The first action (fetch_value) is enqueued and executes successfully
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn sequential_workflow_first_action_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("sequential_workflow.py", SEQUENTIAL_WORKFLOW_MODULE),
+            ("register.py", REGISTER_SEQUENTIAL_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "sequentialworkflow",
+        user_module: "sequential_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Dispatch the first action
+    let completed = harness.dispatch_all().await?;
+    info!(completed = completed.len(), "actions completed");
+
+    // Should have at least 1 action (fetch_value)
+    assert!(
+        !completed.is_empty(),
+        "expected at least one action to complete"
+    );
+
+    // All executed actions should have succeeded
+    for metrics in &completed {
+        assert!(
+            metrics.success,
+            "action {} failed: {:?}",
+            metrics.action_id, metrics.error_message
+        );
+    }
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Conditional Workflow Tests
+// =============================================================================
+
+fn make_conditional_register_script(tier: &str) -> String {
+    format!(
+        r#"
+import asyncio
+import os
+
+from conditional_workflow import ConditionalWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ConditionalWorkflow()
+    result = await wf.run(tier="{tier}")
+    print(f"Registration result: {{result}}")
+
+asyncio.run(main())
+"#
+    )
+}
+
+/// Test that conditional workflows register correctly and the first action executes.
+///
+/// NOTE: Full conditional execution (evaluating conditions and executing the correct branch)
+/// requires the DAG runner. This test only verifies that:
+/// 1. The workflow registers via gRPC
+/// 2. The first action (get_score) is enqueued and executes successfully
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn conditional_workflow_registers_and_first_action_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let register_script = make_conditional_register_script("high");
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("conditional_workflow.py", CONDITIONAL_WORKFLOW_MODULE),
+            ("register.py", register_script.leak()),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "conditionalworkflow",
+        user_module: "conditional_workflow",
+        inputs: &[("tier", "high")],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Dispatch and execute actions
+    let completed = harness.dispatch_all().await?;
+    info!(completed = completed.len(), "actions completed");
+
+    // The harness only enqueues top-level actions, so we get just get_score
+    // Full conditional execution would require the DAG runner
+    assert!(
+        !completed.is_empty(),
+        "expected at least one action to complete"
+    );
+
+    // All actions should have succeeded
+    for metrics in &completed {
+        assert!(
+            metrics.success,
+            "action {} failed: {:?}",
+            metrics.action_id, metrics.error_message
+        );
+    }
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Exception Workflow Test
+// =============================================================================
+
+const REGISTER_EXCEPTION_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from exception_workflow import ExceptionWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = ExceptionWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test that exception workflows register correctly and the first action executes.
+///
+/// NOTE: Full exception handling (catching errors and executing handlers)
+/// requires the DAG runner. This test only verifies that:
+/// 1. The workflow registers via gRPC
+/// 2. The first action (get_initial_value) is enqueued and executes successfully
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn exception_workflow_registers_and_first_action_executes() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            ("exception_workflow.py", EXCEPTION_WORKFLOW_MODULE),
+            ("register.py", REGISTER_EXCEPTION_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "exceptionworkflow",
+        user_module: "exception_workflow",
+        inputs: &[],
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    // Dispatch and execute actions
+    let completed = harness.dispatch_all().await?;
+    info!(completed = completed.len(), "actions completed");
+
+    // The harness only enqueues top-level actions from try block
+    // Full exception handling would require the DAG runner
+    assert!(
+        !completed.is_empty(),
+        "expected at least one action to complete"
+    );
+
+    // All actions should have succeeded
+    for metrics in &completed {
+        assert!(
+            metrics.success,
+            "action {} failed: {:?}",
+            metrics.action_id, metrics.error_message
+        );
     }
 
     harness.shutdown().await?;

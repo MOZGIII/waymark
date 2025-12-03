@@ -65,6 +65,8 @@ pub struct DAGNode {
     pub action_name: Option<String>,
     /// Python module containing the action (for action_call nodes)
     pub module_name: Option<String>,
+    /// Keyword arguments for action calls (name -> literal value or variable reference like "$var")
+    pub kwargs: Option<HashMap<String, String>>,
 }
 
 impl DAGNode {
@@ -82,6 +84,7 @@ impl DAGNode {
             aggregates_from: None,
             is_fn_call: false,
             called_function: None,
+            kwargs: None,
             is_input: false,
             is_output: false,
             io_vars: None,
@@ -135,6 +138,12 @@ impl DAGNode {
     pub fn with_action(mut self, action_name: &str, module_name: Option<&str>) -> Self {
         self.action_name = Some(action_name.to_string());
         self.module_name = module_name.map(|s| s.to_string());
+        self
+    }
+
+    /// Builder method to set kwargs (for action_call nodes)
+    pub fn with_kwargs(mut self, kwargs: HashMap<String, String>) -> Self {
+        self.kwargs = Some(kwargs);
         self
     }
 }
@@ -523,8 +532,12 @@ impl DAGConverter {
             format!("@{}()", action.action_name)
         };
 
+        // Extract kwargs as string representations
+        let kwargs = self.extract_kwargs(&action.kwargs);
+
         let mut node = DAGNode::new(node_id.clone(), "action_call".to_string(), label)
-            .with_action(&action.action_name, action.module_name.as_deref());
+            .with_action(&action.action_name, action.module_name.as_deref())
+            .with_kwargs(kwargs);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -538,6 +551,69 @@ impl DAGConverter {
         vec![node_id]
     }
 
+    /// Extract kwargs from AST Kwarg list to a HashMap.
+    /// Values are either literal strings/JSON or variable references like "$var".
+    fn extract_kwargs(&self, kwargs: &[ast::Kwarg]) -> HashMap<String, String> {
+        let mut result = HashMap::new();
+        for kwarg in kwargs {
+            if let Some(ref value) = kwarg.value {
+                let value_str = self.expr_to_string(value);
+                result.insert(kwarg.name.clone(), value_str);
+            }
+        }
+        result
+    }
+
+    /// Convert an expression to a string representation.
+    /// Variables become "$varname", literals become their JSON representation.
+    fn expr_to_string(&self, expr: &ast::Expr) -> String {
+        match &expr.kind {
+            Some(ast::expr::Kind::Variable(var)) => format!("${}", var.name),
+            Some(ast::expr::Kind::Literal(lit)) => self.literal_to_string(lit),
+            Some(ast::expr::Kind::List(list)) => {
+                let items: Vec<String> = list
+                    .elements
+                    .iter()
+                    .map(|e| self.expr_to_string(e))
+                    .collect();
+                format!("[{}]", items.join(", "))
+            }
+            Some(ast::expr::Kind::Dict(dict)) => {
+                let entries: Vec<String> = dict
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        let key = e
+                            .key
+                            .as_ref()
+                            .map(|k| self.expr_to_string(k))
+                            .unwrap_or_default();
+                        let val = e
+                            .value
+                            .as_ref()
+                            .map(|v| self.expr_to_string(v))
+                            .unwrap_or_default();
+                        format!("{}: {}", key, val)
+                    })
+                    .collect();
+                format!("{{{}}}", entries.join(", "))
+            }
+            _ => "null".to_string(),
+        }
+    }
+
+    /// Convert a literal to its string representation.
+    fn literal_to_string(&self, lit: &ast::Literal) -> String {
+        match &lit.value {
+            Some(ast::literal::Value::IntValue(i)) => i.to_string(),
+            Some(ast::literal::Value::FloatValue(f)) => f.to_string(),
+            Some(ast::literal::Value::StringValue(s)) => format!("\"{}\"", s),
+            Some(ast::literal::Value::BoolValue(b)) => b.to_string(),
+            Some(ast::literal::Value::IsNone(true)) => "null".to_string(),
+            _ => "null".to_string(),
+        }
+    }
+
     /// Convert a spread action
     fn convert_spread_action(&mut self, spread: &ast::SpreadAction) -> Vec<String> {
         let action = spread.action.as_ref().unwrap();
@@ -549,9 +625,13 @@ impl DAGConverter {
             action.action_name, spread.loop_var
         );
 
+        // Extract kwargs
+        let kwargs = self.extract_kwargs(&action.kwargs);
+
         let mut action_node =
             DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
-                .with_action(&action.action_name, action.module_name.as_deref());
+                .with_action(&action.action_name, action.module_name.as_deref())
+                .with_kwargs(kwargs);
         if let Some(ref fn_name) = self.current_function {
             action_node = action_node.with_function_name(fn_name);
         }
@@ -608,7 +688,10 @@ impl DAGConverter {
                 Some(ast::call::Kind::Action(action)) => {
                     let id = self.next_id("parallel_action");
                     let label = format!("@{}() [{}]", action.action_name, i);
-                    let mut node = DAGNode::new(id.clone(), "action_call".to_string(), label);
+                    let kwargs = self.extract_kwargs(&action.kwargs);
+                    let mut node = DAGNode::new(id.clone(), "action_call".to_string(), label)
+                        .with_action(&action.action_name, action.module_name.as_deref())
+                        .with_kwargs(kwargs);
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
                     }

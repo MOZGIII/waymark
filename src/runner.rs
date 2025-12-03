@@ -629,7 +629,8 @@ impl WorkQueueHandler {
 /// 4. Determine which new actions need to be queued
 #[derive(Clone)]
 pub struct WorkCompletionHandler {
-    db: Arc<Database>,
+    /// Database handle for persisting completions and enqueuing new actions.
+    pub db: Arc<Database>,
 }
 
 impl WorkCompletionHandler {
@@ -1880,7 +1881,8 @@ impl DAGRunner {
             .clone()
             .unwrap_or_else(|| "default".to_string());
 
-        let payload = serde_json::to_vec(&context.variables)?;
+        // Build kwargs from node metadata, resolving variable references from context
+        let payload = Self::build_action_payload(node, context)?;
 
         Ok(Some(NewAction {
             instance_id,
@@ -1893,6 +1895,45 @@ impl DAGRunner {
             backoff_base_delay_ms: 1000,
             node_id: Some(node.id.clone()),
         }))
+    }
+
+    /// Build action payload from node kwargs, resolving variable references.
+    fn build_action_payload(node: &DAGNode, context: &InstanceContext) -> RunnerResult<Vec<u8>> {
+        let mut payload_map = serde_json::Map::new();
+
+        if let Some(ref kwargs) = node.kwargs {
+            for (key, value_str) in kwargs {
+                let resolved = Self::resolve_kwarg_value(value_str, context)?;
+                payload_map.insert(key.clone(), resolved);
+            }
+        }
+
+        Ok(serde_json::to_vec(&JsonValue::Object(payload_map))?)
+    }
+
+    /// Resolve a kwarg value string to a JSON value.
+    /// - "$varname" -> look up variable in context
+    /// - Numeric literals -> parse as number
+    /// - "\"string\"" -> parse as string
+    /// - Other -> try to parse as JSON
+    fn resolve_kwarg_value(value_str: &str, context: &InstanceContext) -> RunnerResult<JsonValue> {
+        // Variable reference
+        if let Some(var_name) = value_str.strip_prefix('$') {
+            return Ok(context
+                .variables
+                .get(var_name)
+                .cloned()
+                .unwrap_or(JsonValue::Null));
+        }
+
+        // Try to parse as JSON (handles numbers, booleans, strings, etc.)
+        match serde_json::from_str(value_str) {
+            Ok(v) => Ok(v),
+            Err(_) => {
+                // If not valid JSON, treat as raw string
+                Ok(JsonValue::String(value_str.to_string()))
+            }
+        }
     }
 
     /// Request shutdown.
@@ -1908,6 +1949,105 @@ impl DAGRunner {
     /// Get count of in-flight actions.
     pub async fn in_flight_count(&self) -> usize {
         self.work_handler.in_flight_count().await
+    }
+
+    /// Start a workflow instance by enqueuing its initial action(s).
+    ///
+    /// This is the entry point for workflow execution. It:
+    /// 1. Loads the DAG for the instance's workflow version
+    /// 2. Finds the input boundary node
+    /// 3. Traverses to find the first delegated (action) nodes
+    /// 4. Enqueues them with the initial input context
+    ///
+    /// Returns the number of actions enqueued.
+    pub async fn start_instance(
+        &self,
+        instance_id: WorkflowInstanceId,
+        initial_inputs: HashMap<String, JsonValue>,
+    ) -> RunnerResult<usize> {
+        // Load the DAG for this instance
+        let dag = self
+            .dag_cache
+            .get_dag_for_instance(instance_id)
+            .await?
+            .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.0))?;
+
+        // Create initial context
+        let context = InstanceContext::new(instance_id).with_inputs(initial_inputs);
+
+        // Store context
+        {
+            let mut contexts = self.instance_contexts.write().await;
+            contexts.insert(instance_id.0, context.clone());
+        }
+
+        // Find the entry function and its input node
+        let helper = DAGHelper::new(&dag);
+        let function_names = helper.get_function_names();
+
+        if function_names.is_empty() {
+            return Err(RunnerError::Dag("No functions found in DAG".to_string()));
+        }
+
+        // Use the first function as the entry point
+        let entry_fn = function_names[0];
+        let input_node = helper
+            .find_input_node(entry_fn)
+            .ok_or_else(|| RunnerError::NodeNotFound(format!("{}_input", entry_fn)))?;
+
+        // Find first delegated successors starting from input node
+        let mut actions_to_enqueue = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+
+        // Start from input node's successors
+        for successor in helper.get_ready_successors(&input_node.id, None) {
+            queue.push_back(successor.node_id);
+        }
+
+        while let Some(node_id) = queue.pop_front() {
+            if visited.contains(&node_id) {
+                continue;
+            }
+            visited.insert(node_id.clone());
+
+            let node = match helper.get_node(&node_id) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let mode = helper.get_execution_mode(node);
+
+            match mode {
+                ExecutionMode::Delegated => {
+                    // This is an action - enqueue it
+                    if let Some(action) =
+                        Self::create_action_for_node_static(node, instance_id, &context)?
+                    {
+                        actions_to_enqueue.push(action);
+                    }
+                    // Don't traverse past delegated nodes - they'll handle their successors
+                }
+                ExecutionMode::Inline => {
+                    // Skip inline nodes and continue to their successors
+                    for successor in helper.get_ready_successors(&node_id, None) {
+                        if !visited.contains(&successor.node_id) {
+                            queue.push_back(successor.node_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enqueue all initial actions
+        let count = actions_to_enqueue.len();
+        let db = &self.completion_handler.db;
+        for action in actions_to_enqueue {
+            db.enqueue_action(action).await?;
+        }
+
+        info!(instance_id = %instance_id.0, actions = count, "started workflow instance");
+        Ok(count)
     }
 }
 

@@ -4,12 +4,13 @@
 //! - Database connection
 //! - Worker bridge server
 //! - Python worker pool
+//! - DAGRunner for workflow execution
 //! - gRPC service for workflow registration
-//! - Utilities for workflow registration and dispatch
 
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -19,6 +20,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
+use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,
@@ -32,8 +34,9 @@ use tonic::transport::Server;
 use tracing::info;
 
 use rappel::{
-    ActionDispatchPayload, BackoffKind, Database, NewAction, PythonWorkerConfig, PythonWorkerPool,
-    RoundTripMetrics, WorkerBridgeServer, WorkflowInstanceId, WorkflowVersionId, proto,
+    ActionDispatchPayload, DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool,
+    RoundTripMetrics, RunnerConfig, WorkerBridgeServer, WorkflowInstanceId, WorkflowVersionId,
+    proto,
 };
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -195,13 +198,13 @@ pub struct HarnessConfig<'a> {
 
 /// Integration test harness that manages the full runtime stack.
 pub struct IntegrationHarness {
-    database: Database,
+    database: Arc<Database>,
     worker_bridge: Arc<WorkerBridgeServer>,
-    worker_pool: PythonWorkerPool,
+    worker_pool: Arc<PythonWorkerPool>,
+    runner: Arc<DAGRunner>,
     python_env: TempDir,
     version_id: WorkflowVersionId,
     instance_id: WorkflowInstanceId,
-    expected_actions: usize,
     grpc_shutdown: Option<oneshot::Sender<()>>,
     grpc_handle: Option<JoinHandle<()>>,
 }
@@ -220,12 +223,12 @@ impl IntegrationHarness {
         };
 
         // Connect to database
-        let database = Database::connect(&database_url).await?;
+        let database = Arc::new(Database::connect(&database_url).await?);
         cleanup_database(&database).await?;
 
         // Start the workflow registration gRPC server
         let (grpc_addr, grpc_shutdown, grpc_handle) =
-            start_workflow_grpc_server(database.clone()).await?;
+            start_workflow_grpc_server((*database).clone()).await?;
         info!(%grpc_addr, "workflow registration gRPC server started");
 
         // Start worker bridge (for worker connections)
@@ -233,12 +236,8 @@ impl IntegrationHarness {
         info!(addr = %worker_bridge.addr(), "worker bridge started");
 
         // Set up Python environment and run registration script
-        // - CARABINER_SERVER_PORT: Set to prevent Python from trying to boot a server
-        //   (The Python bridge checks this before trying to spawn boot-rappel-singleton)
-        // - CARABINER_GRPC_ADDR: Points to our workflow registration server
-        // - CARABINER_SKIP_WAIT_FOR_INSTANCE: Tells Python not to block waiting for results
         let env_vars = vec![
-            ("CARABINER_SERVER_PORT", "9999".to_string()), // Dummy port to prevent singleton boot
+            ("CARABINER_SERVER_PORT", "9999".to_string()),
             ("CARABINER_GRPC_ADDR", grpc_addr.to_string()),
             ("CARABINER_SKIP_WAIT_FOR_INSTANCE", "1".to_string()),
         ];
@@ -257,17 +256,7 @@ impl IntegrationHarness {
             })?;
         let version_id = WorkflowVersionId(version.id);
 
-        // Load the version to get action count for expected completions
-        let full_version = database.get_workflow_version(version_id).await?;
-
-        // Decode program to count actions
-        let program = rappel::ir_ast::Program::decode(&full_version.program_proto[..])
-            .context("decode program proto")?;
-        let expected_actions = count_actions_in_program(&program);
-        info!(expected_actions, "workflow registered with actions");
-
         // Find the instance that was created during registration
-        // (the RegisterWorkflow gRPC call creates both version and instance)
         let instances: Vec<rappel::WorkflowInstance> = sqlx::query_as(
             "SELECT id, partition_id, workflow_name, workflow_version_id, \
              next_action_seq, input_payload, result_payload, status, \
@@ -285,9 +274,6 @@ impl IntegrationHarness {
 
         info!(%instance_id, "found workflow instance");
 
-        // Enqueue the first action(s) based on the DAG
-        enqueue_initial_actions(&database, instance_id, &program, config.user_module).await?;
-
         // Start worker pool
         let worker_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("python")
@@ -302,25 +288,94 @@ impl IntegrationHarness {
             extra_python_paths: vec![python_env.path().to_path_buf()],
         };
         let worker_pool =
-            PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_bridge)).await?;
+            Arc::new(PythonWorkerPool::new(worker_config, 1, Arc::clone(&worker_bridge)).await?);
         info!("worker pool ready");
+
+        // Create DAGRunner with the proper components
+        let runner_config = RunnerConfig {
+            batch_size: 10,
+            max_slots_per_worker: 5,
+            poll_interval_ms: 50,
+            timeout_check_interval_ms: 1000,
+        };
+        let runner = Arc::new(DAGRunner::new(
+            runner_config,
+            Arc::clone(&database),
+            Arc::clone(&worker_pool),
+        ));
+
+        // Start the workflow instance using the DAGRunner
+        let initial_inputs = build_initial_inputs(config.inputs);
+        runner
+            .start_instance(instance_id, initial_inputs)
+            .await
+            .context("failed to start workflow instance")?;
 
         Ok(Some(Self {
             database,
             worker_bridge,
             worker_pool,
+            runner,
             python_env,
             version_id,
             instance_id,
-            expected_actions,
             grpc_shutdown: Some(grpc_shutdown),
             grpc_handle: Some(grpc_handle),
         }))
     }
 
+    /// Run the DAGRunner until the workflow completes or times out.
+    ///
+    /// This starts the DAGRunner's main loop and waits for the workflow instance
+    /// to reach a terminal state (completed or failed).
+    pub async fn run_to_completion(&self, timeout_secs: u64) -> Result<Vec<RoundTripMetrics>> {
+        let runner = Arc::clone(&self.runner);
+        let instance_id = self.instance_id;
+        let database = Arc::clone(&self.database);
+
+        // Start the runner in a background task
+        let runner_handle = tokio::spawn(async move {
+            let _ = runner.run().await;
+        });
+
+        // Wait for workflow completion
+        let timeout_duration = Duration::from_secs(timeout_secs);
+        let start = std::time::Instant::now();
+
+        loop {
+            if start.elapsed() > timeout_duration {
+                self.runner.shutdown();
+                let _ = runner_handle.await;
+                return Err(anyhow!(
+                    "workflow did not complete within {}s",
+                    timeout_secs
+                ));
+            }
+
+            let instance = database.get_instance(instance_id).await?;
+            if instance.status == "completed" || instance.status == "failed" {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Shutdown the runner
+        self.runner.shutdown();
+        let _ = runner_handle.await;
+
+        // Return empty metrics for now - the full metrics would require
+        // changes to track them through the runner
+        Ok(vec![])
+    }
+
     /// Dispatch all queued actions and wait for completion.
+    ///
+    /// This uses a simplified dispatch loop for testing. For sequential workflows,
+    /// it only runs the first action (subsequent actions need the full DAGRunner
+    /// completion handling to enqueue them).
     pub async fn dispatch_all(&self) -> Result<Vec<RoundTripMetrics>> {
-        dispatch_all_actions(&self.database, &self.worker_pool, self.expected_actions).await
+        dispatch_all_actions(&self.database, &self.worker_pool).await
     }
 
     /// Get the stored workflow result.
@@ -339,15 +394,15 @@ impl IntegrationHarness {
         self.instance_id
     }
 
-    /// Get the expected number of actions.
-    pub fn expected_actions(&self) -> usize {
-        self.expected_actions
+    /// Get the DAGRunner.
+    pub fn runner(&self) -> &DAGRunner {
+        &self.runner
     }
 
     /// Shut down the harness.
     pub async fn shutdown(mut self) -> Result<()> {
-        self.worker_pool.shutdown().await?;
-        self.worker_bridge.shutdown().await;
+        // Shutdown runner first
+        self.runner.shutdown();
 
         // Shutdown gRPC server
         if let Some(shutdown_tx) = self.grpc_shutdown.take() {
@@ -357,9 +412,32 @@ impl IntegrationHarness {
             let _ = handle.await;
         }
 
+        // Drop runner to release its Arc reference to worker_pool
+        drop(self.runner);
+
+        // Try to get ownership of worker_pool for clean shutdown
+        match Arc::try_unwrap(self.worker_pool) {
+            Ok(pool) => {
+                pool.shutdown().await?;
+            }
+            Err(_arc) => {
+                // Other references still exist - pool will be cleaned up on drop
+                tracing::warn!("worker pool has other references, skipping explicit shutdown");
+            }
+        }
+
+        self.worker_bridge.shutdown().await;
         drop(self.python_env);
         Ok(())
     }
+}
+
+/// Build initial inputs from string pairs.
+fn build_initial_inputs(pairs: &[(&str, &str)]) -> HashMap<String, JsonValue> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), JsonValue::String((*v).to_string())))
+        .collect()
 }
 
 /// Clean up the database before each test.
@@ -368,199 +446,6 @@ async fn cleanup_database(db: &Database) -> Result<()> {
         .execute(db.pool())
         .await?;
     Ok(())
-}
-
-/// Purge instances with empty input (created during registration).
-async fn purge_empty_instances(db: &Database) -> Result<()> {
-    sqlx::query("DELETE FROM workflow_instances WHERE input_payload IS NULL")
-        .execute(db.pool())
-        .await?;
-    Ok(())
-}
-
-/// Count action calls in a program.
-fn count_actions_in_program(program: &rappel::ir_ast::Program) -> usize {
-    let mut count = 0;
-    for func in &program.functions {
-        if let Some(body) = &func.body {
-            count += count_actions_in_block(body);
-        }
-    }
-    count.max(1) // At least 1 action expected
-}
-
-fn count_actions_in_block(block: &rappel::ir_ast::Block) -> usize {
-    use rappel::ir_ast::statement::Kind;
-
-    let mut count = 0;
-    for stmt in &block.statements {
-        match &stmt.kind {
-            Some(Kind::ActionCall(_)) => count += 1,
-            Some(Kind::Conditional(cond)) => {
-                // Count actions in the if branch
-                if let Some(if_branch) = &cond.if_branch
-                    && let Some(body) = &if_branch.body
-                {
-                    count += count_actions_in_block(body);
-                }
-                // Count actions in elif branches
-                for elif in &cond.elif_branches {
-                    if let Some(body) = &elif.body {
-                        count += count_actions_in_block(body);
-                    }
-                }
-                // Count actions in else branch
-                if let Some(else_branch) = &cond.else_branch
-                    && let Some(body) = &else_branch.body
-                {
-                    count += count_actions_in_block(body);
-                }
-            }
-            Some(Kind::ForLoop(for_loop)) => {
-                if let Some(body) = &for_loop.body {
-                    count += count_actions_in_block(body);
-                }
-            }
-            Some(Kind::TryExcept(try_except)) => {
-                if let Some(body) = &try_except.try_body {
-                    count += count_actions_in_block(body);
-                }
-                for handler in &try_except.handlers {
-                    if let Some(handler_block) = &handler.body {
-                        count += count_actions_in_block(handler_block);
-                    }
-                }
-            }
-            Some(Kind::SpreadAction(_)) => count += 1,
-            Some(Kind::ParallelBlock(parallel)) => {
-                count += parallel.calls.len();
-            }
-            _ => {}
-        }
-    }
-    count
-}
-
-/// Enqueue initial actions from the workflow program.
-async fn enqueue_initial_actions(
-    db: &Database,
-    instance_id: WorkflowInstanceId,
-    program: &rappel::ir_ast::Program,
-    module_name: &str,
-) -> Result<()> {
-    use rappel::ir_ast::statement::Kind;
-
-    // Find action calls in the first function
-    if let Some(func) = program.functions.first()
-        && let Some(body) = &func.body
-    {
-        for (idx, stmt) in body.statements.iter().enumerate() {
-            if let Some(Kind::ActionCall(action_call)) = &stmt.kind {
-                // Build kwargs JSON
-                let mut kwargs = serde_json::Map::new();
-                for kwarg in &action_call.kwargs {
-                    if let Some(value) = &kwarg.value {
-                        kwargs.insert(kwarg.name.clone(), expr_to_json(value));
-                    }
-                }
-
-                let dispatch_payload = serde_json::to_vec(&serde_json::Value::Object(kwargs))?;
-
-                // Use module_name from action_call if available, otherwise fall back to config
-                let action_module = if action_call.module_name.is_none()
-                    || action_call
-                        .module_name
-                        .as_ref()
-                        .map(|s| s.is_empty())
-                        .unwrap_or(true)
-                {
-                    module_name.to_string()
-                } else {
-                    action_call.module_name.clone().unwrap_or_default()
-                };
-
-                let action = NewAction {
-                    instance_id,
-                    module_name: action_module,
-                    action_name: action_call.action_name.clone(),
-                    dispatch_payload,
-                    timeout_seconds: 300,
-                    max_retries: 3,
-                    backoff_kind: BackoffKind::Exponential,
-                    backoff_base_delay_ms: 1000,
-                    node_id: Some(format!("node_{}", idx)),
-                };
-
-                db.enqueue_action(action).await?;
-                info!(action_name = %action_call.action_name, "enqueued initial action");
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Convert an IR expression to JSON (for kwargs).
-fn expr_to_json(expr: &rappel::ir_ast::Expr) -> serde_json::Value {
-    use rappel::ir_ast::expr::Kind;
-
-    match &expr.kind {
-        Some(Kind::Literal(lit)) => literal_to_json(lit),
-        Some(Kind::Variable(var)) => serde_json::Value::String(format!("${}", var.name)),
-        Some(Kind::List(list)) => {
-            let items: Vec<_> = list.elements.iter().map(expr_to_json).collect();
-            serde_json::Value::Array(items)
-        }
-        Some(Kind::Dict(dict)) => {
-            let mut map = serde_json::Map::new();
-            for entry in &dict.entries {
-                if let (Some(key), Some(value)) = (&entry.key, &entry.value) {
-                    let key_str = match expr_to_json(key) {
-                        serde_json::Value::String(s) => s,
-                        other => other.to_string(),
-                    };
-                    map.insert(key_str, expr_to_json(value));
-                }
-            }
-            serde_json::Value::Object(map)
-        }
-        _ => serde_json::Value::Null,
-    }
-}
-
-fn literal_to_json(lit: &rappel::ir_ast::Literal) -> serde_json::Value {
-    use rappel::ir_ast::literal::Value;
-
-    match &lit.value {
-        Some(Value::IntValue(i)) => serde_json::Value::Number((*i).into()),
-        Some(Value::FloatValue(f)) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Some(Value::StringValue(s)) => serde_json::Value::String(s.clone()),
-        Some(Value::BoolValue(b)) => serde_json::Value::Bool(*b),
-        Some(Value::IsNone(true)) => serde_json::Value::Null,
-        _ => serde_json::Value::Null,
-    }
-}
-
-/// Encode workflow input as protobuf bytes.
-fn encode_workflow_input(pairs: &[(&str, &str)]) -> Vec<u8> {
-    let arguments: Vec<proto::WorkflowArgument> = pairs
-        .iter()
-        .map(|(key, value)| proto::WorkflowArgument {
-            key: (*key).to_string(),
-            value: Some(proto::WorkflowArgumentValue {
-                kind: Some(proto::workflow_argument_value::Kind::Primitive(
-                    proto::PrimitiveWorkflowArgument {
-                        kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
-                            (*value).to_string(),
-                        )),
-                    },
-                )),
-            }),
-        })
-        .collect();
-
-    proto::WorkflowArguments { arguments }.encode_to_vec()
 }
 
 /// Run a Python script in a temporary environment.
@@ -686,13 +571,18 @@ async fn run_shell(
 }
 
 /// Dispatch all actions from the queue to workers.
+///
+/// This is a simplified dispatch loop for testing that:
+/// 1. Fetches queued actions
+/// 2. Dispatches them to workers
+/// 3. Marks actions as completed
+/// 4. Repeats until no more work is available
 async fn dispatch_all_actions(
-    database: &Database,
-    pool: &PythonWorkerPool,
-    max_actions: usize,
+    database: &Arc<Database>,
+    pool: &Arc<PythonWorkerPool>,
 ) -> Result<Vec<RoundTripMetrics>> {
     let mut completed = Vec::new();
-    let mut max_iterations = max_actions.saturating_mul(20).max(100);
+    let mut max_iterations = 200;
     let mut idle_cycles = 0usize;
 
     while max_iterations > 0 {
