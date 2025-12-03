@@ -29,9 +29,9 @@ class ExceptionWorkflow(Workflow):
     """Workflow with try/except handling.
 
     The IR builder will automatically transform this:
-    - Hoist get_initial_value() out of the try block
-    - Keep only risky_operation() in the try block
-    - Move the return after the try/except
+    - Wrap the multi-call try body into a synthetic function
+    - The try block then has a single call to that function
+    - Both actions remain protected by exception handling
     """
 
     async def run(self) -> str:

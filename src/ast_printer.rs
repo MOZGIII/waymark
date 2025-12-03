@@ -101,20 +101,6 @@ impl AstPrinter {
         lines.join("\n")
     }
 
-    /// Print a data body (for for-loops).
-    fn print_data_body(&mut self, body: &ast::DataBody) -> String {
-        self.indent_level += 1;
-        let mut lines = Vec::new();
-        for stmt in &body.statements {
-            let stmt_str = self.print_statement(stmt);
-            for line in stmt_str.lines() {
-                lines.push(format!("{}{}", self.current_indent(), line));
-            }
-        }
-        self.indent_level -= 1;
-        lines.join("\n")
-    }
-
     /// Print a call (action or function).
     fn print_call(&mut self, call: &ast::Call) -> String {
         match &call.kind {
@@ -253,7 +239,7 @@ impl AstPrinter {
         let body = for_loop
             .body
             .as_ref()
-            .map(|b| self.print_data_body(b))
+            .map(|b| self.print_single_call_body(b))
             .unwrap_or_default();
 
         format!("for {} in {}:\n{}", loop_vars, iterable, body)

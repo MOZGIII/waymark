@@ -489,17 +489,6 @@ impl DAGConverter {
         result
     }
 
-    /// Convert a DataBody to DAG node(s).
-    /// DataBody contains pure data statements (no action/function calls).
-    fn convert_data_body(&mut self, body: &ast::DataBody) -> Vec<String> {
-        let mut result = vec![];
-        for stmt in &body.statements {
-            let node_ids = self.convert_statement(stmt);
-            result.extend(node_ids);
-        }
-        result
-    }
-
     /// Convert an assignment statement
     fn convert_assignment(&mut self, assign: &ast::Assignment) -> Vec<String> {
         let value = match &assign.value {
@@ -821,13 +810,19 @@ impl DAGConverter {
             self.track_var_definition(loop_var, &loop_id);
         }
 
-        // Track output variables from the loop body assignment
-        if let Some(body) = &for_loop.body
-            && let Some(first_stmt) = body.statements.first()
-            && let Some(ast::statement::Kind::Assignment(assign)) = &first_stmt.kind
-        {
-            for target in &assign.targets {
+        // Track output variables from the loop body (SingleCallBody)
+        if let Some(body) = &for_loop.body {
+            // If there's a call with a target, track it
+            if let Some(ref target) = body.target {
                 self.track_var_definition(target, &loop_id);
+            }
+            // Also check pure data statements for assignments
+            for stmt in &body.statements {
+                if let Some(ast::statement::Kind::Assignment(assign)) = &stmt.kind {
+                    for target in &assign.targets {
+                        self.track_var_definition(target, &loop_id);
+                    }
+                }
             }
         }
 

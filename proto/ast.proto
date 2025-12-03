@@ -51,7 +51,7 @@ message Block {
 // general blocks. These types make the constraints explicit.
 
 // Body constrained to at most ONE action or function call.
-// Used by: TryExcept (try_body, handlers), Conditional branches
+// Used by: TryExcept (try_body, handlers), Conditional branches, ForLoop body
 //
 // Can contain EITHER:
 // 1. A single call (action or function) with optional assignment target
@@ -71,20 +71,8 @@ message SingleCallBody {
   Span span = 4;
 }
 
-// Body for pure data manipulation (NO action/function calls allowed).
-// Used by: ForLoop body
-//
-// Example (for loop with data manipulation):
-//   for i, order in enumerate(valid_orders):
-//       confirmation = { "order_id": order["id"], ... }
-//       confirmations = confirmations + [confirmation]
-//
-// For iterating with action calls, use SpreadAction instead:
-//   payments = spread valid_orders:order -> @process_payment(order_id=order["id"])
-message DataBody {
-  repeated Statement statements = 1;  // Must NOT contain action_call or function_call
-  Span span = 2;
-}
+// Note: DataBody was removed. ForLoop now uses SingleCallBody.
+// For parallel iteration over collections, use SpreadAction.
 
 // -----------------------------------------------------------------------------
 // Statements
@@ -144,12 +132,12 @@ message Call {
 }
 
 // For loop: for i, item in enumerate(items): body
-// Body is constrained to pure data manipulation (no calls).
-// Use SpreadAction for iterating with action calls.
+// Body is constrained to at most ONE action or function call per iteration.
+// Use SpreadAction for parallel iteration over collections.
 message ForLoop {
   repeated string loop_vars = 1;     // Loop variable(s) for unpacking
   Expr iterable = 2;
-  DataBody body = 3;                 // Pure data body (no calls allowed)
+  SingleCallBody body = 3;           // Single call body (one action/fn per iteration)
 }
 
 // Conditional: if/elif/else

@@ -288,14 +288,19 @@ class IRBuilder(ast.NodeVisitor):
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
 
-        # For loops use DataBody (pure data statements, no calls)
-        # Note: If there are action calls, the Rust runtime will handle them,
-        # but ideally Python code should use spread for action iteration.
+        # Wrap for loop body if multiple calls (use loop_vars as inputs)
+        if self._count_calls(body_stmts) > 1:
+            body_stmts = self._wrap_body_as_function(
+                body_stmts, "for_body", node, inputs=loop_vars
+            )
+
+        # For loops use SingleCallBody (at most one action/function call per iteration)
+        # Use spread for parallel iteration over collections.
         stmt = ir.Statement(span=_make_span(node))
         for_loop = ir.ForLoop(
             loop_vars=loop_vars,
             iterable=iterable,
-            body=self._stmts_to_data_body(body_stmts, _make_span(node)),
+            body=self._stmts_to_single_call_body(body_stmts, _make_span(node)),
         )
         stmt.for_loop.CopyFrom(for_loop)
         return [stmt]
@@ -521,10 +526,6 @@ class IRBuilder(ast.NodeVisitor):
         # Add all statements as pure data
         body.statements.extend(stmts)
         return body
-
-    def _stmts_to_data_body(self, stmts: List[ir.Statement], span: ir.Span) -> ir.DataBody:
-        """Convert statements to DataBody (for for-loops, no calls allowed)."""
-        return ir.DataBody(statements=stmts, span=span)
 
     def _wrap_body_as_function(
         self,

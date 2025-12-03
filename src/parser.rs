@@ -328,30 +328,6 @@ impl<'source> Parser<'source> {
         })
     }
 
-    /// Parse a data body (for for-loops - pure data manipulation, no calls)
-    ///
-    /// Grammar: INDENT statement+ DEDENT
-    /// Constraint: statements must not contain action_call or function_call
-    fn parse_data_body(&mut self) -> Result<ast::DataBody, ParseError> {
-        let start_span = self.peek_span();
-        self.expect(&Token::Indent)?;
-
-        let mut statements = Vec::new();
-        while !self.check(&Token::Dedent) && !self.at_end() {
-            let stmt = self.parse_statement()?;
-            // Note: We don't validate no-calls here; that's a semantic check
-            statements.push(stmt);
-        }
-
-        let end_span = self.peek_span();
-        self.expect(&Token::Dedent)?;
-
-        Ok(ast::DataBody {
-            statements,
-            span: self.make_span(start_span, end_span),
-        })
-    }
-
     // -------------------------------------------------------------------------
     // Statement parsing
     // -------------------------------------------------------------------------
@@ -564,7 +540,7 @@ impl<'source> Parser<'source> {
         self.expect(&Token::In)?;
         let iterable = self.parse_expr()?;
         self.expect(&Token::Colon)?;
-        let body = self.parse_data_body()?;
+        let body = self.parse_single_call_body()?;
 
         Ok(ast::ForLoop {
             loop_vars,
