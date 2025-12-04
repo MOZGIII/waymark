@@ -501,6 +501,9 @@ async fn main() -> Result<()> {
     runner.shutdown();
     let _ = tokio::time::timeout(Duration::from_secs(5), runner_handle).await;
 
+    // Drop the runner to release worker_pool reference
+    drop(runner);
+
     // Calculate statistics
     let elapsed_s = elapsed.as_secs_f64();
     let throughput = total as f64 / elapsed_s;
