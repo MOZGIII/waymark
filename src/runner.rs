@@ -1534,7 +1534,54 @@ impl DAGRunner {
         catch_all_handler
     }
 
+    /// Evaluate a guard expression and return whether it passes (truthy).
+    ///
+    /// Returns `true` if there's no guard expression, or if the expression evaluates to truthy.
+    /// Returns `false` if the expression evaluates to falsy or if evaluation fails.
+    fn evaluate_guard(
+        guard_expr: Option<&ast::Expr>,
+        scope: &Scope,
+        successor_id: &str,
+    ) -> bool {
+        let Some(guard) = guard_expr else {
+            // No guard expression - always pass
+            return true;
+        };
+
+        match ExpressionEvaluator::evaluate(guard, scope) {
+            Ok(val) => {
+                let is_true = match &val {
+                    JsonValue::Bool(b) => *b,
+                    JsonValue::Null => false,
+                    JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+                    JsonValue::String(s) => !s.is_empty(),
+                    JsonValue::Array(a) => !a.is_empty(),
+                    JsonValue::Object(o) => !o.is_empty(),
+                };
+                debug!(
+                    successor_id = %successor_id,
+                    guard_expr = ?guard,
+                    result = ?val,
+                    is_true = is_true,
+                    "evaluated guard expression"
+                );
+                is_true
+            }
+            Err(e) => {
+                warn!(
+                    successor_id = %successor_id,
+                    error = %e,
+                    "failed to evaluate guard expression, skipping"
+                );
+                false
+            }
+        }
+    }
+
     /// Process successor nodes with optional condition result for branching.
+    ///
+    /// Uses BFS traversal to process inline nodes and their successors iteratively.
+    /// Guard expressions are evaluated as we encounter edges during traversal.
     #[allow(clippy::too_many_arguments)]
     async fn process_successors_with_condition(
         node_id: &str,
@@ -1625,52 +1672,29 @@ impl DAGRunner {
             inline_scope.insert(target.clone(), result.clone());
         }
 
-        let successors = helper.get_ready_successors(node_id, condition_result);
+        // BFS work queue: (node_id, result to pass forward)
+        // This replaces recursive calls with an iterative loop
+        use std::collections::VecDeque;
 
-        // Filter successors based on guard expressions
-        // If successors have guard_expr, evaluate them and only process matching ones
-        let filtered_successors: Vec<_> = successors
-            .into_iter()
-            .filter(|successor| {
-                if let Some(ref guard_expr) = successor.guard_expr {
-                    // Evaluate the guard expression
-                    match ExpressionEvaluator::evaluate(guard_expr, inline_scope) {
-                        Ok(val) => {
-                            let is_true = match &val {
-                                JsonValue::Bool(b) => *b,
-                                JsonValue::Null => false,
-                                JsonValue::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
-                                JsonValue::String(s) => !s.is_empty(),
-                                JsonValue::Array(a) => !a.is_empty(),
-                                JsonValue::Object(o) => !o.is_empty(),
-                            };
-                            debug!(
-                                successor_id = %successor.node_id,
-                                guard_expr = ?guard_expr,
-                                result = ?val,
-                                is_true = is_true,
-                                "evaluated guard expression on edge"
-                            );
-                            is_true
-                        }
-                        Err(e) => {
-                            warn!(
-                                successor_id = %successor.node_id,
-                                error = %e,
-                                "failed to evaluate guard expression on edge, skipping"
-                            );
-                            false
-                        }
-                    }
-                } else {
-                    // No guard expression - always include
-                    true
-                }
-            })
-            .collect();
+        let mut work_queue: VecDeque<(String, JsonValue)> = VecDeque::new();
 
-        for successor in filtered_successors {
-            let succ_node = match dag.nodes.get(&successor.node_id) {
+        // Initialize queue with immediate successors from the starting node
+        for successor in helper.get_ready_successors(node_id, condition_result) {
+            // Evaluate guard at edge traversal time
+            if !Self::evaluate_guard(
+                successor.guard_expr.as_ref(),
+                inline_scope,
+                &successor.node_id,
+            ) {
+                continue;
+            }
+
+            work_queue.push_back((successor.node_id, result.clone()));
+        }
+
+        // Process work queue iteratively (BFS)
+        while let Some((current_node_id, current_result)) = work_queue.pop_front() {
+            let succ_node = match dag.nodes.get(&current_node_id) {
                 Some(n) => n,
                 None => continue,
             };
@@ -1684,15 +1708,15 @@ impl DAGRunner {
                         // The result is the value from the inline_scope (the action result that just completed)
                         // We wrap it in a "result" key to match Python's expected format
                         let mut result_map = HashMap::new();
-                        result_map.insert("result".to_string(), result.clone());
+                        result_map.insert("result".to_string(), current_result.clone());
 
                         // Serialize the result as WorkflowArguments protobuf
                         let result_payload = Self::serialize_workflow_result(&result_map);
 
                         debug!(
                             instance_id = %instance_id.0,
-                            output_node = %successor.node_id,
-                            result = ?result,
+                            output_node = %current_node_id,
+                            result = ?current_result,
                             "workflow reached output node, marking complete"
                         );
 
@@ -1703,18 +1727,13 @@ impl DAGRunner {
                         continue;
                     }
 
-                    // For branch nodes, we don't evaluate guards here.
-                    // The guards are on the edges, and we handle them at successor traversal time.
-                    // For now, just pass through.
-                    let condition_result: Option<bool> = None;
-
                     // Execute inline node with in-memory scope
                     let inline_result = Self::execute_inline_node(succ_node, inline_scope)?;
 
                     // Collect inbox writes for inline node's result
                     if let Some(ref target) = succ_node.target {
                         Self::collect_inbox_writes_for_node(
-                            &successor.node_id,
+                            &current_node_id,
                             target,
                             &inline_result,
                             dag,
@@ -1727,32 +1746,32 @@ impl DAGRunner {
                     // - Control-flow nodes (join, branch) pass through the incoming result
                     // - Value-producing nodes use their own inline_result
                     let passthrough_result = match succ_node.node_type.as_str() {
-                        "join" | "branch" => result.clone(),
+                        "join" | "branch" => current_result.clone(),
                         _ => inline_result,
                     };
 
-                    // Recursively process inline successors, passing condition result for branching
-                    Box::pin(Self::process_successors_with_condition(
-                        &successor.node_id,
-                        &passthrough_result,
-                        dag,
-                        helper,
-                        inline_scope,
-                        batch,
-                        instance_id,
-                        db,
-                        condition_result,
-                    ))
-                    .await?;
+                    // Add successors to work queue (instead of recursive call)
+                    for successor in helper.get_ready_successors(&current_node_id, None) {
+                        // Evaluate guard at edge traversal time
+                        if !Self::evaluate_guard(
+                            successor.guard_expr.as_ref(),
+                            inline_scope,
+                            &successor.node_id,
+                        ) {
+                            continue;
+                        }
+
+                        work_queue.push_back((successor.node_id, passthrough_result.clone()));
+                    }
                 }
                 ExecutionMode::Delegated => {
                     // Read inbox for this node from database
                     // This includes data from ANY upstream node, not just the one that just completed
-                    let mut inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+                    let mut inbox = db.read_inbox(instance_id, &current_node_id).await?;
 
                     // Merge pending inbox writes for this node (not yet committed to DB)
                     for pending_write in &batch.inbox_writes {
-                        if pending_write.target_node_id == successor.node_id {
+                        if pending_write.target_node_id == current_node_id {
                             inbox.insert(
                                 pending_write.variable_name.clone(),
                                 pending_write.value.clone(),
@@ -1767,9 +1786,10 @@ impl DAGRunner {
                     }
 
                     // Create actions (may be multiple for spread nodes)
-                    let result = Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
-                    batch.new_actions.extend(result.actions);
-                    batch.inbox_writes.extend(result.inbox_writes);
+                    let action_result =
+                        Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
+                    batch.new_actions.extend(action_result.actions);
+                    batch.inbox_writes.extend(action_result.inbox_writes);
                 }
             }
         }
