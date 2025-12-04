@@ -20,6 +20,7 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
+use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,

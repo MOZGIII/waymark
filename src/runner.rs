@@ -137,6 +137,56 @@ fn proto_value_to_json(value: &proto::WorkflowArgumentValue) -> JsonValue {
     }
 }
 
+/// Convert a JSON Value to a protobuf WorkflowArgumentValue.
+fn json_to_proto_value(value: &JsonValue) -> proto::WorkflowArgumentValue {
+    use proto::workflow_argument_value::Kind;
+
+    let kind = match value {
+        JsonValue::Null => Kind::Primitive(proto::PrimitiveWorkflowArgument {
+            kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
+        }),
+        JsonValue::Bool(b) => Kind::Primitive(proto::PrimitiveWorkflowArgument {
+            kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
+        }),
+        JsonValue::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
+                })
+            } else if let Some(f) = n.as_f64() {
+                Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
+                })
+            } else {
+                Kind::Primitive(proto::PrimitiveWorkflowArgument {
+                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
+                })
+            }
+        }
+        JsonValue::String(s) => Kind::Primitive(proto::PrimitiveWorkflowArgument {
+            kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
+                s.clone(),
+            )),
+        }),
+        JsonValue::Array(arr) => {
+            let items = arr.iter().map(json_to_proto_value).collect();
+            Kind::ListValue(proto::WorkflowListArgument { items })
+        }
+        JsonValue::Object(obj) => {
+            let entries = obj
+                .iter()
+                .map(|(k, v)| proto::WorkflowArgument {
+                    key: k.clone(),
+                    value: Some(json_to_proto_value(v)),
+                })
+                .collect();
+            Kind::DictValue(proto::WorkflowDictArgument { entries })
+        }
+    };
+
+    proto::WorkflowArgumentValue { kind: Some(kind) }
+}
+
 // ============================================================================
 // Errors
 // ============================================================================
@@ -539,6 +589,15 @@ pub struct CompletionBatch {
     pub new_actions: Vec<NewAction>,
     /// Inbox writes to commit (data flow between nodes)
     pub inbox_writes: Vec<InboxWrite>,
+    /// Workflow instance completion (if the workflow finished)
+    pub instance_completion: Option<InstanceCompletion>,
+}
+
+/// Workflow instance completion record.
+#[derive(Debug, Clone)]
+pub struct InstanceCompletion {
+    pub instance_id: WorkflowInstanceId,
+    pub result_payload: Vec<u8>,
 }
 
 impl CompletionBatch {
@@ -547,7 +606,10 @@ impl CompletionBatch {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.completions.is_empty() && self.new_actions.is_empty() && self.inbox_writes.is_empty()
+        self.completions.is_empty()
+            && self.new_actions.is_empty()
+            && self.inbox_writes.is_empty()
+            && self.instance_completion.is_none()
     }
 }
 
@@ -738,6 +800,25 @@ impl WorkCompletionHandler {
         // Enqueue new actions
         for new_action in batch.new_actions {
             self.db.enqueue_action(new_action).await?;
+        }
+
+        // Complete workflow instance if finished
+        if let Some(completion) = batch.instance_completion {
+            debug!(
+                instance_id = %completion.instance_id.0,
+                result_len = completion.result_payload.len(),
+                "marking workflow instance as completed"
+            );
+            self.db
+                .complete_instance(
+                    completion.instance_id,
+                    if completion.result_payload.is_empty() {
+                        None
+                    } else {
+                        Some(&completion.result_payload)
+                    },
+                )
+                .await?;
         }
 
         Ok(())
@@ -1784,6 +1865,31 @@ impl DAGRunner {
             let exec_mode = helper.get_execution_mode(succ_node);
             match exec_mode {
                 ExecutionMode::Inline => {
+                    // Check if this is the output node of the entry function (workflow completion)
+                    if succ_node.is_output || succ_node.node_type == "return" {
+                        // This is the final node - mark the workflow as complete
+                        // The result is the value from the inline_scope (the action result that just completed)
+                        // We wrap it in a "result" key to match Python's expected format
+                        let mut result_map = HashMap::new();
+                        result_map.insert("result".to_string(), result.clone());
+
+                        // Serialize the result as WorkflowArguments protobuf
+                        let result_payload = Self::serialize_workflow_result(&result_map);
+
+                        debug!(
+                            instance_id = %instance_id.0,
+                            output_node = %successor.node_id,
+                            result = ?result,
+                            "workflow reached output node, marking complete"
+                        );
+
+                        batch.instance_completion = Some(InstanceCompletion {
+                            instance_id,
+                            result_payload,
+                        });
+                        continue;
+                    }
+
                     // Execute inline node with in-memory scope
                     let inline_result = Self::execute_inline_node(succ_node, inline_scope)?;
 
@@ -1815,7 +1921,17 @@ impl DAGRunner {
                 ExecutionMode::Delegated => {
                     // Read inbox for this node from database
                     // This includes data from ANY upstream node, not just the one that just completed
-                    let inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+                    let mut inbox = db.read_inbox(instance_id, &successor.node_id).await?;
+
+                    // Merge pending inbox writes for this node (not yet committed to DB)
+                    for pending_write in &batch.inbox_writes {
+                        if pending_write.target_node_id == successor.node_id {
+                            inbox.insert(
+                                pending_write.variable_name.clone(),
+                                pending_write.value.clone(),
+                            );
+                        }
+                    }
 
                     // Create actions (may be multiple for spread nodes)
                     let result = Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
@@ -1826,6 +1942,22 @@ impl DAGRunner {
         }
 
         Ok(())
+    }
+
+    /// Serialize workflow result (inbox values) as protobuf WorkflowArguments.
+    fn serialize_workflow_result(inbox: &HashMap<String, JsonValue>) -> Vec<u8> {
+        use prost::Message;
+
+        let arguments: Vec<proto::WorkflowArgument> = inbox
+            .iter()
+            .map(|(key, value)| proto::WorkflowArgument {
+                key: key.clone(),
+                value: Some(json_to_proto_value(value)),
+            })
+            .collect();
+
+        let workflow_args = proto::WorkflowArguments { arguments };
+        workflow_args.encode_to_vec()
     }
 
     /// Execute an inline node with in-memory scope (non-durable).
