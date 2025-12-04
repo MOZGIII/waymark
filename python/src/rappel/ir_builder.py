@@ -82,9 +82,12 @@ def build_workflow_ir(workflow_cls: type["Workflow"]) -> ir.Program:
     # Discover actions in the module
     action_defs = _discover_action_names(module)
 
+    # Discover imports for built-in detection (e.g., from asyncio import sleep)
+    imported_names = _discover_module_imports(module)
+
     # Build the IR with transformation context
     ctx = TransformContext()
-    builder = IRBuilder(action_defs, ctx)
+    builder = IRBuilder(action_defs, ctx, imported_names)
     builder.visit(tree)
 
     # Create the Program with the main function and any implicit functions
@@ -118,12 +121,56 @@ def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
     return names
 
 
+@dataclass
+class ImportedName:
+    """Tracks an imported name and its source module."""
+
+    local_name: str  # Name used in code (e.g., "sleep")
+    module: str  # Source module (e.g., "asyncio")
+    original_name: str  # Original name in source module (e.g., "sleep")
+
+
+def _discover_module_imports(module: Any) -> Dict[str, ImportedName]:
+    """Discover imports in a module by parsing its source.
+
+    Tracks imports like:
+    - from asyncio import sleep  -> {"sleep": ImportedName("sleep", "asyncio", "sleep")}
+    - from asyncio import sleep as s -> {"s": ImportedName("s", "asyncio", "sleep")}
+    """
+    imported: Dict[str, ImportedName] = {}
+
+    try:
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
+    except (OSError, TypeError):
+        # Can't get source (e.g., built-in module)
+        return imported
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            for alias in node.names:
+                local_name = alias.asname if alias.asname else alias.name
+                imported[local_name] = ImportedName(
+                    local_name=local_name,
+                    module=node.module,
+                    original_name=alias.name,
+                )
+
+    return imported
+
+
 class IRBuilder(ast.NodeVisitor):
     """Builds IR from Python AST with deep transformations."""
 
-    def __init__(self, action_defs: Dict[str, ActionDefinition], ctx: TransformContext):
+    def __init__(
+        self,
+        action_defs: Dict[str, ActionDefinition],
+        ctx: TransformContext,
+        imported_names: Optional[Dict[str, ImportedName]] = None,
+    ):
         self._action_defs = action_defs
         self._ctx = ctx
+        self._imported_names = imported_names or {}
         self.function_def: Optional[ir.FunctionDef] = None
         self._statements: List[ir.Statement] = []
 
@@ -290,9 +337,7 @@ class IRBuilder(ast.NodeVisitor):
 
         # Wrap for loop body if multiple calls (use loop_vars as inputs)
         if self._count_calls(body_stmts) > 1:
-            body_stmts = self._wrap_body_as_function(
-                body_stmts, "for_body", node, inputs=loop_vars
-            )
+            body_stmts = self._wrap_body_as_function(body_stmts, "for_body", node, inputs=loop_vars)
 
         # For loops use SingleCallBody (at most one action/function call per iteration)
         # Use spread for parallel iteration over collections.
@@ -624,6 +669,9 @@ class IRBuilder(ast.NodeVisitor):
                 # Extract the actual action call from run_action
                 if awaited.args:
                     return self._extract_action_call_from_awaitable(awaited.args[0])
+            # Check for asyncio.sleep() - convert to @sleep action
+            if self._is_asyncio_sleep_call(awaited):
+                return self._convert_asyncio_sleep_to_action(awaited)
             # Direct action call
             return self._extract_action_call_from_call(awaited)
 
@@ -634,6 +682,51 @@ class IRBuilder(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             return node.func.attr == "run_action"
         return False
+
+    def _is_asyncio_sleep_call(self, node: ast.Call) -> bool:
+        """Check if this is an asyncio.sleep(...) call.
+
+        Supports both patterns:
+        - import asyncio; asyncio.sleep(1)
+        - from asyncio import sleep; sleep(1)
+        - from asyncio import sleep as s; s(1)
+        """
+        if isinstance(node.func, ast.Attribute):
+            # asyncio.sleep(...) pattern
+            if node.func.attr == "sleep" and isinstance(node.func.value, ast.Name):
+                return node.func.value.id == "asyncio"
+        elif isinstance(node.func, ast.Name):
+            # sleep(...) pattern - check if it's imported from asyncio
+            func_name = node.func.id
+            if func_name in self._imported_names:
+                imported = self._imported_names[func_name]
+                return imported.module == "asyncio" and imported.original_name == "sleep"
+        return False
+
+    def _convert_asyncio_sleep_to_action(self, node: ast.Call) -> ir.ActionCall:
+        """Convert asyncio.sleep(duration) to @sleep(duration=X) action call.
+
+        This creates a built-in sleep action that the scheduler handles as a
+        durable sleep - stored in the DB with a future scheduled_at time.
+        """
+        action_call = ir.ActionCall(action_name="sleep")
+
+        # Extract duration argument (positional or keyword)
+        if node.args:
+            # asyncio.sleep(1) - positional
+            expr = _expr_to_ir(node.args[0])
+            if expr:
+                action_call.kwargs.append(ir.Kwarg(name="duration", value=expr))
+        elif node.keywords:
+            # asyncio.sleep(seconds=1) - keyword (less common)
+            for kw in node.keywords:
+                if kw.arg in ("seconds", "delay", "duration"):
+                    expr = _expr_to_ir(kw.value)
+                    if expr:
+                        action_call.kwargs.append(ir.Kwarg(name="duration", value=expr))
+                    break
+
+        return action_call
 
     def _extract_action_call_from_awaitable(self, node: ast.expr) -> Optional[ir.ActionCall]:
         """Extract action call from an awaitable expression."""
