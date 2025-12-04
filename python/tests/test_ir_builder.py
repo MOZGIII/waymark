@@ -736,3 +736,187 @@ class TestWorkflowHelperMethods:
         # Keyword arg
         assert fc.kwargs[0].name == "z", "Expected 'z' kwarg"
         assert fc.kwargs[0].value.literal.int_value == 3, "Expected z=3"
+
+
+class TestUnsupportedPatternDetection:
+    """Test that unsupported patterns raise UnsupportedPatternError with recommendations."""
+
+    def test_gather_variable_spread_raises_error(self) -> None:
+        """Test: asyncio.gather(*tasks) raises error with recommendation."""
+        import pytest
+
+        from rappel import UnsupportedPatternError
+        from tests.fixtures_gather.gather_unsupported_variable import (
+            GatherUnsupportedVariableWorkflow,
+        )
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            GatherUnsupportedVariableWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "tasks" in error.message, "Error should mention the variable name"
+        assert "gather" in error.message.lower(), "Error should mention gather"
+        assert "list comprehension" in error.recommendation.lower(), (
+            "Recommendation should suggest list comprehension"
+        )
+
+    def test_fstring_raises_error(self) -> None:
+        """Test: f-strings raise error with recommendation."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, action, workflow
+        from rappel.workflow import Workflow
+
+        @action(name="fstring_test_action")
+        async def fstring_action() -> int:
+            return 1
+
+        @workflow
+        class FstringWorkflow(Workflow):
+            async def run(self, name: str) -> str:
+                result = await fstring_action()
+                return f"Hello {name}, result is {result}"
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            FstringWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "F-string" in error.message, "Error should mention f-strings"
+        assert "@action" in error.recommendation, (
+            "Recommendation should suggest using @action"
+        )
+
+    def test_while_loop_raises_error(self) -> None:
+        """Test: while loops raise error with recommendation."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, action, workflow
+        from rappel.workflow import Workflow
+
+        @action(name="while_test_action")
+        async def while_action() -> int:
+            return 1
+
+        @workflow
+        class WhileWorkflow(Workflow):
+            async def run(self, count: int) -> int:
+                i = 0
+                while i < count:
+                    await while_action()
+                    i += 1
+                return i
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            WhileWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "While" in error.message, "Error should mention while loops"
+        assert "for loop" in error.recommendation.lower(), (
+            "Recommendation should suggest for loop"
+        )
+
+    def test_with_statement_raises_error(self) -> None:
+        """Test: with statements raise error with recommendation."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class WithWorkflow(Workflow):
+            async def run(self, path: str) -> str:
+                with open(path) as f:
+                    return f.read()
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            WithWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "with" in error.message.lower(), "Error should mention with statements"
+        assert "@action" in error.recommendation, (
+            "Recommendation should suggest using @action"
+        )
+
+    def test_lambda_raises_error(self) -> None:
+        """Test: lambda expressions raise error with recommendation."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class LambdaWorkflow(Workflow):
+            async def run(self, x: int) -> int:
+                fn = lambda y: y * 2
+                return fn(x)
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            LambdaWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "Lambda" in error.message, "Error should mention lambda"
+        assert "@action" in error.recommendation, (
+            "Recommendation should suggest using @action"
+        )
+
+    def test_list_comprehension_outside_gather_raises_error(self) -> None:
+        """Test: list comprehensions outside gather context raise error."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class ListCompWorkflow(Workflow):
+            async def run(self, items: list) -> list:
+                doubled = [x * 2 for x in items]
+                return doubled
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            ListCompWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "List comprehension" in error.message, (
+            "Error should mention list comprehensions"
+        )
+        assert "asyncio.gather" in error.recommendation, (
+            "Recommendation should mention gather context"
+        )
+
+    def test_delete_statement_raises_error(self) -> None:
+        """Test: del statements raise error with recommendation."""
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
+        from rappel.workflow import Workflow
+
+        @workflow
+        class DeleteWorkflow(Workflow):
+            async def run(self, data: dict) -> dict:
+                del data["key"]
+                return data
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            DeleteWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert "del" in error.message.lower(), "Error should mention del"
+        assert "@action" in error.recommendation, (
+            "Recommendation should suggest using @action"
+        )
+
+    def test_error_includes_line_number(self) -> None:
+        """Test: errors include line number for debugging."""
+        import pytest
+
+        from rappel import UnsupportedPatternError
+        from tests.fixtures_gather.gather_unsupported_variable import (
+            GatherUnsupportedVariableWorkflow,
+        )
+
+        with pytest.raises(UnsupportedPatternError) as exc_info:
+            GatherUnsupportedVariableWorkflow.workflow_ir()
+
+        error = exc_info.value
+        assert error.line is not None, "Error should include line number"
+        assert error.line > 0, "Line number should be positive"

@@ -11,7 +11,7 @@ from .actions import (
 )
 from .dependencies import Depend, provide_dependencies
 from .exceptions import ExhaustedRetries, ExhaustedRetriesError
-from .ir_builder import build_workflow_ir
+from .ir_builder import UnsupportedPatternError, build_workflow_ir
 from .registry import registry
 from .workflow import (
     RetryPolicy,
@@ -37,4 +37,5 @@ __all__ = [
     "bridge",
     "ExhaustedRetries",
     "ExhaustedRetriesError",
+    "UnsupportedPatternError",
 ]

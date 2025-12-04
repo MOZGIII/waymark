@@ -16,4 +16,4 @@ class SleepAliasedImportWorkflow(Workflow):
     async def run(self) -> str:
         val = await get_value_aliased_import()
         await async_sleep(3)
-        return f"done:{val}"
+        return "done:" + str(val)

@@ -16,4 +16,4 @@ class SleepImportAsyncioWorkflow(Workflow):
     async def run(self) -> str:
         val = await get_value_asyncio_import()
         await asyncio.sleep(1)
-        return f"done:{val}"
+        return "done:" + str(val)

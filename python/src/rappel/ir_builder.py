@@ -14,15 +14,165 @@ Transformations:
 2. **For loop body wrapping**: Wraps multi-action for bodies into synthetic functions
 3. **If branch wrapping**: Wraps multi-action if/elif/else branches into synthetic functions
 4. **Exception handler wrapping**: Wraps multi-action handlers into synthetic functions
+
+Validation:
+The IR builder proactively detects unsupported Python patterns and raises
+UnsupportedPatternError with clear recommendations for how to rewrite the code.
 """
 
 import ast
 import inspect
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from proto import ast_pb2 as ir
+
+
+class UnsupportedPatternError(Exception):
+    """Raised when the IR builder encounters an unsupported Python pattern.
+
+    This error includes a recommendation for how to rewrite the code to use
+    supported patterns.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        recommendation: str,
+        line: Optional[int] = None,
+        col: Optional[int] = None,
+    ):
+        self.message = message
+        self.recommendation = recommendation
+        self.line = line
+        self.col = col
+
+        location = f" (line {line})" if line else ""
+        full_message = f"{message}{location}\n\nRecommendation: {recommendation}"
+        super().__init__(full_message)
+
+
+# Recommendations for common unsupported patterns
+RECOMMENDATIONS = {
+    "fstring": (
+        "F-strings are not supported in workflow code because they require "
+        "runtime string interpolation.\n"
+        "Use an @action to perform string formatting:\n\n"
+        "    @action\n"
+        "    async def format_message(value: int) -> str:\n"
+        "        return f'Result: {value}'"
+    ),
+    "delete": (
+        "The 'del' statement is not supported in workflow code.\n"
+        "Use an @action to perform mutations:\n\n"
+        "    @action\n"
+        "    async def remove_key(data: dict, key: str) -> dict:\n"
+        "        del data[key]\n"
+        "        return data"
+    ),
+    "while_loop": (
+        "While loops are not supported in workflow code because they can run "
+        "indefinitely.\n"
+        "Use a for loop with a fixed range, or restructure as recursive workflow calls."
+    ),
+    "with_statement": (
+        "Context managers (with statements) are not supported in workflow code.\n"
+        "Use an @action to handle resource management:\n\n"
+        "    @action\n"
+        "    async def read_file(path: str) -> str:\n"
+        "        with open(path) as f:\n"
+        "            return f.read()"
+    ),
+    "raise_statement": (
+        "The 'raise' statement is not supported directly in workflow code.\n"
+        "Use an @action that raises exceptions, or return error values."
+    ),
+    "assert_statement": (
+        "Assert statements are not supported in workflow code.\n"
+        "Use an @action for validation, or use if statements with explicit error handling."
+    ),
+    "lambda": (
+        "Lambda expressions are not supported in workflow code.\n"
+        "Use an @action to define the function logic."
+    ),
+    "list_comprehension": (
+        "List comprehensions are only supported inside asyncio.gather(*[...]).\n"
+        "For other cases, use a for loop or an @action."
+    ),
+    "dict_comprehension": (
+        "Dict comprehensions are not supported in workflow code.\n"
+        "Use an @action to build dictionaries:\n\n"
+        "    @action\n"
+        "    async def build_dict(items: list) -> dict:\n"
+        "        return {k: v for k, v in items}"
+    ),
+    "set_comprehension": (
+        "Set comprehensions are not supported in workflow code.\n"
+        "Use an @action to build sets."
+    ),
+    "generator": (
+        "Generator expressions are not supported in workflow code.\n"
+        "Use a list or an @action instead."
+    ),
+    "walrus": (
+        "The walrus operator (:=) is not supported in workflow code.\n"
+        "Use separate assignment statements instead."
+    ),
+    "match": (
+        "Match statements are not supported in workflow code.\n"
+        "Use if/elif/else chains instead."
+    ),
+    "gather_variable_spread": (
+        "Spreading a variable in asyncio.gather() is not supported because it requires "
+        "data flow analysis to determine the contents.\n"
+        "Use a list comprehension directly in gather:\n\n"
+        "    # Instead of:\n"
+        "    tasks = []\n"
+        "    for i in range(count):\n"
+        "        tasks.append(process(value=i))\n"
+        "    results = await asyncio.gather(*tasks)\n\n"
+        "    # Use:\n"
+        "    results = await asyncio.gather(*[process(value=i) for i in range(count)])"
+    ),
+    "for_loop_append_pattern": (
+        "Building a task list in a for loop then spreading in asyncio.gather() is not "
+        "supported.\n"
+        "Use a list comprehension directly in gather:\n\n"
+        "    # Instead of:\n"
+        "    tasks = []\n"
+        "    for i in range(count):\n"
+        "        tasks.append(process(value=i))\n"
+        "    results = await asyncio.gather(*tasks)\n\n"
+        "    # Use:\n"
+        "    results = await asyncio.gather(*[process(value=i) for i in range(count)])"
+    ),
+    "global_statement": (
+        "Global statements are not supported in workflow code.\n"
+        "Use workflow state or pass values explicitly."
+    ),
+    "nonlocal_statement": (
+        "Nonlocal statements are not supported in workflow code.\n"
+        "Use explicit parameter passing instead."
+    ),
+    "import_statement": (
+        "Import statements inside workflow run() are not supported.\n"
+        "Place imports at the module level."
+    ),
+    "class_def": (
+        "Class definitions inside workflow run() are not supported.\n"
+        "Define classes at the module level."
+    ),
+    "function_def": (
+        "Nested function definitions inside workflow run() are not supported.\n"
+        "Define functions at the module level or use @action."
+    ),
+    "yield_statement": (
+        "Yield statements are not supported in workflow code.\n"
+        "Workflows must return a complete result, not generate values incrementally."
+    ),
+}
+
 
 if TYPE_CHECKING:
     from .workflow import Workflow
@@ -222,6 +372,8 @@ class IRBuilder(ast.NodeVisitor):
 
         Returns a list because some transformations (like try block hoisting)
         may expand a single Python statement into multiple IR statements.
+
+        Raises UnsupportedPatternError for unsupported statement types.
         """
         if isinstance(node, ast.Assign):
             result = self._visit_assign(node)
@@ -242,8 +394,97 @@ class IRBuilder(ast.NodeVisitor):
         elif isinstance(node, ast.AugAssign):
             result = self._visit_aug_assign(node)
             return [result] if result else []
+        elif isinstance(node, ast.Pass):
+            # Pass statements are fine, they just don't produce IR
+            return []
+
+        # Check for unsupported statement types
+        self._check_unsupported_statement(node)
 
         return []
+
+    def _check_unsupported_statement(self, node: ast.stmt) -> None:
+        """Check for unsupported statement types and raise descriptive errors."""
+        line = getattr(node, "lineno", None)
+        col = getattr(node, "col_offset", None)
+
+        if isinstance(node, ast.While):
+            raise UnsupportedPatternError(
+                "While loops are not supported",
+                RECOMMENDATIONS["while_loop"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            raise UnsupportedPatternError(
+                "Context managers (with statements) are not supported",
+                RECOMMENDATIONS["with_statement"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, ast.Raise):
+            raise UnsupportedPatternError(
+                "The 'raise' statement is not supported",
+                RECOMMENDATIONS["raise_statement"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, ast.Assert):
+            raise UnsupportedPatternError(
+                "Assert statements are not supported",
+                RECOMMENDATIONS["assert_statement"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, ast.Delete):
+            raise UnsupportedPatternError(
+                "The 'del' statement is not supported",
+                RECOMMENDATIONS["delete"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, ast.Global):
+            raise UnsupportedPatternError(
+                "Global statements are not supported",
+                RECOMMENDATIONS["global_statement"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, ast.Nonlocal):
+            raise UnsupportedPatternError(
+                "Nonlocal statements are not supported",
+                RECOMMENDATIONS["nonlocal_statement"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise UnsupportedPatternError(
+                "Import statements inside workflow run() are not supported",
+                RECOMMENDATIONS["import_statement"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, ast.ClassDef):
+            raise UnsupportedPatternError(
+                "Class definitions inside workflow run() are not supported",
+                RECOMMENDATIONS["class_def"],
+                line=line,
+                col=col,
+            )
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            raise UnsupportedPatternError(
+                "Nested function definitions are not supported",
+                RECOMMENDATIONS["function_def"],
+                line=line,
+                col=col,
+            )
+        elif hasattr(ast, "Match") and isinstance(node, ast.Match):
+            raise UnsupportedPatternError(
+                "Match statements are not supported",
+                RECOMMENDATIONS["match"],
+                line=line,
+                col=col,
+            )
 
     def _visit_assign(self, node: ast.Assign) -> Optional[ir.Statement]:
         """Convert assignment to IR."""
@@ -879,6 +1120,10 @@ class IRBuilder(ast.NodeVisitor):
         2. Dynamic spread: asyncio.gather(*[action(x) for x in items])
            -> SpreadAction for parallel iteration over collection
 
+        Raises UnsupportedPatternError for:
+        - Spreading a variable: asyncio.gather(*tasks)
+        - Any non-list-comprehension starred expression
+
         Args:
             node: The asyncio.gather() Call node
             target: Optional variable name for the result (e.g., "results" or None)
@@ -886,11 +1131,31 @@ class IRBuilder(ast.NodeVisitor):
         Returns:
             An IR Statement containing ParallelBlock or SpreadAction, or None if fails.
         """
-        # Check for starred list comprehension pattern: gather(*[action(x) for x in items])
+        # Check for starred expressions
         if len(node.args) == 1 and isinstance(node.args[0], ast.Starred):
             starred = node.args[0]
+            # Only list comprehensions are supported
             if isinstance(starred.value, ast.ListComp):
                 return self._convert_gather_listcomp_to_spread(starred.value, target, node)
+            else:
+                # Spreading a variable or other expression is not supported
+                line = getattr(node, "lineno", None)
+                col = getattr(node, "col_offset", None)
+                if isinstance(starred.value, ast.Name):
+                    var_name = starred.value.id
+                    raise UnsupportedPatternError(
+                        f"Spreading variable '{var_name}' in asyncio.gather() is not supported",
+                        RECOMMENDATIONS["gather_variable_spread"],
+                        line=line,
+                        col=col,
+                    )
+                else:
+                    raise UnsupportedPatternError(
+                        "Spreading non-list-comprehension expressions in asyncio.gather() is not supported",
+                        RECOMMENDATIONS["gather_variable_spread"],
+                        line=line,
+                        col=col,
+                    )
 
         # Standard case: gather(a(), b(), c()) -> ParallelBlock
         parallel = ir.ParallelBlock()
@@ -1211,7 +1476,73 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
             result.list.CopyFrom(list_expr)
             return result
 
+    # Check for unsupported expression types
+    _check_unsupported_expression(expr)
+
     return None
+
+
+def _check_unsupported_expression(expr: ast.AST) -> None:
+    """Check for unsupported expression types and raise descriptive errors."""
+    line = getattr(expr, "lineno", None)
+    col = getattr(expr, "col_offset", None)
+
+    if isinstance(expr, ast.JoinedStr):
+        raise UnsupportedPatternError(
+            "F-strings are not supported",
+            RECOMMENDATIONS["fstring"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.Lambda):
+        raise UnsupportedPatternError(
+            "Lambda expressions are not supported",
+            RECOMMENDATIONS["lambda"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.ListComp):
+        raise UnsupportedPatternError(
+            "List comprehensions are not supported in this context",
+            RECOMMENDATIONS["list_comprehension"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.DictComp):
+        raise UnsupportedPatternError(
+            "Dict comprehensions are not supported",
+            RECOMMENDATIONS["dict_comprehension"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.SetComp):
+        raise UnsupportedPatternError(
+            "Set comprehensions are not supported",
+            RECOMMENDATIONS["set_comprehension"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.GeneratorExp):
+        raise UnsupportedPatternError(
+            "Generator expressions are not supported",
+            RECOMMENDATIONS["generator"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.NamedExpr):
+        raise UnsupportedPatternError(
+            "The walrus operator (:=) is not supported",
+            RECOMMENDATIONS["walrus"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.Yield) or isinstance(expr, ast.YieldFrom):
+        raise UnsupportedPatternError(
+            "Yield expressions are not supported",
+            RECOMMENDATIONS["yield_statement"],
+            line=line,
+            col=col,
+        )
 
 
 def _constant_to_literal(value: Any) -> Optional[ir.Literal]:
