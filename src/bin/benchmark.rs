@@ -558,8 +558,23 @@ async fn main() -> Result<()> {
         Arc::clone(&worker_pool),
     );
 
-    // Start the instance
-    runner.start_instance(instance_id, HashMap::new()).await?;
+    // Prepare initial inputs for the workflow
+    let mut initial_inputs = HashMap::new();
+    // indices: list of integers [0, 1, 2, ..., count-1]
+    let indices: Vec<serde_json::Value> = (0..args.count)
+        .map(|i| serde_json::Value::Number(i.into()))
+        .collect();
+    initial_inputs.insert(
+        "indices".to_string(),
+        serde_json::Value::Array(indices),
+    );
+    initial_inputs.insert(
+        "iterations".to_string(),
+        serde_json::Value::Number(args.iterations.into()),
+    );
+
+    // Start the instance with initial inputs
+    runner.start_instance(instance_id, initial_inputs).await?;
     info!(%instance_id, "workflow instance started");
 
     // Run the benchmark with DAG runner integration

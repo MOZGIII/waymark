@@ -69,6 +69,12 @@ pub struct DAGNode {
     pub kwargs: Option<HashMap<String, String>>,
     /// Target variable name where the action result should be stored (for action_call nodes)
     pub target: Option<String>,
+    /// Whether this is a spread action (parallel iteration over a collection)
+    pub is_spread: bool,
+    /// Loop variable name for spread actions (e.g., "item" in "spread items:item -> @action()")
+    pub spread_loop_var: Option<String>,
+    /// Collection variable being spread over (e.g., "items" in "spread items:item -> @action()")
+    pub spread_collection: Option<String>,
 }
 
 impl DAGNode {
@@ -93,6 +99,9 @@ impl DAGNode {
             action_name: None,
             module_name: None,
             target: None,
+            is_spread: false,
+            spread_loop_var: None,
+            spread_collection: None,
         }
     }
 
@@ -153,6 +162,14 @@ impl DAGNode {
     /// Builder method to set kwargs (for action_call nodes)
     pub fn with_kwargs(mut self, kwargs: HashMap<String, String>) -> Self {
         self.kwargs = Some(kwargs);
+        self
+    }
+
+    /// Builder method to mark as spread action
+    pub fn with_spread(mut self, loop_var: &str, collection: &str) -> Self {
+        self.is_spread = true;
+        self.spread_loop_var = Some(loop_var.to_string());
+        self.spread_collection = Some(collection.to_string());
         self
     }
 }
@@ -687,10 +704,22 @@ impl DAGConverter {
         // Extract kwargs
         let kwargs = self.extract_kwargs(&action.kwargs);
 
+        // Get the collection expression as a string (e.g., "$items" or "range(5)")
+        let collection_str = spread
+            .collection
+            .as_ref()
+            .map(|c| self.expr_to_string(c))
+            .unwrap_or_default();
+
+        // Use internal variable name for spread results flowing to aggregator
+        let spread_result_var = "_spread_result".to_string();
+
         let mut action_node =
             DAGNode::new(action_id.clone(), "action_call".to_string(), action_label)
                 .with_action(&action.action_name, action.module_name.as_deref())
-                .with_kwargs(kwargs);
+                .with_kwargs(kwargs)
+                .with_spread(&spread.loop_var, &collection_str)
+                .with_target(&spread_result_var); // Set target so results flow to aggregator
         if let Some(ref fn_name) = self.current_function {
             action_node = action_node.with_function_name(fn_name);
         }
@@ -706,14 +735,25 @@ impl DAGConverter {
 
         let mut agg_node = DAGNode::new(agg_id.clone(), "aggregator".to_string(), target_label)
             .with_aggregator(&action_id);
+        // Set the aggregator's target to the spread's target variable
+        if let Some(ref t) = spread.target {
+            agg_node = agg_node.with_target(t);
+        }
         if let Some(ref fn_name) = self.current_function {
             agg_node = agg_node.with_function_name(fn_name);
         }
         self.dag.add_node(agg_node);
 
-        // Connect action to aggregator
+        // Connect action to aggregator via state machine edge
         self.dag
             .add_edge(DAGEdge::state_machine(action_id.clone(), agg_id.clone()));
+
+        // Add DATA_FLOW edge from spread action to aggregator for results
+        self.dag.add_edge(DAGEdge::data_flow(
+            action_id.clone(),
+            agg_id.clone(),
+            &spread_result_var,
+        ));
 
         // Track variable definition at aggregator
         if let Some(ref t) = spread.target {
