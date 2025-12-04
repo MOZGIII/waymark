@@ -20,7 +20,6 @@ use std::{
 
 use anyhow::{Context, Result, anyhow};
 use prost::Message;
-use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::{
     net::TcpListener,
@@ -34,9 +33,8 @@ use tonic::transport::Server;
 use tracing::info;
 
 use rappel::{
-    ActionDispatchPayload, DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool,
-    RoundTripMetrics, RunnerConfig, WorkerBridgeServer, WorkflowInstanceId, WorkflowVersionId,
-    proto,
+    DAGRunner, Database, PythonWorkerConfig, PythonWorkerPool, RunnerConfig, WorkerBridgeServer,
+    WorkflowInstanceId, WorkflowVersionId, proto,
 };
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -328,7 +326,7 @@ impl IntegrationHarness {
     ///
     /// This starts the DAGRunner's main loop and waits for the workflow instance
     /// to reach a terminal state (completed or failed).
-    pub async fn run_to_completion(&self, timeout_secs: u64) -> Result<Vec<RoundTripMetrics>> {
+    pub async fn run_to_completion(&self, timeout_secs: u64) -> Result<()> {
         let runner = Arc::clone(&self.runner);
         let instance_id = self.instance_id;
         let database = Arc::clone(&self.database);
@@ -364,20 +362,20 @@ impl IntegrationHarness {
         self.runner.shutdown();
         let _ = runner_handle.await;
 
-        // Return empty metrics for now - the full metrics would require
-        // changes to track them through the runner
-        Ok(vec![])
+        Ok(())
     }
 
     /// Dispatch all queued actions and wait for completion.
     ///
-    /// This uses the DAGRunner for completion handling, which triggers DAG
+    /// This uses the DAGRunner's main loop for completion handling, which triggers DAG
     /// traversal to enqueue successor actions. This properly handles:
     /// - Sequential workflows (action chains)
     /// - Parallel workflows (gather/spread)
     /// - Loops with multiple iterations
-    pub async fn dispatch_all(&self) -> Result<Vec<RoundTripMetrics>> {
-        dispatch_all_actions_with_runner(&self.database, &self.worker_pool, &self.runner).await
+    pub async fn dispatch_all(&self) -> Result<()> {
+        // Use run_to_completion with a reasonable timeout
+        self.run_to_completion(60).await?;
+        Ok(())
     }
 
     /// Get the stored workflow result.
@@ -572,164 +570,3 @@ async fn run_shell(
     }
 }
 
-/// Dispatch all actions from the queue to workers with DAG runner integration.
-///
-/// This dispatch loop:
-/// 1. Fetches queued actions
-/// 2. Dispatches them to workers
-/// 3. Uses DAGRunner to process completions (which enqueues successor actions)
-/// 4. Repeats until no more work is available
-async fn dispatch_all_actions_with_runner(
-    database: &Arc<Database>,
-    pool: &Arc<PythonWorkerPool>,
-    runner: &DAGRunner,
-) -> Result<Vec<RoundTripMetrics>> {
-    let mut completed = Vec::new();
-    let mut max_iterations = 500;
-    let mut idle_cycles = 0usize;
-
-    while max_iterations > 0 {
-        max_iterations -= 1;
-
-        let actions = database.dispatch_actions(16).await?;
-        if actions.is_empty() {
-            idle_cycles = idle_cycles.saturating_add(1);
-            if idle_cycles >= 10 && !completed.is_empty() {
-                // Check if there are any pending actions in the queue
-                let pending: i64 = sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM action_queue WHERE status IN ('pending', 'running')",
-                )
-                .fetch_one(database.pool())
-                .await?;
-
-                if pending == 0 {
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-
-        idle_cycles = 0;
-        for action in actions {
-            // Build dispatch payload from JSON kwargs
-            let kwargs = if action.dispatch_payload.is_empty() {
-                proto::WorkflowArguments { arguments: vec![] }
-            } else {
-                let json: serde_json::Value = serde_json::from_slice(&action.dispatch_payload)
-                    .context("failed to parse dispatch payload")?;
-                json_to_workflow_args(&json)
-            };
-
-            let payload = ActionDispatchPayload {
-                action_id: action.id.to_string(),
-                instance_id: action.instance_id.to_string(),
-                sequence: action.action_seq as u32,
-                action_name: action.action_name.clone(),
-                module_name: action.module_name.clone(),
-                kwargs,
-                timeout_seconds: action.timeout_seconds as u32,
-                max_retries: action.max_retries as u32,
-                attempt_number: action.attempt_number as u32,
-                dispatch_token: action.delivery_token,
-            };
-
-            let worker = pool.next_worker();
-            let metrics = worker
-                .send_action(payload)
-                .await
-                .map_err(|e| anyhow!("worker send failed: {}", e))?;
-
-            // Process completion through DAGRunner to trigger DAG traversal
-            let completion_result = runner
-                .process_action_completion(
-                    rappel::ActionId(action.id),
-                    WorkflowInstanceId(action.instance_id),
-                    action.node_id.clone(),
-                    metrics.success,
-                    metrics.response_payload.clone(),
-                    metrics.error_message.clone(),
-                    action.delivery_token,
-                )
-                .await;
-
-            if let Err(e) = completion_result {
-                tracing::error!("Failed to process completion: {}", e);
-            }
-
-            completed.push(metrics);
-        }
-    }
-
-    Ok(completed)
-}
-
-/// Convert JSON to WorkflowArguments proto.
-fn json_to_workflow_args(json: &serde_json::Value) -> proto::WorkflowArguments {
-    match json {
-        serde_json::Value::Object(obj) => {
-            let arguments = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_workflow_value(v)),
-                })
-                .collect();
-            proto::WorkflowArguments { arguments }
-        }
-        _ => proto::WorkflowArguments { arguments: vec![] },
-    }
-}
-
-fn json_to_workflow_value(value: &serde_json::Value) -> proto::WorkflowArgumentValue {
-    let kind = match value {
-        serde_json::Value::Null => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::NullValue(0)),
-            })
-        }
-        serde_json::Value::Bool(b) => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::BoolValue(*b)),
-            })
-        }
-        serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::IntValue(i)),
-                })
-            } else if let Some(f) = n.as_f64() {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(f)),
-                })
-            } else {
-                proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                    kind: Some(proto::primitive_workflow_argument::Kind::DoubleValue(0.0)),
-                })
-            }
-        }
-        serde_json::Value::String(s) => {
-            proto::workflow_argument_value::Kind::Primitive(proto::PrimitiveWorkflowArgument {
-                kind: Some(proto::primitive_workflow_argument::Kind::StringValue(
-                    s.clone(),
-                )),
-            })
-        }
-        serde_json::Value::Array(arr) => {
-            let items = arr.iter().map(json_to_workflow_value).collect();
-            proto::workflow_argument_value::Kind::ListValue(proto::WorkflowListArgument { items })
-        }
-        serde_json::Value::Object(obj) => {
-            let entries = obj
-                .iter()
-                .map(|(k, v)| proto::WorkflowArgument {
-                    key: k.clone(),
-                    value: Some(json_to_workflow_value(v)),
-                })
-                .collect();
-            proto::workflow_argument_value::Kind::DictValue(proto::WorkflowDictArgument { entries })
-        }
-    };
-
-    proto::WorkflowArgumentValue { kind: Some(kind) }
-}

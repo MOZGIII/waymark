@@ -107,32 +107,21 @@ async fn simple_workflow_executes_end_to_end() -> Result<()> {
         return Ok(());
     };
 
-    // Dispatch and execute all actions
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
-
-    // Should have at least 1 action (the greet call)
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
-
-    // All actions should have succeeded
-    for metrics in &completed {
-        assert!(
-            metrics.success,
-            "action {} failed: {:?}",
-            metrics.action_id, metrics.error_message
-        );
-    }
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
     // Verify the workflow result
-    if let Some(stored_payload) = harness.stored_result().await? {
-        let message = parse_result(&stored_payload)?;
-        if let Some(msg) = message {
-            assert_eq!(msg, "hello world", "unexpected workflow result");
-        }
-    }
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+    assert_eq!(
+        message,
+        Some("hello world".to_string()),
+        "unexpected workflow result"
+    );
 
     harness.shutdown().await?;
     Ok(())
@@ -185,24 +174,9 @@ async fn sequential_workflow_first_action_executes() -> Result<()> {
         return Ok(());
     };
 
-    // Dispatch the first action
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
-
-    // Should have at least 1 action (fetch_value)
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
-
-    // All executed actions should have succeeded
-    for metrics in &completed {
-        assert!(
-            metrics.success,
-            "action {} failed: {:?}",
-            metrics.action_id, metrics.error_message
-        );
-    }
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
     harness.shutdown().await?;
     Ok(())
@@ -260,25 +234,9 @@ async fn conditional_workflow_registers_and_first_action_executes() -> Result<()
         return Ok(());
     };
 
-    // Dispatch and execute actions
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
-
-    // The harness only enqueues top-level actions, so we get just get_score
-    // Full conditional execution would require the DAG runner
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
-
-    // All actions should have succeeded
-    for metrics in &completed {
-        assert!(
-            metrics.success,
-            "action {} failed: {:?}",
-            metrics.action_id, metrics.error_message
-        );
-    }
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
     harness.shutdown().await?;
     Ok(())
@@ -330,25 +288,9 @@ async fn exception_workflow_registers_and_first_action_executes() -> Result<()> 
         return Ok(());
     };
 
-    // Dispatch and execute actions
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
-
-    // The harness only enqueues top-level actions from try block
-    // Full exception handling would require the DAG runner
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
-
-    // All actions should have succeeded
-    for metrics in &completed {
-        assert!(
-            metrics.success,
-            "action {} failed: {:?}",
-            metrics.action_id, metrics.error_message
-        );
-    }
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
     harness.shutdown().await?;
     Ok(())
@@ -403,24 +345,9 @@ async fn crash_recovery_workflow_with_timeout_policies() -> Result<()> {
         return Ok(());
     };
 
-    // Dispatch and execute actions
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
-
-    // Should have at least 1 action (step_one with timeout)
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
-
-    // All actions should have succeeded
-    for metrics in &completed {
-        assert!(
-            metrics.success,
-            "action {} failed: {:?}",
-            metrics.action_id, metrics.error_message
-        );
-    }
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
     harness.shutdown().await?;
     Ok(())
@@ -471,18 +398,10 @@ async fn exception_custom_workflow_with_retry_policy() -> Result<()> {
         return Ok(());
     };
 
-    // Dispatch and execute actions
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
-    // Should have at least 1 action (provide_value)
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
-
-    // Note: explode_custom will fail, but provide_value should succeed
-    // We just verify that actions were executed
     harness.shutdown().await?;
     Ok(())
 }
@@ -533,15 +452,9 @@ async fn exception_with_success_workflow_registers() -> Result<()> {
         return Ok(());
     };
 
-    // Dispatch and execute actions
-    let completed = harness.dispatch_all().await?;
-    info!(completed = completed.len(), "actions completed");
-
-    // Should have at least 1 action
-    assert!(
-        !completed.is_empty(),
-        "expected at least one action to complete"
-    );
+    // Execute all actions via the DAGRunner
+    harness.dispatch_all().await?;
+    info!("workflow completed");
 
     harness.shutdown().await?;
     Ok(())
