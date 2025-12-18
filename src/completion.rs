@@ -2195,4 +2195,604 @@ fn workflow(input: [x], output: [result]):
             );
         }
     }
+
+    // ========================================================================
+    // Early Return + For Loop Over Empty List Tests
+    // ========================================================================
+    //
+    // These tests reproduce a bug where a workflow with:
+    // 1. An action that returns a response with optional fields
+    // 2. A conditional that returns early if a field is falsy
+    // 3. A for loop over another field (which could be empty)
+    // 4. A final action after the loop
+    //
+    // Would fail with "Workflow dead-end" when:
+    // - The early return condition is NOT taken (field is truthy)
+    // - BUT the for loop iterates over an empty list
+    //
+    // This pattern is common in workflows that validate uploaded content.
+
+    #[test]
+    fn test_early_return_with_for_loop_over_empty_list() {
+        // This reproduces a bug from the ValidateUploadedPostRappel workflow:
+        //
+        // parse_result = @parse_uploaded_post(...)
+        // if not parse_result.auth_session_id:
+        //     return  # early exit
+        // for post_id in parse_result.new_post_ids:  # Could be empty!
+        //     @process_post(post_id)
+        // @validate_posts(...)
+        //
+        // When auth_session_id is present but new_post_ids is empty,
+        // the workflow should still continue to validate_posts.
+        let source = r#"
+fn workflow(input: [raw_id], output: [result]):
+    parse_result = @parse_uploaded_post(raw_id=raw_id)
+    if not parse_result.auth_session_id:
+        return parse_result
+    for post_id in parse_result.new_post_ids:
+        processed = @process_post(id=post_id)
+    final = @validate_posts(count=0)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        let parse_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("parse_uploaded_post"))
+            .expect("Should have parse_uploaded_post action");
+
+        let subgraph = analyze_subgraph(&parse_action.id, &dag, &helper);
+
+        let initial_scope: InlineScope = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        // Execute with:
+        // - auth_session_id = "session-123" (truthy, so early return is NOT taken)
+        // - new_post_ids = [] (empty list, so for loop doesn't iterate)
+        //
+        // Expected: Should continue to validate_posts action
+        let result = execute_inline_subgraph(
+            &parse_action.id,
+            serde_json::json!({
+                "auth_session_id": "session-123",
+                "new_post_ids": []
+            }),
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when early return not taken and for loop is empty, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+
+        // Should have a path to validate_posts
+        assert!(
+            !plan.readiness_increments.is_empty() || plan.instance_completion.is_some(),
+            "Should have readiness increments for validate_posts or workflow completion"
+        );
+
+        // If there are readiness increments, verify validate_posts is reachable
+        if !plan.readiness_increments.is_empty() {
+            let action_names: Vec<_> = plan
+                .readiness_increments
+                .iter()
+                .filter_map(|r| r.action_name.as_ref())
+                .collect();
+            assert!(
+                action_names.iter().any(|n| *n == "validate_posts"),
+                "Expected validate_posts action in readiness increments, got: {:?}",
+                action_names
+            );
+        }
+    }
+
+    #[test]
+    fn test_early_return_with_for_loop_early_return_taken() {
+        // Test the case where early return IS taken (auth_session_id is null)
+        let source = r#"
+fn workflow(input: [raw_id], output: [result]):
+    parse_result = @parse_uploaded_post(raw_id=raw_id)
+    if not parse_result.auth_session_id:
+        return parse_result
+    for post_id in parse_result.new_post_ids:
+        processed = @process_post(id=post_id)
+    final = @validate_posts(count=0)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        let parse_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("parse_uploaded_post"))
+            .expect("Should have parse_uploaded_post action");
+
+        let subgraph = analyze_subgraph(&parse_action.id, &dag, &helper);
+
+        let initial_scope: InlineScope = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        // Execute with:
+        // - auth_session_id = null (falsy, so early return IS taken)
+        let result = execute_inline_subgraph(
+            &parse_action.id,
+            serde_json::json!({
+                "auth_session_id": null,
+                "new_post_ids": ["post-1", "post-2"]
+            }),
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when early return is taken, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+
+        // When early return is taken, the workflow may either:
+        // 1. Complete immediately (instance_completion is Some)
+        // 2. Have readiness increments that lead to the output
+        //
+        // The key is that we shouldn't go through the for loop body (process_post)
+        assert!(
+            plan.instance_completion.is_some() || !plan.readiness_increments.is_empty(),
+            "Should have instance completion or readiness increments for early return path"
+        );
+
+        // Verify we're NOT going to process_post (the for loop body)
+        if !plan.readiness_increments.is_empty() {
+            let action_names: Vec<_> = plan
+                .readiness_increments
+                .iter()
+                .filter_map(|r| r.action_name.as_ref())
+                .collect();
+            assert!(
+                !action_names.iter().any(|n| *n == "process_post"),
+                "Should NOT have process_post when early return is taken, got: {:?}",
+                action_names
+            );
+        }
+    }
+
+    #[test]
+    fn test_early_return_with_for_loop_non_empty_list() {
+        // Test the case where early return is NOT taken and for loop has items
+        let source = r#"
+fn workflow(input: [raw_id], output: [result]):
+    parse_result = @parse_uploaded_post(raw_id=raw_id)
+    if not parse_result.auth_session_id:
+        return parse_result
+    for post_id in parse_result.new_post_ids:
+        processed = @process_post(id=post_id)
+    final = @validate_posts(count=0)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        let parse_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("parse_uploaded_post"))
+            .expect("Should have parse_uploaded_post action");
+
+        let subgraph = analyze_subgraph(&parse_action.id, &dag, &helper);
+
+        let initial_scope: InlineScope = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        // Execute with:
+        // - auth_session_id = "session-123" (truthy, early return NOT taken)
+        // - new_post_ids = ["post-1"] (non-empty, for loop should iterate)
+        let result = execute_inline_subgraph(
+            &parse_action.id,
+            serde_json::json!({
+                "auth_session_id": "session-123",
+                "new_post_ids": ["post-1"]
+            }),
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when early return not taken and for loop has items, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+
+        // Should proceed to process_post action (inside the loop)
+        assert!(
+            !plan.readiness_increments.is_empty(),
+            "Should have readiness increments for process_post action"
+        );
+
+        let action_names: Vec<_> = plan
+            .readiness_increments
+            .iter()
+            .filter_map(|r| r.action_name.as_ref())
+            .collect();
+        assert!(
+            action_names.iter().any(|n| *n == "process_post"),
+            "Expected process_post action in readiness increments, got: {:?}",
+            action_names
+        );
+    }
+
+    // ========================================================================
+    // Return Inside elif Branch Tests
+    // ========================================================================
+
+    #[test]
+    fn test_return_inside_elif_branch() {
+        // Test that return inside an elif branch completes the workflow
+        // and doesn't continue to subsequent code
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    value = @get_value(x=x)
+    if value.status == "high":
+        result = @process_high(v=value)
+    elif value.status == "medium":
+        return value
+    else:
+        result = @process_low(v=value)
+    final = @finalize(result=result)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        let get_value_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("get_value"))
+            .expect("Should have get_value action");
+
+        let subgraph = analyze_subgraph(&get_value_action.id, &dag, &helper);
+
+        let initial_scope: InlineScope = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        // Execute with status = "medium" (should take elif branch and return)
+        let result = execute_inline_subgraph(
+            &get_value_action.id,
+            serde_json::json!({
+                "status": "medium",
+                "data": "test"
+            }),
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when elif return is taken, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+
+        // Should complete the workflow (early return in elif)
+        // Should NOT proceed to finalize action
+        if !plan.readiness_increments.is_empty() {
+            let action_names: Vec<_> = plan
+                .readiness_increments
+                .iter()
+                .filter_map(|r| r.action_name.as_ref())
+                .collect();
+            assert!(
+                !action_names.iter().any(|n| *n == "finalize"),
+                "Should NOT have finalize when elif return is taken, got: {:?}",
+                action_names
+            );
+        }
+    }
+
+    // ========================================================================
+    // Return Inside for Loop Tests
+    // ========================================================================
+
+    #[test]
+    fn test_return_inside_for_loop() {
+        // Test that return inside a for loop body completes the workflow
+        // and doesn't continue to the loop increment or subsequent code
+        let source = r#"
+fn workflow(input: [items], output: [result]):
+    for item in items:
+        if item.found:
+            return item
+        processed = @process_item(i=item)
+    final = @finalize(count=0)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        // Find the input node to start from
+        let input_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_input)
+            .expect("Should have input node");
+
+        let subgraph = analyze_subgraph(&input_node.id, &dag, &helper);
+
+        let mut initial_scope: InlineScope = HashMap::new();
+        // items = [{"found": true, "value": "first"}]
+        initial_scope.insert(
+            "items".to_string(),
+            serde_json::json!([{"found": true, "value": "first"}]),
+        );
+
+        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        // Execute from input (with items that should trigger early return)
+        let result = execute_inline_subgraph(
+            &input_node.id,
+            JsonValue::Null, // Input node doesn't have a result
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when for loop return is taken, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+
+        // Should NOT proceed to process_item or finalize
+        if !plan.readiness_increments.is_empty() {
+            let action_names: Vec<_> = plan
+                .readiness_increments
+                .iter()
+                .filter_map(|r| r.action_name.as_ref())
+                .collect();
+            assert!(
+                !action_names.iter().any(|n| *n == "finalize"),
+                "Should NOT have finalize when for loop return is taken, got: {:?}",
+                action_names
+            );
+        }
+    }
+
+    #[test]
+    fn test_return_directly_in_for_loop_body() {
+        // Test that a direct return in for loop body (not nested in if)
+        // completes the workflow and doesn't continue to loop increment
+        let source = r#"
+fn workflow(input: [items], output: [result]):
+    for item in items:
+        return item
+    final = @finalize(count=0)
+    return final
+"#;
+        let dag = dag_from_source(source);
+
+        // Verify the return node connects to output, not to loop increment
+        let return_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.node_type == "return")
+            .collect();
+
+        let output_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_output)
+            .expect("Should have output node");
+
+        // Find the loop increment node
+        let incr_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.id.contains("loop_incr"))
+            .collect();
+
+        for return_node in &return_nodes {
+            // Should have edge to output
+            let has_edge_to_output = dag
+                .edges
+                .iter()
+                .any(|e| e.source == return_node.id && e.target == output_node.id);
+            assert!(
+                has_edge_to_output,
+                "Return node {} should have edge to output",
+                return_node.id
+            );
+
+            // Should NOT have edge to loop increment
+            for incr_node in &incr_nodes {
+                let has_edge_to_incr = dag
+                    .edges
+                    .iter()
+                    .any(|e| e.source == return_node.id && e.target == incr_node.id);
+                assert!(
+                    !has_edge_to_incr,
+                    "Return node {} should NOT have edge to loop increment {}",
+                    return_node.id, incr_node.id
+                );
+            }
+        }
+    }
+
+    // ========================================================================
+    // Return Inside try/except Tests
+    // ========================================================================
+
+    #[test]
+    fn test_return_inside_try_body() {
+        // Test that return inside a try body completes the workflow
+        // and doesn't continue to subsequent code.
+        //
+        // Note: SingleCallBody in Rappel can only have ONE call or statements.
+        // So we test a try body that only has a return (no action call).
+        // This is a valid pattern when the try body is pure computation.
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    value = @get_value(x=x)
+    try:
+        return value
+    except NetworkError:
+        fallback = @fallback_action(x=x)
+    final = @finalize(v=fallback)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let helper = DAGHelper::new(&dag);
+
+        let get_value_action = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("get_value"))
+            .expect("Should have get_value action");
+
+        let subgraph = analyze_subgraph(&get_value_action.id, &dag, &helper);
+
+        let initial_scope: InlineScope = HashMap::new();
+        let existing_inbox: HashMap<String, HashMap<String, JsonValue>> = HashMap::new();
+        let instance_id = WorkflowInstanceId(uuid::Uuid::new_v4());
+
+        let ctx = InlineContext {
+            initial_scope: &initial_scope,
+            existing_inbox: &existing_inbox,
+            spread_index: None,
+        };
+
+        // Execute with successful result
+        let result = execute_inline_subgraph(
+            &get_value_action.id,
+            serde_json::json!({"success": true, "data": "result"}),
+            ctx,
+            &subgraph,
+            &dag,
+            instance_id,
+        );
+
+        assert!(
+            result.is_ok(),
+            "Should succeed when try body return is taken, got: {:?}",
+            result
+        );
+
+        let plan = result.unwrap();
+
+        // Should NOT proceed to finalize action
+        if !plan.readiness_increments.is_empty() {
+            let action_names: Vec<_> = plan
+                .readiness_increments
+                .iter()
+                .filter_map(|r| r.action_name.as_ref())
+                .collect();
+            assert!(
+                !action_names.iter().any(|n| *n == "finalize"),
+                "Should NOT have finalize when try body return is taken, got: {:?}",
+                action_names
+            );
+        }
+    }
+
+    #[test]
+    fn test_return_inside_except_handler() {
+        // Test that return inside an except handler completes the workflow
+        // and doesn't continue to subsequent code
+        let source = r#"
+fn workflow(input: [x], output: [result]):
+    try:
+        value = @risky_action(x=x)
+    except NetworkError:
+        return x
+    final = @finalize(v=value)
+    return final
+"#;
+        let dag = dag_from_source(source);
+        let _helper = DAGHelper::new(&dag);
+
+        // For except handlers, we need to test what happens when the exception path is taken.
+        // This is more complex because exception handling is done at runtime.
+        // For now, we verify the DAG structure is correct - return nodes should connect to output.
+
+        // Check that any return nodes in the workflow connect to the output
+        let return_nodes: Vec<_> = dag
+            .nodes
+            .values()
+            .filter(|n| n.node_type == "return")
+            .collect();
+
+        let output_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_output)
+            .expect("Should have output node");
+
+        for return_node in &return_nodes {
+            let has_edge_to_output = dag
+                .edges
+                .iter()
+                .any(|e| e.source == return_node.id && e.target == output_node.id);
+            assert!(
+                has_edge_to_output,
+                "Return node {} should have edge to output node {}",
+                return_node.id, output_node.id
+            );
+        }
+    }
 }
