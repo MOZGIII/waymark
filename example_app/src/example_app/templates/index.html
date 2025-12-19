@@ -134,7 +134,7 @@
     <p>
       Explore different workflow patterns supported by Rappel. Each section demonstrates
       a specific pattern - parallel execution, sequential chaining, conditionals, loops,
-      error handling, durable sleep, and scheduled execution.
+      early returns, error handling, durable sleep, and scheduled execution.
     </p>
 
     <!-- Parallel Execution -->
@@ -200,9 +200,27 @@
       <div class="result" id="loop-result" hidden></div>
     </section>
 
+    <!-- Return Inside Loop -->
+    <section class="workflow-section">
+      <h3>5. Return Inside a Loop</h3>
+      <p>
+        Search a list for a number and return early when the needle is found.
+        Enter comma-separated integers (max 10).
+      </p>
+      <form id="loop-return-form">
+        <label for="loop-return-items">Items:</label>
+        <input type="text" id="loop-return-items" name="items" value="1, 2, 3, 4, 5" />
+        <label for="loop-return-needle">Needle:</label>
+        <input type="number" id="loop-return-needle" name="needle" value="3" />
+        <button type="submit">Run Early Return</button>
+      </form>
+      <div class="status" id="loop-return-status"></div>
+      <div class="result" id="loop-return-result" hidden></div>
+    </section>
+
     <!-- Error Handling -->
     <section class="workflow-section">
-      <h3>5. Error Handling (try/except)</h3>
+      <h3>6. Error Handling (try/except)</h3>
       <p>
         Demonstrate exception handling in workflows. Toggle failure to see recovery in action.
       </p>
@@ -219,7 +237,7 @@
 
     <!-- Durable Sleep -->
     <section class="workflow-section">
-      <h3>6. Durable Sleep</h3>
+      <h3>7. Durable Sleep</h3>
       <p>
         Pause workflow execution. Unlike regular sleep, this survives worker restarts.
       </p>
@@ -383,7 +401,26 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 5. Error
+      // 5. Return Inside Loop
+      runWorkflow(
+        "loop-return-form",
+        "/api/loop-return",
+        (form) => {
+          const raw = form.querySelector("#loop-return-items").value;
+          const items = raw
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+            .map((s) => Number(s))
+            .filter((n) => Number.isFinite(n))
+            .slice(0, 10);
+          const needle = Number(form.querySelector("#loop-return-needle").value);
+          return items.length > 0 && Number.isFinite(needle) ? { items, needle } : null;
+        },
+        (data) => JSON.stringify(data, null, 2)
+      );
+
+      // 6. Error
       runWorkflow(
         "error-form",
         "/api/error",
@@ -394,7 +431,7 @@
         (data) => JSON.stringify(data, null, 2)
       );
 
-      // 6. Sleep
+      // 7. Sleep
       runWorkflow(
         "sleep-form",
         "/api/sleep",
@@ -417,6 +454,7 @@
         },
         (data) => JSON.stringify(data, null, 2)
       );
+
 
       // 8. Schedule - toggle between cron and interval inputs
       const scheduleTypeSelect = document.getElementById("schedule-type");

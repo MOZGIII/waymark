@@ -5,15 +5,10 @@ This module parses Python workflow classes and produces the IR representation
 that can be sent to the Rust runtime for execution.
 
 The IR builder performs deep transformations to convert Python patterns into
-valid Rappel IR structures. Each control flow body (try, for, if branches)
-should have at most ONE action/function call. When bodies have multiple
-action calls, they are wrapped into synthetic functions.
-
-Transformations:
-1. **Try body wrapping**: Wraps multi-action try bodies into synthetic functions
-2. **For loop body wrapping**: Wraps multi-action for bodies into synthetic functions
-3. **If branch wrapping**: Wraps multi-action if/elif/else branches into synthetic functions
-4. **Exception handler wrapping**: Wraps multi-action handlers into synthetic functions
+valid Rappel IR structures. Control flow bodies (try, for, if branches) are
+represented as full blocks, so they can contain arbitrary statements and
+`return` behaves consistently with Python (returns from `run()` end the
+workflow).
 
 Validation:
 The IR builder proactively detects unsupported Python patterns and raises
@@ -667,8 +662,7 @@ class IRBuilder(ast.NodeVisitor):
         elif isinstance(node, ast.For):
             return self._visit_for(node)
         elif isinstance(node, ast.If):
-            result = self._visit_if(node)
-            return [result] if result else []
+            return self._visit_if(node)
         elif isinstance(node, ast.Try):
             return self._visit_try(node)
         elif isinstance(node, ast.Return):
@@ -1116,34 +1110,10 @@ class IRBuilder(ast.NodeVisitor):
         return None
 
     def _visit_for(self, node: ast.For) -> List[ir.Statement]:
-        """Convert for loop to IR with body wrapping transformation.
+        """Convert for loop to IR.
 
-        If the for loop body has multiple action/function calls, we wrap them
-        into a synthetic function and replace the body with a single call.
-
-        For loops that modify out-of-scope variables (accumulators) are detected
-        and those variables are set as targets on the SingleCallBody. This enables
-        the runtime to properly aggregate results into those variables.
-
-        Supported accumulator patterns:
-        1. List append: results.append(value)
-        2. Dict subscript: result[key] = value
-        3. List concatenation: results = results + [value]
-        4. Counter increment: count = count + 1
-
-        Python:
-            for item in items:
-                a = await step_one(item)
-                b = await step_two(a)
-
-        Becomes IR equivalent of:
-            fn __for_body_1__(item):
-                a = @step_one(item=item)
-                b = @step_two(a=a)
-                return b
-
-            for item in items:
-                __for_body_1__(item=item)
+        The loop body is emitted as a full block so it can contain multiple
+        statements/calls and early `return`.
         """
         # Get loop variables
         loop_vars: List[str] = []
@@ -1159,37 +1129,17 @@ class IRBuilder(ast.NodeVisitor):
         if not iterable:
             return []
 
-        # Collect variables defined within the loop body (in-scope)
-        in_scope_vars = set(loop_vars)
-
         # Build body statements (recursively transforms nested structures)
         body_stmts: List[ir.Statement] = []
         for body_node in node.body:
             stmts = self._visit_statement(body_node)
             body_stmts.extend(stmts)
-            # Track variables defined by assignments in this iteration
-            for s in stmts:
-                if s.HasField("assignment"):
-                    in_scope_vars.update(s.assignment.targets)
 
-        # Detect all out-of-scope variable modifications
-        # These are variables modified in the loop body but defined outside it
-        modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
-
-        # ALWAYS wrap for loop body into a synthetic function for variable isolation.
-        # Variables flow in/out explicitly through function parameters and return values.
-        body_stmts = self._wrap_body_as_function(
-            body_stmts, "for_body", node, inputs=loop_vars, modified_vars=modified_vars
-        )
-
-        # Convert to SingleCallBody (now contains just the synthetic function call)
         stmt = ir.Statement(span=_make_span(node))
-        single_call_body = self._stmts_to_single_call_body(body_stmts, _make_span(node))
-
         for_loop = ir.ForLoop(
             loop_vars=loop_vars,
             iterable=iterable,
-            body=single_call_body,
+            block_body=ir.Block(statements=body_stmts, span=_make_span(node)),
         )
         stmt.for_loop.CopyFrom(for_loop)
         return [stmt]
@@ -1223,26 +1173,22 @@ class IRBuilder(ast.NodeVisitor):
             # Check conditionals for accumulator targets in branch bodies
             if stmt.HasField("conditional"):
                 cond = stmt.conditional
-                branch_bodies = [cond.if_branch.body] if cond.HasField("if_branch") else []
-                branch_bodies.extend(
-                    branch.body for branch in cond.elif_branches if branch.HasField("body")
-                )
-                if cond.HasField("else_branch"):
-                    branch_bodies.append(cond.else_branch.body)
+                branch_blocks: list[ir.Block] = []
+                if cond.HasField("if_branch") and cond.if_branch.HasField("block_body"):
+                    branch_blocks.append(cond.if_branch.block_body)
+                for branch in cond.elif_branches:
+                    if branch.HasField("block_body"):
+                        branch_blocks.append(branch.block_body)
+                if cond.HasField("else_branch") and cond.else_branch.HasField("block_body"):
+                    branch_blocks.append(cond.else_branch.block_body)
 
-                for body in branch_bodies:
-                    for target in body.targets:
-                        if target not in in_scope_vars and target not in seen:
-                            accumulators.append(target)
-                            seen.add(target)
-
-                    if body.statements:
-                        for var in self._detect_accumulator_targets(
-                            list(body.statements), in_scope_vars
-                        ):
-                            if var not in seen:
-                                accumulators.append(var)
-                                seen.add(var)
+                for block in branch_blocks:
+                    for var in self._detect_accumulator_targets(
+                        list(block.statements), in_scope_vars
+                    ):
+                        if var not in seen:
+                            accumulators.append(var)
+                            seen.add(var)
 
         return accumulators
 
@@ -1334,112 +1280,143 @@ class IRBuilder(ast.NodeVisitor):
 
         return vars_found
 
-    def _visit_if(self, node: ast.If) -> Optional[ir.Statement]:
-        """Convert if statement to IR conditional with branch wrapping.
+    def _visit_if(self, node: ast.If) -> List[ir.Statement]:
+        """Convert if statement to IR.
 
-        If any branch has multiple action calls, we wrap it into a synthetic
-        function to ensure each branch has at most one call.
-
-        Out-of-scope variable modifications (like list.append()) are detected
-        and the modified variables are passed in/out of the synthetic function.
-
-        Python:
-            if condition:
-                a = await action_a()
-                b = await action_b(a)
-            else:
-                c = await action_c()
-
-        Becomes IR equivalent of:
-            fn __if_then_1__():
-                a = @action_a()
-                b = @action_b(a=a)
-                return b
-
-            if condition:
-                __if_then_1__()
-            else:
-                @action_c()
+        Normalizes patterns like:
+            if await some_action(...):
+                ...
+        into:
+            __if_cond_n__ = await some_action(...)
+            if __if_cond_n__:
+                ...
         """
-        stmt = ir.Statement(span=_make_span(node))
 
-        # Build if branch
-        condition = _expr_to_ir(node.test)
-        if not condition:
-            return None
+        def normalize_condition(test: ast.expr) -> tuple[List[ir.Statement], Optional[ir.Expr]]:
+            action_call = self._extract_action_call(test)
+            if action_call is None:
+                return ([], _expr_to_ir(test))
 
-        body_stmts: List[ir.Statement] = []
-        for body_node in node.body:
-            stmts = self._visit_statement(body_node)
-            body_stmts.extend(stmts)
-
-        # ALWAYS wrap if branch body for variable isolation
-        in_scope_vars = self._collect_assigned_vars(body_stmts)
-        modified_vars = self._detect_accumulator_targets(body_stmts, in_scope_vars)
-        body_stmts = self._wrap_body_as_function(
-            body_stmts, "if_then", node, modified_vars=modified_vars
-        )
-
-        if_branch = ir.IfBranch(
-            condition=condition,
-            body=self._stmts_to_single_call_body(body_stmts, _make_span(node)),
-            span=_make_span(node),
-        )
-
-        conditional = ir.Conditional(if_branch=if_branch)
-
-        # Handle elif/else chains
-        current = node
-        while current.orelse:
-            if len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
-                # elif branch
-                elif_node = current.orelse[0]
-                elif_condition = _expr_to_ir(elif_node.test)
-                if elif_condition:
-                    elif_body: List[ir.Statement] = []
-                    for body_node in elif_node.body:
-                        stmts = self._visit_statement(body_node)
-                        elif_body.extend(stmts)
-
-                    # ALWAYS wrap elif body for variable isolation
-                    in_scope_vars = self._collect_assigned_vars(elif_body)
-                    modified_vars = self._detect_accumulator_targets(elif_body, in_scope_vars)
-                    elif_body = self._wrap_body_as_function(
-                        elif_body, "if_elif", elif_node, modified_vars=modified_vars
-                    )
-
-                    elif_branch = ir.ElifBranch(
-                        condition=elif_condition,
-                        body=self._stmts_to_single_call_body(elif_body, _make_span(elif_node)),
-                        span=_make_span(elif_node),
-                    )
-                    conditional.elif_branches.append(elif_branch)
-                current = elif_node
-            else:
-                # else branch
-                else_body: List[ir.Statement] = []
-                for else_node in current.orelse:
-                    stmts = self._visit_statement(else_node)
-                    else_body.extend(stmts)
-
-                # ALWAYS wrap else body for variable isolation
-                in_scope_vars = self._collect_assigned_vars(else_body)
-                modified_vars = self._detect_accumulator_targets(else_body, in_scope_vars)
-                else_body = self._wrap_body_as_function(
-                    else_body, "if_else", current.orelse[0], modified_vars=modified_vars
+            if not isinstance(test, ast.Await):
+                line = getattr(test, "lineno", None)
+                col = getattr(test, "col_offset", None)
+                raise UnsupportedPatternError(
+                    "Action calls inside boolean expressions are not supported in if conditions",
+                    "Assign the awaited action result to a variable, then use the variable in the if condition.",
+                    line=line,
+                    col=col,
                 )
 
+            cond_var = self._ctx.next_implicit_fn_name(prefix="if_cond")
+            assign_stmt = ir.Statement(span=_make_span(test))
+            assign_stmt.assignment.CopyFrom(
+                ir.Assignment(
+                    targets=[cond_var],
+                    value=ir.Expr(action_call=action_call, span=_make_span(test)),
+                )
+            )
+            cond_expr = ir.Expr(variable=ir.Variable(name=cond_var), span=_make_span(test))
+            return ([assign_stmt], cond_expr)
+
+        def visit_body(nodes: list[ast.stmt]) -> List[ir.Statement]:
+            stmts: List[ir.Statement] = []
+            for body_node in nodes:
+                stmts.extend(self._visit_statement(body_node))
+            return stmts
+
+        # Collect if/elif branches as (test_expr, body_nodes)
+        branches: list[tuple[ast.expr, list[ast.stmt], ast.AST]] = [(node.test, node.body, node)]
+        current = node
+        while current.orelse and len(current.orelse) == 1 and isinstance(current.orelse[0], ast.If):
+            elif_node = current.orelse[0]
+            branches.append((elif_node.test, elif_node.body, elif_node))
+            current = elif_node
+
+        else_nodes = current.orelse
+
+        normalized: list[
+            tuple[List[ir.Statement], Optional[ir.Expr], List[ir.Statement], ast.AST]
+        ] = []
+        for test_expr, body_nodes, span_node in branches:
+            prefix, cond = normalize_condition(test_expr)
+            normalized.append((prefix, cond, visit_body(body_nodes), span_node))
+
+        else_body = visit_body(else_nodes) if else_nodes else []
+
+        # If any non-first branch needs normalization, preserve Python semantics by nesting.
+        requires_nested = any(prefix for prefix, _, _, _ in normalized[1:])
+
+        def build_conditional_stmt(
+            condition: ir.Expr,
+            then_body: List[ir.Statement],
+            else_body_statements: List[ir.Statement],
+            span_node: ast.AST,
+        ) -> ir.Statement:
+            conditional_stmt = ir.Statement(span=_make_span(span_node))
+            if_branch = ir.IfBranch(
+                condition=condition,
+                block_body=ir.Block(statements=then_body, span=_make_span(span_node)),
+                span=_make_span(span_node),
+            )
+            conditional = ir.Conditional(if_branch=if_branch)
+            if else_body_statements:
                 else_branch = ir.ElseBranch(
-                    body=self._stmts_to_single_call_body(
-                        else_body, _make_span(current.orelse[0]) if current.orelse else ir.Span()
+                    block_body=ir.Block(
+                        statements=else_body_statements,
+                        span=_make_span(span_node),
                     ),
-                    span=_make_span(current.orelse[0]) if current.orelse else None,
+                    span=_make_span(span_node),
                 )
                 conditional.else_branch.CopyFrom(else_branch)
-                break
+            conditional_stmt.conditional.CopyFrom(conditional)
+            return conditional_stmt
 
-        stmt.conditional.CopyFrom(conditional)
-        return stmt
+        if requires_nested:
+            nested_else: List[ir.Statement] = else_body
+            for prefix, cond, then_body, span_node in reversed(normalized):
+                if cond is None:
+                    continue
+                nested_if_stmt = build_conditional_stmt(
+                    condition=cond,
+                    then_body=then_body,
+                    else_body_statements=nested_else,
+                    span_node=span_node,
+                )
+                nested_else = [*prefix, nested_if_stmt]
+            return nested_else
+
+        # Flat conditional with elif/else (original behavior), plus optional prefix for the if guard.
+        if_prefix, if_condition, if_body, if_span_node = normalized[0]
+        if if_condition is None:
+            return []
+
+        conditional_stmt = ir.Statement(span=_make_span(if_span_node))
+        if_branch = ir.IfBranch(
+            condition=if_condition,
+            block_body=ir.Block(statements=if_body, span=_make_span(if_span_node)),
+            span=_make_span(if_span_node),
+        )
+        conditional = ir.Conditional(if_branch=if_branch)
+
+        for _, elif_condition, elif_body, elif_span_node in normalized[1:]:
+            if elif_condition is None:
+                continue
+            elif_branch = ir.ElifBranch(
+                condition=elif_condition,
+                block_body=ir.Block(statements=elif_body, span=_make_span(elif_span_node)),
+                span=_make_span(elif_span_node),
+            )
+            conditional.elif_branches.append(elif_branch)
+
+        if else_body:
+            else_branch = ir.ElseBranch(
+                block_body=ir.Block(statements=else_body, span=_make_span(if_span_node)),
+                span=_make_span(if_span_node),
+            )
+            conditional.else_branch.CopyFrom(else_branch)
+
+        conditional_stmt.conditional.CopyFrom(conditional)
+        return [*if_prefix, conditional_stmt]
 
     def _collect_assigned_vars(self, stmts: List[ir.Statement]) -> set:
         """Collect all variable names assigned in a list of statements."""
@@ -1463,48 +1440,48 @@ class IRBuilder(ast.NodeVisitor):
 
             if stmt.HasField("conditional"):
                 cond = stmt.conditional
-                if cond.HasField("if_branch") and cond.if_branch.HasField("body"):
+                if cond.HasField("if_branch") and cond.if_branch.HasField("block_body"):
                     for target in self._collect_assigned_vars_in_order(
-                        list(cond.if_branch.body.statements)
+                        list(cond.if_branch.block_body.statements)
                     ):
                         if target not in seen:
                             seen.add(target)
                             assigned.append(target)
                 for elif_branch in cond.elif_branches:
-                    if elif_branch.HasField("body"):
+                    if elif_branch.HasField("block_body"):
                         for target in self._collect_assigned_vars_in_order(
-                            list(elif_branch.body.statements)
+                            list(elif_branch.block_body.statements)
                         ):
                             if target not in seen:
                                 seen.add(target)
                                 assigned.append(target)
-                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
+                if cond.HasField("else_branch") and cond.else_branch.HasField("block_body"):
                     for target in self._collect_assigned_vars_in_order(
-                        list(cond.else_branch.body.statements)
+                        list(cond.else_branch.block_body.statements)
                     ):
                         if target not in seen:
                             seen.add(target)
                             assigned.append(target)
 
-            if stmt.HasField("for_loop") and stmt.for_loop.HasField("body"):
+            if stmt.HasField("for_loop") and stmt.for_loop.HasField("block_body"):
                 for target in self._collect_assigned_vars_in_order(
-                    list(stmt.for_loop.body.statements)
+                    list(stmt.for_loop.block_body.statements)
                 ):
                     if target not in seen:
                         seen.add(target)
                         assigned.append(target)
 
             if stmt.HasField("try_except"):
-                try_body = stmt.try_except.try_body
-                if try_body.HasField("span"):
-                    for target in self._collect_assigned_vars_in_order(list(try_body.statements)):
+                try_block = stmt.try_except.try_block
+                if try_block.HasField("span"):
+                    for target in self._collect_assigned_vars_in_order(list(try_block.statements)):
                         if target not in seen:
                             seen.add(target)
                             assigned.append(target)
                 for handler in stmt.try_except.handlers:
-                    if handler.HasField("body"):
+                    if handler.HasField("block_body"):
                         for target in self._collect_assigned_vars_in_order(
-                            list(handler.body.statements)
+                            list(handler.block_body.statements)
                         ):
                             if target not in seen:
                                 seen.add(target)
@@ -1512,32 +1489,8 @@ class IRBuilder(ast.NodeVisitor):
 
         return assigned
 
-    def _collect_variables_from_single_call_body(self, body: ir.SingleCallBody) -> list[str]:
-        vars_found: list[str] = []
-        seen: set[str] = set()
-
-        if body.HasField("call"):
-            call = body.call
-            if call.HasField("action"):
-                for kwarg in call.action.kwargs:
-                    for var in self._collect_variables_from_expr(kwarg.value):
-                        if var not in seen:
-                            seen.add(var)
-                            vars_found.append(var)
-            elif call.HasField("function"):
-                for kwarg in call.function.kwargs:
-                    for var in self._collect_variables_from_expr(kwarg.value):
-                        if var not in seen:
-                            seen.add(var)
-                            vars_found.append(var)
-
-        for stmt in body.statements:
-            for var in self._collect_variables_from_statements([stmt]):
-                if var not in seen:
-                    seen.add(var)
-                    vars_found.append(var)
-
-        return vars_found
+    def _collect_variables_from_block(self, block: ir.Block) -> list[str]:
+        return self._collect_variables_from_statements(list(block.statements))
 
     def _collect_variables_from_statements(self, stmts: List[ir.Statement]) -> list[str]:
         """Collect variable references from statements in encounter order."""
@@ -1578,10 +1531,8 @@ class IRBuilder(ast.NodeVisitor):
                             if var not in seen:
                                 seen.add(var)
                                 vars_found.append(var)
-                    if cond.if_branch.HasField("body"):
-                        for var in self._collect_variables_from_single_call_body(
-                            cond.if_branch.body
-                        ):
+                    if cond.if_branch.HasField("block_body"):
+                        for var in self._collect_variables_from_block(cond.if_branch.block_body):
                             if var not in seen:
                                 seen.add(var)
                                 vars_found.append(var)
@@ -1591,13 +1542,13 @@ class IRBuilder(ast.NodeVisitor):
                             if var not in seen:
                                 seen.add(var)
                                 vars_found.append(var)
-                    if elif_branch.HasField("body"):
-                        for var in self._collect_variables_from_single_call_body(elif_branch.body):
+                    if elif_branch.HasField("block_body"):
+                        for var in self._collect_variables_from_block(elif_branch.block_body):
                             if var not in seen:
                                 seen.add(var)
                                 vars_found.append(var)
-                if cond.HasField("else_branch") and cond.else_branch.HasField("body"):
-                    for var in self._collect_variables_from_single_call_body(cond.else_branch.body):
+                if cond.HasField("else_branch") and cond.else_branch.HasField("block_body"):
+                    for var in self._collect_variables_from_block(cond.else_branch.block_body):
                         if var not in seen:
                             seen.add(var)
                             vars_found.append(var)
@@ -1609,22 +1560,22 @@ class IRBuilder(ast.NodeVisitor):
                         if var not in seen:
                             seen.add(var)
                             vars_found.append(var)
-                if fl.HasField("body"):
-                    for var in self._collect_variables_from_single_call_body(fl.body):
+                if fl.HasField("block_body"):
+                    for var in self._collect_variables_from_block(fl.block_body):
                         if var not in seen:
                             seen.add(var)
                             vars_found.append(var)
 
             if stmt.HasField("try_except"):
                 te = stmt.try_except
-                if te.HasField("try_body"):
-                    for var in self._collect_variables_from_single_call_body(te.try_body):
+                if te.HasField("try_block"):
+                    for var in self._collect_variables_from_block(te.try_block):
                         if var not in seen:
                             seen.add(var)
                             vars_found.append(var)
                 for handler in te.handlers:
-                    if handler.HasField("body"):
-                        for var in self._collect_variables_from_single_call_body(handler.body):
+                    if handler.HasField("block_body"):
+                        for var in self._collect_variables_from_block(handler.block_body):
                             if var not in seen:
                                 seen.add(var)
                                 vars_found.append(var)
@@ -1661,65 +1612,12 @@ class IRBuilder(ast.NodeVisitor):
         return vars_found
 
     def _visit_try(self, node: ast.Try) -> List[ir.Statement]:
-        """Convert try/except to IR with body wrapping transformation.
-
-        If the try body has multiple action calls, we wrap the entire body
-        into a synthetic function, preserving exact semantics.
-
-        Python:
-            try:
-                a = await setup_action()
-                b = await risky_action(a)
-                return f"success:{b}"
-            except SomeError:
-                ...
-
-        Becomes IR equivalent of:
-            fn __try_body_1__():
-                a = @setup_action()
-                b = @risky_action(a=a)
-                return f"success:{b}"
-
-            try:
-                __try_body_1__()
-            except SomeError:
-                ...
-        """
+        """Convert try/except to IR with full block bodies."""
         # Build try body statements (recursively transforms nested structures)
         try_body: List[ir.Statement] = []
         for body_node in node.body:
             stmts = self._visit_statement(body_node)
             try_body.extend(stmts)
-
-        # ALWAYS wrap try body for variable isolation
-        assigned_vars_ordered = self._collect_assigned_vars_in_order(try_body)
-        assigned_vars_set = set(assigned_vars_ordered)
-        free_vars = [
-            var
-            for var in self._collect_variables_from_statements(try_body)
-            if var not in assigned_vars_set
-        ]
-        modified_vars = self._detect_accumulator_targets(try_body, assigned_vars_set)
-
-        # Inputs need free variables plus any accumulator-style mutations.
-        try_inputs = []
-        for var in free_vars + modified_vars:
-            if var not in try_inputs:
-                try_inputs.append(var)
-
-        # Outputs include all assigned variables plus accumulator targets.
-        try_outputs: list[str] = []
-        for var in assigned_vars_ordered + modified_vars:
-            if var not in try_outputs:
-                try_outputs.append(var)
-
-        try_body = self._wrap_body_as_function(
-            try_body,
-            "try_body",
-            node,
-            inputs=try_inputs,
-            modified_vars=try_outputs,
-        )
 
         # Build exception handlers (with wrapping if needed)
         handlers: List[ir.ExceptHandler] = []
@@ -1739,37 +1637,9 @@ class IRBuilder(ast.NodeVisitor):
                 stmts = self._visit_statement(handler_node)
                 handler_body.extend(stmts)
 
-            # ALWAYS wrap handler body for variable isolation
-            assigned_vars_ordered = self._collect_assigned_vars_in_order(handler_body)
-            assigned_vars_set = set(assigned_vars_ordered)
-            free_vars = [
-                var
-                for var in self._collect_variables_from_statements(handler_body)
-                if var not in assigned_vars_set
-            ]
-            modified_vars = self._detect_accumulator_targets(handler_body, assigned_vars_set)
-
-            handler_inputs: list[str] = []
-            for var in free_vars + modified_vars:
-                if var not in handler_inputs:
-                    handler_inputs.append(var)
-
-            handler_outputs: list[str] = []
-            for var in assigned_vars_ordered + modified_vars:
-                if var not in handler_outputs:
-                    handler_outputs.append(var)
-
-            handler_body = self._wrap_body_as_function(
-                handler_body,
-                "except_handler",
-                node,
-                inputs=handler_inputs,
-                modified_vars=handler_outputs,
-            )
-
             except_handler = ir.ExceptHandler(
                 exception_types=exception_types,
-                body=self._stmts_to_single_call_body(handler_body, _make_span(handler)),
+                block_body=ir.Block(statements=handler_body, span=_make_span(handler)),
                 span=_make_span(handler),
             )
             handlers.append(except_handler)
@@ -1777,8 +1647,8 @@ class IRBuilder(ast.NodeVisitor):
         # Build the try/except statement
         try_stmt = ir.Statement(span=_make_span(node))
         try_except = ir.TryExcept(
-            try_body=self._stmts_to_single_call_body(try_body, _make_span(node)),
             handlers=handlers,
+            try_block=ir.Block(statements=try_body, span=_make_span(node)),
         )
         try_stmt.try_except.CopyFrom(try_except)
 
@@ -1805,56 +1675,6 @@ class IRBuilder(ast.NodeVisitor):
                 if stmt.expr_stmt.expr.HasField("function_call"):
                     count += 1
         return count
-
-    def _stmts_to_single_call_body(
-        self, stmts: List[ir.Statement], span: ir.Span
-    ) -> ir.SingleCallBody:
-        """Convert statements to SingleCallBody.
-
-        Can contain EITHER:
-        1. A single action or function call (with optional target)
-        2. Pure data statements (no calls)
-        """
-        body = ir.SingleCallBody(span=span)
-
-        # Look for a single call in the statements
-        for stmt in stmts:
-            if stmt.HasField("action_call"):
-                # ActionCall as a statement has no target (side-effect only)
-                action = stmt.action_call
-                call = ir.Call()
-                call.action.CopyFrom(action)
-                body.call.CopyFrom(call)
-                return body
-            elif stmt.HasField("assignment"):
-                # Check if assignment value is an action call or function call
-                if stmt.assignment.value.HasField("action_call"):
-                    action = stmt.assignment.value.action_call
-                    # Copy all targets for tuple unpacking support
-                    body.targets.extend(stmt.assignment.targets)
-                    call = ir.Call()
-                    call.action.CopyFrom(action)
-                    body.call.CopyFrom(call)
-                    return body
-                elif stmt.assignment.value.HasField("function_call"):
-                    fn_call = stmt.assignment.value.function_call
-                    # Copy all targets for tuple unpacking support
-                    body.targets.extend(stmt.assignment.targets)
-                    call = ir.Call()
-                    call.function.CopyFrom(fn_call)
-                    body.call.CopyFrom(call)
-                    return body
-            elif stmt.HasField("expr_stmt") and stmt.expr_stmt.expr.HasField("function_call"):
-                fn_call = stmt.expr_stmt.expr.function_call
-                call = ir.Call()
-                call.function.CopyFrom(fn_call)
-                body.call.CopyFrom(call)
-                return body
-
-        # No call found - this is a pure data body
-        # Add all statements as pure data
-        body.statements.extend(stmts)
-        return body
 
     def _wrap_body_as_function(
         self,
