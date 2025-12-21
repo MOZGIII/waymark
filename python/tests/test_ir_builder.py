@@ -634,9 +634,9 @@ class TestConditionalWithoutElse:
         return None
 
     def _find_all_statements(self, program: ir.Program) -> list[ir.Statement]:
-        """Find all statements in the run function."""
+        """Find all statements in the main function."""
         for fn in program.functions:
-            if fn.name == "run":
+            if fn.name == "main":
                 return list(fn.body.statements)
         return []
 
@@ -660,10 +660,10 @@ class TestConditionalWithoutElse:
             "block_body"
         ), "Should not have else_branch (or it should be empty)"
 
-        # The run function should have statements AFTER the conditional
+        # The main function should have statements AFTER the conditional
         # (the finalize action call)
         statements = self._find_all_statements(program)
-        assert len(statements) > 0, "Should have statements in run function"
+        assert len(statements) > 0, "Should have statements in main function"
 
         # Find the conditional's position
         conditional_idx = None
@@ -955,13 +955,13 @@ class TestWorkflowHelperMethods:
 
         program = WorkflowWithHelperMethods.workflow_ir()
 
-        # Should find self.compute_multiplier as a function call
-        fc = self._find_function_call_in_assignments(program, "self.compute_multiplier")
-        assert fc is not None, "Expected self.compute_multiplier as FunctionCall"
+        # Should find compute_multiplier as a function call
+        fc = self._find_function_call_in_assignments(program, "compute_multiplier")
+        assert fc is not None, "Expected compute_multiplier as FunctionCall"
 
-        # Should find self.format_result as a function call
-        fc2 = self._find_function_call_in_assignments(program, "self.format_result")
-        assert fc2 is not None, "Expected self.format_result as FunctionCall"
+        # Should find format_result as a function call
+        fc2 = self._find_function_call_in_assignments(program, "format_result")
+        assert fc2 is not None, "Expected format_result as FunctionCall"
 
     def test_helper_method_kwargs_preserved(self) -> None:
         """Test: self.method(a=x, b=y) preserves keyword arguments."""
@@ -969,8 +969,8 @@ class TestWorkflowHelperMethods:
 
         program = WorkflowWithHelperMethods.workflow_ir()
 
-        fc = self._find_function_call_in_assignments(program, "self.compute_multiplier")
-        assert fc is not None, "Expected self.compute_multiplier"
+        fc = self._find_function_call_in_assignments(program, "compute_multiplier")
+        assert fc is not None, "Expected compute_multiplier"
 
         # Check kwargs are preserved
         kwarg_names = [kw.name for kw in fc.kwargs]
@@ -992,8 +992,8 @@ class TestWorkflowHelperMethods:
 
         program = WorkflowWithHelperMethods.workflow_ir()
 
-        fc = self._find_function_call_in_assignments(program, "self.format_result")
-        assert fc is not None, "Expected self.format_result"
+        fc = self._find_function_call_in_assignments(program, "format_result")
+        assert fc is not None, "Expected format_result"
 
         # Check the 'value' kwarg references 'processed' variable
         assert len(fc.kwargs) == 1, f"Expected 1 kwarg, got {len(fc.kwargs)}"
@@ -1009,8 +1009,8 @@ class TestWorkflowHelperMethods:
 
         program = WorkflowHelperPositionalArgs.workflow_ir()
 
-        fc = self._find_function_call_in_assignments(program, "self.add")
-        assert fc is not None, "Expected self.add"
+        fc = self._find_function_call_in_assignments(program, "add")
+        assert fc is not None, "Expected add"
 
         # Positional args should be in fc.args (not converted to kwargs)
         assert len(fc.args) == 2, f"Expected 2 positional args, got {len(fc.args)}"
@@ -1030,8 +1030,8 @@ class TestWorkflowHelperMethods:
 
         program = WorkflowHelperPositionalArgs.workflow_ir()
 
-        fc = self._find_function_call_in_assignments(program, "self.multiply")
-        assert fc is not None, "Expected self.multiply"
+        fc = self._find_function_call_in_assignments(program, "multiply")
+        assert fc is not None, "Expected multiply"
 
         # Should have 2 positional args and 1 kwarg
         assert len(fc.args) == 2, f"Expected 2 positional args, got {len(fc.args)}"
@@ -1044,6 +1044,34 @@ class TestWorkflowHelperMethods:
         # Keyword arg
         assert fc.kwargs[0].name == "z", "Expected 'z' kwarg"
         assert fc.kwargs[0].value.literal.int_value == 3, "Expected z=3"
+
+    def test_async_helper_method_included(self) -> None:
+        """Test: await self.method() becomes a FunctionCall with a definition."""
+        from tests.fixtures_workflow.workflow_helper_async import WorkflowWithAsyncHelper
+
+        program = WorkflowWithAsyncHelper.workflow_ir()
+
+        fc = self._find_function_call_in_assignments(program, "run_internal")
+        assert fc is not None, "Expected run_internal as FunctionCall"
+
+        fn_names = {fn.name for fn in program.functions}
+        assert "run_internal" in fn_names, "Expected run_internal function definition"
+
+    def test_helper_method_from_base_class(self) -> None:
+        """Test: base-class helper methods are included in the IR."""
+        from tests.fixtures_workflow.workflow_helper_inheritance_child import (
+            WorkflowWithHelperInheritance,
+        )
+
+        program = WorkflowWithHelperInheritance.workflow_ir()
+
+        fc = self._find_function_call_in_assignments(program, "run_internal")
+        assert fc is not None, "Expected run_internal as FunctionCall"
+
+        fn_names = {fn.name for fn in program.functions}
+        assert "run_internal" in fn_names, "Expected run_internal function definition"
+
+        assert fc.kwargs[0].name == "value", "Expected 'value' kwarg"
 
 
 class TestUnsupportedPatternDetection:
@@ -1172,7 +1200,7 @@ class TestUnsupportedPatternDetection:
 
         program = ListComprehensionAssignmentWorkflow.workflow_ir()
 
-        run_fn = next(fn for fn in program.functions if fn.name == "run")
+        run_fn = next(fn for fn in program.functions if fn.name == "main")
 
         has_initializer = any(
             stmt.HasField("assignment")
@@ -1230,7 +1258,7 @@ class TestUnsupportedPatternDetection:
 
         program = DictComprehensionAssignmentWorkflow.workflow_ir()
 
-        run_fn = next(fn for fn in program.functions if fn.name == "run")
+        run_fn = next(fn for fn in program.functions if fn.name == "main")
         has_initializer = any(
             stmt.HasField("assignment")
             and list(stmt.assignment.targets) == ["active_lookup"]
@@ -2102,7 +2130,9 @@ class TestMoreBinaryOperators:
 
     def test_power_operator(self) -> None:
         """Test: x ** y power operator."""
-        from rappel import workflow
+        import pytest
+
+        from rappel import UnsupportedPatternError, workflow
         from rappel.workflow import Workflow
 
         @workflow
@@ -2110,8 +2140,8 @@ class TestMoreBinaryOperators:
             async def run(self, x: int, y: int) -> int:
                 return x**y
 
-        program = PowerWorkflow.workflow_ir()
-        assert program is not None
+        with pytest.raises(UnsupportedPatternError):
+            PowerWorkflow.workflow_ir()
 
     def test_floor_division(self) -> None:
         """Test: x // y floor division."""
@@ -2431,7 +2461,7 @@ class TestForLoopWithMultipleCalls:
         # Find the for loop
         for_loop = None
         for fn in program.functions:
-            if fn.name == "run":
+            if fn.name == "main":
                 for stmt in fn.body.statements:
                     if stmt.HasField("for_loop"):
                         for_loop = stmt.for_loop
@@ -2478,8 +2508,8 @@ class TestAwaitActionInIfCondition:
 
         program = IfAwaitActionConditionWorkflow.workflow_ir()
 
-        run_fn = next((fn for fn in program.functions if fn.name == "run"), None)
-        assert run_fn is not None, "Expected run() function"
+        run_fn = next((fn for fn in program.functions if fn.name == "main"), None)
+        assert run_fn is not None, "Expected main() function"
         assert len(run_fn.body.statements) >= 2, "Expected hoisted condition assignment + if"
 
         assign_stmt = run_fn.body.statements[0]
@@ -2530,7 +2560,7 @@ class TestTryExceptStatefulOutputs:
 
         program = TryStatefulOutputsWorkflow.workflow_ir()
 
-        run_fn = next(fn for fn in program.functions if fn.name == "run")
+        run_fn = next(fn for fn in program.functions if fn.name == "main")
         try_stmt = next(
             stmt for stmt in run_fn.body.statements if stmt.HasField("try_except")
         ).try_except

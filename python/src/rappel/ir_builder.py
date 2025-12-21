@@ -7,8 +7,8 @@ that can be sent to the Rust runtime for execution.
 The IR builder performs deep transformations to convert Python patterns into
 valid Rappel IR structures. Control flow bodies (try, for, if branches) are
 represented as full blocks, so they can contain arbitrary statements and
-`return` behaves consistently with Python (returns from `run()` end the
-workflow).
+`return` behaves consistently with Python (returns from the entry function end
+the workflow).
 
 Validation:
 The IR builder proactively detects unsupported Python patterns and raises
@@ -40,13 +40,22 @@ class UnsupportedPatternError(Exception):
         recommendation: str,
         line: Optional[int] = None,
         col: Optional[int] = None,
+        filename: Optional[str] = None,
     ):
         self.message = message
         self.recommendation = recommendation
         self.line = line
         self.col = col
+        self.filename = filename
 
-        location = f" (line {line})" if line else ""
+        location_parts: List[str] = []
+        if filename:
+            location_parts.append(filename)
+        if line:
+            location_parts.append(f"line {line}")
+        if col is not None:
+            location_parts.append(f"col {col}")
+        location = f" ({', '.join(location_parts)})" if location_parts else ""
         full_message = f"{message}{location}\n\nRecommendation: {recommendation}"
         super().__init__(full_message)
 
@@ -218,6 +227,14 @@ RECOMMENDATIONS = {
         "Yield statements are not supported in workflow code.\n"
         "Workflows must return a complete result, not generate values incrementally."
     ),
+    "unsupported_expression": (
+        "This expression type is not supported in workflow code.\n"
+        "Move the logic into an @action or rewrite using supported expressions."
+    ),
+    "unsupported_literal": (
+        "This literal type is not supported in workflow code.\n"
+        "Convert the value to a supported literal type inside an @action."
+    ),
 }
 
 
@@ -232,6 +249,16 @@ class ActionDefinition:
     action_name: str
     module_name: Optional[str]
     signature: inspect.Signature
+
+
+@dataclass
+class ModuleContext:
+    """Cached IRBuilder context derived from a module."""
+
+    action_defs: Dict[str, ActionDefinition]
+    imported_names: Dict[str, "ImportedName"]
+    module_functions: Set[str]
+    model_defs: Dict[str, "ModelDefinition"]
 
 
 @dataclass
@@ -272,39 +299,138 @@ def build_workflow_ir(workflow_cls: type["Workflow"]) -> ir.Program:
     if module is None:
         raise ValueError(f"unable to locate module for workflow {workflow_cls!r}")
 
-    # Get the function source and parse it
-    function_source = textwrap.dedent(inspect.getsource(original_run))
-    tree = ast.parse(function_source)
+    module_contexts: Dict[str, ModuleContext] = {}
 
-    # Discover actions in the module
-    action_defs = _discover_action_names(module)
-
-    # Discover imports for built-in detection (e.g., from asyncio import sleep)
-    imported_names = _discover_module_imports(module)
-
-    # Discover all async function names in the module (for non-action detection)
-    module_functions = _discover_module_functions(module)
-
-    # Discover Pydantic models and dataclasses that can be used in workflows
-    model_defs = _discover_model_definitions(module)
+    def get_module_context(target_module: Any) -> ModuleContext:
+        module_name = target_module.__name__
+        if module_name not in module_contexts:
+            module_contexts[module_name] = ModuleContext(
+                action_defs=_discover_action_names(target_module),
+                imported_names=_discover_module_imports(target_module),
+                module_functions=_discover_module_functions(target_module),
+                model_defs=_discover_model_definitions(target_module),
+            )
+        return module_contexts[module_name]
 
     # Build the IR with transformation context
     ctx = TransformContext()
-    builder = IRBuilder(action_defs, ctx, imported_names, module_functions, model_defs)
-    builder.visit(tree)
-
-    # Create the Program with the main function and any implicit functions
     program = ir.Program()
+    function_defs: Dict[str, ir.FunctionDef] = {}
+
+    def parse_function(fn: Any) -> tuple[ast.AST, Optional[str], int]:
+        source_lines, start_line = inspect.getsourcelines(fn)
+        function_source = textwrap.dedent("".join(source_lines))
+        filename = inspect.getsourcefile(fn)
+        if filename is None:
+            filename = inspect.getfile(fn)
+        return ast.parse(function_source, filename=filename or "<unknown>"), filename, start_line
+
+    def _with_source_location(
+        err: UnsupportedPatternError,
+        filename: Optional[str],
+        start_line: int,
+    ) -> UnsupportedPatternError:
+        line = err.line
+        col = err.col
+        if line is not None:
+            line = start_line + line - 1
+        if col is not None:
+            col = col + 1
+        return UnsupportedPatternError(
+            err.message,
+            err.recommendation,
+            line=line,
+            col=col,
+            filename=filename,
+        )
+
+    def add_function_def(
+        fn: Any,
+        fn_tree: ast.AST,
+        filename: Optional[str],
+        start_line: int,
+        override_name: Optional[str] = None,
+    ) -> None:
+        fn_module = inspect.getmodule(fn)
+        if fn_module is None:
+            raise ValueError(f"unable to locate module for function {fn!r}")
+
+        ctx_data = get_module_context(fn_module)
+        builder = IRBuilder(
+            ctx_data.action_defs,
+            ctx,
+            ctx_data.imported_names,
+            ctx_data.module_functions,
+            ctx_data.model_defs,
+        )
+        try:
+            builder.visit(fn_tree)
+        except UnsupportedPatternError as err:
+            raise _with_source_location(err, filename, start_line) from err
+        if builder.function_def:
+            if override_name:
+                builder.function_def.name = override_name
+            function_defs[builder.function_def.name] = builder.function_def
+
+    # Build the entry function from run() and map it to main in the IR.
+    run_tree, run_filename, run_start_line = parse_function(original_run)
+    add_function_def(original_run, run_tree, run_filename, run_start_line, "main")
+
+    # Include helper methods reachable via self.method() calls
+    pending = list(_collect_self_method_calls(run_tree))
+    visited: Set[str] = set()
+    skip_methods = {"run_action"}
+
+    while pending:
+        method_name = pending.pop()
+        if method_name in visited or method_name == "run" or method_name in skip_methods:
+            continue
+        visited.add(method_name)
+
+        method = _find_workflow_method(workflow_cls, method_name)
+        if method is None:
+            continue
+
+        method_tree, method_filename, method_start_line = parse_function(method)
+        add_function_def(method, method_tree, method_filename, method_start_line)
+
+        pending.extend(_collect_self_method_calls(method_tree))
 
     # Add implicit functions first (they may be called by the main function)
     for implicit_fn in ctx.implicit_functions:
         program.functions.append(implicit_fn)
 
-    # Add the main function
-    if builder.function_def:
-        program.functions.append(builder.function_def)
+    # Add all function definitions (run + reachable helper methods)
+    for fn_def in function_defs.values():
+        program.functions.append(fn_def)
 
     return program
+
+
+def _collect_self_method_calls(tree: ast.AST) -> Set[str]:
+    """Collect self.method(...) call names from a parsed function AST."""
+    calls: Set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            if func.value.id == "self":
+                calls.add(func.attr)
+    return calls
+
+
+def _find_workflow_method(workflow_cls: type["Workflow"], name: str) -> Optional[Any]:
+    """Find a workflow method by name across the class MRO."""
+    for base in workflow_cls.__mro__:
+        if name not in base.__dict__:
+            continue
+        value = base.__dict__[name]
+        if isinstance(value, staticmethod) or isinstance(value, classmethod):
+            return value.__func__
+        if inspect.isfunction(value):
+            return value
+    return None
 
 
 def _discover_action_names(module: Any) -> Dict[str, ActionDefinition]:
@@ -668,8 +794,7 @@ class IRBuilder(ast.NodeVisitor):
         elif isinstance(node, ast.Return):
             return self._visit_return(node)
         elif isinstance(node, ast.AugAssign):
-            result = self._visit_aug_assign(node)
-            return [result] if result else []
+            return self._visit_aug_assign(node)
         elif isinstance(node, ast.Pass):
             # Pass statements are fine, they just don't produce IR
             return []
@@ -1796,8 +1921,20 @@ class IRBuilder(ast.NodeVisitor):
 
                 return [assign_stmt, return_stmt]
 
-            # Regular return with expression (variable, literal, etc.)
+            # Normalize return of function calls into assignment + return
             expr = _expr_to_ir(node.value)
+            if expr and expr.HasField("function_call"):
+                tmp_var = self._ctx.next_implicit_fn_name(prefix="return_tmp")
+
+                assign_stmt = ir.Statement(span=_make_span(node))
+                assign_stmt.assignment.CopyFrom(ir.Assignment(targets=[tmp_var], value=expr))
+
+                return_stmt = ir.Statement(span=_make_span(node))
+                var_expr = ir.Expr(variable=ir.Variable(name=tmp_var), span=_make_span(node))
+                return_stmt.return_stmt.CopyFrom(ir.ReturnStmt(value=var_expr))
+                return [assign_stmt, return_stmt]
+
+            # Regular return with expression (variable, literal, etc.)
             if expr:
                 stmt = ir.Statement(span=_make_span(node))
                 return_stmt = ir.ReturnStmt(value=expr)
@@ -1809,7 +1946,7 @@ class IRBuilder(ast.NodeVisitor):
         stmt.return_stmt.CopyFrom(ir.ReturnStmt())
         return [stmt]
 
-    def _visit_aug_assign(self, node: ast.AugAssign) -> Optional[ir.Statement]:
+    def _visit_aug_assign(self, node: ast.AugAssign) -> List[ir.Statement]:
         """Convert augmented assignment (+=, -=, etc.) to IR."""
         # For now, we can represent this as a regular assignment with binary op
         # target op= value  ->  target = target op value
@@ -1821,6 +1958,31 @@ class IRBuilder(ast.NodeVisitor):
 
         left = _expr_to_ir(node.target)
         right = _expr_to_ir(node.value)
+        if right and right.HasField("function_call"):
+            tmp_var = self._ctx.next_implicit_fn_name(prefix="aug_tmp")
+
+            assign_tmp = ir.Statement(span=_make_span(node))
+            assign_tmp.assignment.CopyFrom(
+                ir.Assignment(
+                    targets=[tmp_var],
+                    value=ir.Expr(function_call=right.function_call, span=_make_span(node)),
+                )
+            )
+
+            if left:
+                op = _bin_op_to_ir(node.op)
+                if op:
+                    binary = ir.BinaryOp(
+                        left=left,
+                        op=op,
+                        right=ir.Expr(variable=ir.Variable(name=tmp_var)),
+                    )
+                    value = ir.Expr(binary_op=binary)
+                    assign = ir.Assignment(targets=targets, value=value)
+                    stmt.assignment.CopyFrom(assign)
+                    return [assign_tmp, stmt]
+            return [assign_tmp]
+
         if left and right:
             op = _bin_op_to_ir(node.op)
             if op:
@@ -1828,9 +1990,9 @@ class IRBuilder(ast.NodeVisitor):
                 value = ir.Expr(binary_op=binary)
                 assign = ir.Assignment(targets=targets, value=value)
                 stmt.assignment.CopyFrom(assign)
-                return stmt
+                return [stmt]
 
-        return None
+        return []
 
     def _check_constructor_in_return(self, node: ast.expr) -> None:
         """Check for constructor calls in return statements.
@@ -2574,7 +2736,10 @@ class IRBuilder(ast.NodeVisitor):
                 current = current.value
             if isinstance(current, ast.Name):
                 parts.append(current.id)
-            return ".".join(reversed(parts))
+            name = ".".join(reversed(parts))
+            if name.startswith("self."):
+                return name[5:]
+            return name
         return None
 
     def _expr_to_ir_with_model_coercion(self, node: ast.expr) -> Optional[ir.Expr]:
@@ -2775,6 +2940,24 @@ def _expr_to_ir(expr: ast.AST) -> Optional[ir.Expr]:
             result.dot.CopyFrom(ir.DotAccess(object=obj, attribute=expr.attr))
             return result
 
+    if isinstance(expr, ast.Await) and isinstance(expr.value, ast.Call):
+        func_name = _get_func_name(expr.value.func)
+        if func_name:
+            args = [_expr_to_ir(a) for a in expr.value.args]
+            kwargs: List[ir.Kwarg] = []
+            for kw in expr.value.keywords:
+                if kw.arg:
+                    kw_expr = _expr_to_ir(kw.value)
+                    if kw_expr:
+                        kwargs.append(ir.Kwarg(name=kw.arg, value=kw_expr))
+            func_call = ir.FunctionCall(
+                name=func_name,
+                args=[a for a in args if a],
+                kwargs=kwargs,
+            )
+            result.function_call.CopyFrom(func_call)
+            return result
+
     if isinstance(expr, ast.Call):
         # Function call
         func_name = _get_func_name(expr.func)
@@ -2812,6 +2995,15 @@ def _check_unsupported_expression(expr: ast.AST) -> None:
     """Check for unsupported expression types and raise descriptive errors."""
     line = getattr(expr, "lineno", None)
     col = getattr(expr, "col_offset", None)
+
+    if isinstance(expr, ast.Constant):
+        if _constant_to_literal(expr.value) is None:
+            raise UnsupportedPatternError(
+                f"Unsupported literal type '{type(expr.value).__name__}'",
+                RECOMMENDATIONS["unsupported_literal"],
+                line=line,
+                col=col,
+            )
 
     if isinstance(expr, ast.JoinedStr):
         raise UnsupportedPatternError(
@@ -2866,6 +3058,13 @@ def _check_unsupported_expression(expr: ast.AST) -> None:
         raise UnsupportedPatternError(
             "Yield expressions are not supported",
             RECOMMENDATIONS["yield_statement"],
+            line=line,
+            col=col,
+        )
+    elif isinstance(expr, ast.expr):
+        raise UnsupportedPatternError(
+            f"Unsupported expression type '{type(expr).__name__}'",
+            RECOMMENDATIONS["unsupported_expression"],
             line=line,
             col=col,
         )
@@ -2962,5 +3161,8 @@ def _get_func_name(func: ast.expr) -> Optional[str]:
             current = current.value
         if isinstance(current, ast.Name):
             parts.append(current.id)
-        return ".".join(reversed(parts))
+        name = ".".join(reversed(parts))
+        if name.startswith("self."):
+            return name[5:]
+        return name
     return None
