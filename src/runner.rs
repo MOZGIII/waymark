@@ -51,7 +51,7 @@ use prost::Message;
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
     completion::{GuardResult, InlineContext, analyze_subgraph, execute_inline_subgraph},
-    dag::{DAG, DAGConverter, DAGNode, EdgeType},
+    dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
     dag_state::{DAGHelper, ExecutionMode, SuccessorInfo},
     db::{
         ActionId, BackoffKind, CompletionRecord, Database, NewAction, QueuedAction, ScheduleId,
@@ -1991,6 +1991,10 @@ impl DAGRunner {
                         )
                         .await?;
                         handler.write_batch(batch).await?;
+                        // Mark the failed action as caught so fail_instances_with_exhausted_actions
+                        // doesn't mark the workflow as failed. This must be AFTER write_batch
+                        // because the action is still 'dispatched' until write_batch completes.
+                        handler.db.mark_action_caught(instance_id, node_id).await?;
                         return Ok(());
                     }
 
@@ -2024,6 +2028,10 @@ impl DAGRunner {
                             )
                             .await?;
                             handler.write_batch(batch).await?;
+                            // Mark the failed action as caught so fail_instances_with_exhausted_actions
+                            // doesn't mark the workflow as failed. This must be AFTER write_batch
+                            // because the action is still 'dispatched' until write_batch completes.
+                            handler.db.mark_action_caught(instance_id, node_id).await?;
                             return Ok(());
                         }
                     }
@@ -2442,6 +2450,7 @@ impl DAGRunner {
         // Store result in inline scope for potential inline successors
         if let Some(node) = dag.nodes.get(node_id)
             && let Some(ref target) = node.target
+            && !(Self::is_exception_binding_node(node) && inline_scope.contains_key(target))
         {
             inline_scope.insert(target.clone(), result.clone());
         }
@@ -2454,11 +2463,17 @@ impl DAGRunner {
 
         // Initialize queue with immediate successors from the starting node
         let mut guard_errors = Vec::new();
-        for successor in Self::filter_successors_with_guards(
-            helper.get_ready_successors(node_id, condition_result),
-            inline_scope,
-            &mut guard_errors,
-        ) {
+        let raw_successors = helper.get_ready_successors(node_id, condition_result);
+        let successor_ids: Vec<_> = raw_successors.iter().map(|s| &s.node_id).collect();
+        debug!(
+            node_id = %node_id,
+            raw_successor_count = raw_successors.len(),
+            raw_successors = ?successor_ids,
+            "process_successors_with_condition: getting ready successors"
+        );
+        for successor in
+            Self::filter_successors_with_guards(raw_successors, inline_scope, &mut guard_errors)
+        {
             work_queue.push_back((successor.node_id, result.clone()));
         }
 
@@ -2593,7 +2608,7 @@ impl DAGRunner {
     #[allow(clippy::too_many_arguments)]
     async fn process_exception_handler(
         handler_node_id: &str,
-        _exception_result: &WorkflowValue,
+        exception_result: &WorkflowValue,
         dag: &DAG,
         helper: &DAGHelper<'_>,
         inline_scope: &mut Scope,
@@ -2629,6 +2644,11 @@ impl DAGRunner {
             "processing exception handler"
         );
 
+        let is_binding = Self::is_exception_binding_node(handler_node);
+        if is_binding {
+            inline_scope.insert(EXCEPTION_SCOPE_VAR.to_string(), exception_result.clone());
+        }
+
         let exec_mode = helper.get_execution_mode(handler_node);
         match exec_mode {
             ExecutionMode::Inline => {
@@ -2637,10 +2657,23 @@ impl DAGRunner {
                 if let Some(ref target) = handler_node.target {
                     inline_scope.insert(target.clone(), inline_result.clone());
                 }
+                if is_binding {
+                    inline_scope.remove(EXCEPTION_SCOPE_VAR);
+                }
+                let successor_result = if is_binding {
+                    WorkflowValue::Null
+                } else {
+                    inline_result.clone()
+                };
                 // Continue to handler's successors
+                debug!(
+                    handler_node_id = %handler_node_id,
+                    inline_scope_keys = ?inline_scope.keys().collect::<Vec<_>>(),
+                    "about to process successors of exception binding node"
+                );
                 Box::pin(Self::process_successors_with_condition(
                     handler_node_id,
-                    &inline_result,
+                    &successor_result,
                     dag,
                     helper,
                     inline_scope,
@@ -2685,6 +2718,25 @@ impl DAGRunner {
                 Ok(())
             }
         }
+    }
+
+    fn is_exception_binding_node(node: &DAGNode) -> bool {
+        if node.id.starts_with("exc_bind") {
+            return true;
+        }
+        if node.node_type != "assignment" {
+            return false;
+        }
+        if node.label.contains(EXCEPTION_SCOPE_VAR) {
+            return true;
+        }
+        let Some(assign_expr) = node.assign_expr.as_ref() else {
+            return false;
+        };
+        let Some(ast::expr::Kind::Variable(var)) = assign_expr.kind.as_ref() else {
+            return false;
+        };
+        var.name == EXCEPTION_SCOPE_VAR
     }
 
     /// Serialize workflow result (inbox values) as protobuf WorkflowArguments.
