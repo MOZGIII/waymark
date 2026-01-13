@@ -1304,6 +1304,17 @@ impl DAGConverter {
                 }
             }
 
+            if let Some(ref spread_expr) = node.spread_collection_expr {
+                if Self::expr_uses_var(spread_expr, var_name) {
+                    tracing::trace!(
+                        node_id = %node.id,
+                        var_name = %var_name,
+                        "uses_var: found in spread_collection_expr"
+                    );
+                    return true;
+                }
+            }
+
             false
         };
 
@@ -1887,11 +1898,16 @@ impl DAGConverter {
         // Extract kwargs from the function call (positional args mapped when possible)
         let (kwargs, kwarg_exprs) = self.extract_fn_call_args(call);
 
+        let call_expr = ast::Expr {
+            span: None,
+            kind: Some(ast::expr::Kind::FunctionCall(call.clone())),
+        };
         let mut node = DAGNode::new(node_id.clone(), "fn_call".to_string(), label)
             .with_fn_call(&call.name)
             .with_kwargs(kwargs)
             .with_kwarg_exprs(kwarg_exprs)
-            .with_targets(targets);
+            .with_targets(targets)
+            .with_assign_expr(call_expr);
         if let Some(ref fn_name) = self.current_function {
             node = node.with_function_name(fn_name);
         }
@@ -2274,13 +2290,20 @@ impl DAGConverter {
         self.dag.add_node(parallel_node);
         result_nodes.push(parallel_id.clone());
 
+        let list_aggregate = targets.len() == 1;
+        let agg_id = self.next_id("parallel_aggregator");
+
         // Create a node for each call
         let mut call_node_ids = Vec::new();
         for (i, call) in calls.iter().enumerate() {
             // Assign a target to each parallel call based on index
             // If we have targets ["a", "b"] and calls [action1, action2],
             // then action1 produces "a" and action2 produces "b"
-            let call_target = targets.get(i).cloned();
+            let call_target = if list_aggregate {
+                None
+            } else {
+                targets.get(i).cloned()
+            };
 
             let (call_id, call_node) = match &call.kind {
                 Some(ast::call::Kind::Action(action)) => {
@@ -2298,6 +2321,9 @@ impl DAGConverter {
                         .with_kwarg_exprs(kwarg_exprs);
                     if let Some(ref t) = call_target {
                         node = node.with_target(t);
+                    }
+                    if list_aggregate {
+                        node = node.with_aggregates_to(&agg_id);
                     }
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
@@ -2318,6 +2344,9 @@ impl DAGConverter {
                         .with_kwarg_exprs(kwarg_exprs);
                     if let Some(ref t) = call_target {
                         node = node.with_target(t);
+                    }
+                    if list_aggregate {
+                        node = node.with_aggregates_to(&agg_id);
                     }
                     if let Some(ref fn_name) = self.current_function {
                         node = node.with_function_name(fn_name);
@@ -2346,7 +2375,6 @@ impl DAGConverter {
         }
 
         // Create aggregator node (still needed for control flow even without targets)
-        let agg_id = self.next_id("parallel_aggregator");
         let target_label = if !targets.is_empty() {
             if targets.len() == 1 {
                 format!("parallel_aggregate -> {}", targets[0])
@@ -4084,6 +4112,38 @@ fn main(input: [], output: [result]):
         // Should have aggregator node
         let node_types: HashSet<_> = dag.nodes.values().map(|n| n.node_type.as_str()).collect();
         assert!(node_types.contains("aggregator"));
+    }
+
+    #[test]
+    fn test_spread_collection_expr_creates_dataflow_edge() {
+        let source = r#"fn main(input: [], output: [results]):
+    items = @fetch_items()
+    results = spread items:item -> @process_item(item=item)
+    return results"#;
+        let program = parse(source).unwrap();
+        let dag = convert_to_dag(&program).unwrap();
+
+        let items_node = dag
+            .nodes
+            .values()
+            .find(|n| n.action_name.as_deref() == Some("fetch_items"))
+            .expect("Should have fetch_items action");
+        let spread_node = dag
+            .nodes
+            .values()
+            .find(|n| n.is_spread && n.action_name.as_deref() == Some("process_item"))
+            .expect("Should have process_item spread action");
+
+        let has_dataflow = dag.edges.iter().any(|edge| {
+            edge.edge_type == EdgeType::DataFlow
+                && edge.source == items_node.id
+                && edge.target == spread_node.id
+                && edge.variable.as_deref() == Some("items")
+        });
+        assert!(
+            has_dataflow,
+            "Expected data flow from items action to spread collection"
+        );
     }
 
     #[test]
