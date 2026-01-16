@@ -395,7 +395,7 @@ impl Database {
             r#"
             SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
                    input_payload, status, next_run_at, last_run_at, last_instance_id,
-                   created_at, updated_at
+                   created_at, updated_at, priority
             FROM workflow_schedules
             WHERE status != 'deleted'
             "#,
@@ -423,7 +423,7 @@ impl Database {
             r#"
             SELECT id, workflow_name, schedule_name, schedule_type, cron_expression, interval_seconds, jitter_seconds,
                    input_payload, status, next_run_at, last_run_at, last_instance_id,
-                   created_at, updated_at
+                   created_at, updated_at, priority
             FROM workflow_schedules
             WHERE id = $1
             "#,
