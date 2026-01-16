@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::{debug, info, warn};
 
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::ast_evaluator::{EvaluationError, ExpressionEvaluator};
@@ -77,7 +78,7 @@ pub enum FrontierCategory {
 ///
 /// This is computed entirely in memory before any database writes occur.
 /// The entire plan is then executed in a single atomic transaction.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompletionPlan {
     /// The node that completed.
     pub completed_node_id: String,
@@ -188,6 +189,9 @@ pub struct ReadinessIncrement {
     /// Number of StateMachine predecessors this node has.
     pub required_count: i32,
 
+    /// Whether this increment targets an aggregator node (requires tracked readiness).
+    pub is_aggregator: bool,
+
     /// Node type to use when enqueueing (action or barrier).
     pub node_type: NodeType,
 
@@ -252,7 +256,7 @@ pub struct InstanceCompletion {
 // ============================================================================
 
 /// Result of executing a completion plan.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CompletionResult {
     /// Whether this was a stale/duplicate completion.
     pub was_stale: bool,
@@ -262,6 +266,9 @@ pub struct CompletionResult {
 
     /// Whether the workflow completed.
     pub workflow_completed: bool,
+
+    /// Latest inbox update timestamp when inbox writes occurred.
+    pub inbox_updated_at: Option<DateTime<Utc>>,
 }
 
 impl CompletionResult {
@@ -1042,6 +1049,7 @@ pub fn execute_inline_subgraph(
                     plan.readiness_increments.push(ReadinessIncrement {
                         node_id: frontier.node_id.clone(),
                         required_count: frontier.required_count,
+                        is_aggregator: false,
                         node_type,
                         module_name: frontier_node.module_name.clone(),
                         action_name: frontier_node.action_name.clone(),
@@ -1088,6 +1096,7 @@ pub fn execute_inline_subgraph(
                     plan.readiness_increments.push(ReadinessIncrement {
                         node_id: frontier.node_id.clone(),
                         required_count: frontier.required_count,
+                        is_aggregator: frontier_node.is_aggregator,
                         node_type: NodeType::Barrier,
                         module_name: None,
                         action_name: None,
@@ -1602,6 +1611,7 @@ fn handle_spread_frontier(
         plan.readiness_increments.push(ReadinessIncrement {
             node_id: spread_node_id,
             required_count: 1, // Each spread item is triggered by the spread node being ready
+            is_aggregator: false,
             node_type: NodeType::Action,
             module_name: frontier_node.module_name.clone(),
             action_name: frontier_node.action_name.clone(),

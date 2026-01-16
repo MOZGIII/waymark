@@ -921,6 +921,12 @@ struct ActionLogContext {
     id: String,
     /// The action ID this log belongs to
     action_id: String,
+    /// Node ID in the DAG (for UI lookup)
+    node_id: Option<String>,
+    /// Action name (for UI lookup)
+    action_name: Option<String>,
+    /// Module name (for UI lookup)
+    module_name: Option<String>,
     /// Attempt number (0-indexed)
     attempt_number: i32,
     /// When this attempt was dispatched (with milliseconds for precise sorting)
@@ -996,10 +1002,12 @@ fn render_workflow_run_page(
         result_payload: format_payload(&instance.result_payload),
     };
 
-    // Build nodes from action_queue if available, otherwise from action_logs
-    // (completed actions are deleted from action_queue but kept in action_logs)
-    let nodes: Vec<NodeExecutionContext> = if !actions.is_empty() {
-        // Build from action_queue (active/in-progress workflows)
+    // Build nodes from action_queue if available, otherwise from action_logs.
+    // Completed/failed instances prefer logs for full attempt history.
+    let use_logs =
+        matches!(instance.status.as_str(), "completed" | "failed") && !action_logs.is_empty();
+    let nodes: Vec<NodeExecutionContext> = if !use_logs && !actions.is_empty() {
+        // Build from action_queue (active/in-progress workflows or recent completions)
         actions
             .iter()
             .map(|a| NodeExecutionContext {
@@ -1025,7 +1033,7 @@ fn render_workflow_run_page(
             })
             .collect()
     } else {
-        // Build from action_logs (completed workflows where actions were deleted)
+        // Build from action_logs (completed workflows or when queue is empty)
         // Group by action_id to get the latest attempt for each action
         let mut latest_by_action: std::collections::HashMap<String, &crate::db::ActionLog> =
             std::collections::HashMap::new();
@@ -1096,6 +1104,9 @@ fn render_workflow_run_page(
         let log_ctx = ActionLogContext {
             id: log.id.to_string(),
             action_id: log.action_id.to_string(),
+            node_id: log.node_id.clone(),
+            action_name: log.action_name.clone(),
+            module_name: log.module_name.clone(),
             attempt_number: log.attempt_number,
             dispatched_at: log
                 .dispatched_at
@@ -2070,7 +2081,7 @@ mod tests {
         let templates = test_templates();
         let statuses = vec![crate::db::WorkerStatus {
             pool_id: Uuid::new_v4(),
-            worker_id: 1,
+            worker_id: 0,
             throughput_per_min: 2.5,
             total_completed: 42,
             last_action_at: Some(chrono::Utc::now()),

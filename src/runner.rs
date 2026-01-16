@@ -33,24 +33,28 @@
 
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use chrono::{DateTime, Utc};
 use prost::Message;
 
 use crate::{
     ast_evaluator::{EvaluationError, ExpressionEvaluator, Scope},
-    completion::{CompletionError, InlineContext, analyze_subgraph, execute_inline_subgraph},
+    completion::{
+        CompletionError, CompletionPlan, InlineContext, analyze_subgraph, execute_inline_subgraph,
+    },
     dag::{DAG, DAGConverter, DAGNode, EXCEPTION_SCOPE_VAR, EdgeType},
     dag_state::{DAGHelper, ExecutionMode},
     db::{
@@ -64,6 +68,14 @@ use crate::{
     value::WorkflowValue,
     worker::{ActionDispatchPayload, PythonWorkerPool, RoundTripMetrics, WorkerThroughputSnapshot},
 };
+
+type InboxValues = HashMap<String, HashMap<String, WorkflowValue>>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct InstanceInboxCache {
+    values: InboxValues,
+    updated_at: DateTime<Utc>,
+}
 
 // ============================================================================
 // Workflow Value Conversion
@@ -294,6 +306,15 @@ impl DAGCache {
         Ok(Some(self.get_dag(WorkflowVersionId(version_id)).await?))
     }
 
+    pub async fn cache_instance_version(
+        &self,
+        instance_id: WorkflowInstanceId,
+        version_id: WorkflowVersionId,
+    ) {
+        let mut cache = self.instance_versions.write().await;
+        cache.insert(instance_id.0, version_id.0);
+    }
+
     /// Pre-load a DAG into the cache (for testing or warm-up).
     pub async fn preload(&self, version_id: Uuid, dag: DAG) {
         let mut cache = self.cache.write().await;
@@ -438,6 +459,8 @@ pub struct InFlightAction {
     pub action: QueuedAction,
     /// Worker index handling this action
     pub worker_idx: usize,
+    /// Worker ID handling this action
+    pub worker_id: u64,
     /// When dispatch started
     pub dispatched_at: Instant,
 }
@@ -516,7 +539,7 @@ impl InFlightTracker {
     }
 
     /// Add an action to tracking.
-    pub fn add(&mut self, action: QueuedAction, worker_idx: usize) {
+    pub fn add(&mut self, action: QueuedAction, worker_idx: usize, worker_id: u64) {
         if action.timeout_seconds > 0 {
             let deadline = Instant::now() + Duration::from_secs(action.timeout_seconds as u64);
             self.timeouts.insert(action.delivery_token, deadline);
@@ -527,6 +550,7 @@ impl InFlightTracker {
             InFlightAction {
                 action,
                 worker_idx,
+                worker_id,
                 dispatched_at: Instant::now(),
             },
         );
@@ -607,15 +631,19 @@ pub struct WorkQueueHandler {
     slot_tracker: Arc<WorkerSlotTracker>,
     in_flight: Arc<Mutex<InFlightTracker>>,
     dag_cache: Arc<DAGCache>,
+    instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+    metrics: Option<Arc<RunnerMetrics>>,
 }
 
 impl WorkQueueHandler {
-    pub fn new(
+    pub(crate) fn new(
         db: Arc<Database>,
         worker_pool: Arc<PythonWorkerPool>,
         slot_tracker: Arc<WorkerSlotTracker>,
         in_flight: Arc<Mutex<InFlightTracker>>,
         dag_cache: Arc<DAGCache>,
+        instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        metrics: Option<Arc<RunnerMetrics>>,
     ) -> Self {
         Self {
             db,
@@ -623,6 +651,8 @@ impl WorkQueueHandler {
             slot_tracker,
             in_flight,
             dag_cache,
+            instance_inboxes,
+            metrics,
         }
     }
 
@@ -645,6 +675,7 @@ impl WorkQueueHandler {
     /// - Barriers are processed inline using the unified readiness model
     ///
     /// Returns immediately after dispatching. Action completions are sent to the provided channel.
+    #[tracing::instrument(level = "info", skip(self, completion_tx))]
     pub async fn fetch_and_dispatch(
         &self,
         batch_size: usize,
@@ -654,6 +685,17 @@ impl WorkQueueHandler {
 
         let available = self.slot_tracker.available_slots();
         if available == 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_fetch_and_dispatch(FetchAndDispatchStats {
+                    total_us: total_start.elapsed().as_micros() as u64,
+                    db_us: 0,
+                    dispatch_us: 0,
+                    dispatched: 0,
+                    actions: 0,
+                    barriers: 0,
+                    sleeps: 0,
+                });
+            }
             return Ok(0);
         }
 
@@ -694,7 +736,7 @@ impl WorkQueueHandler {
         let dispatch_us = dispatch_start.elapsed().as_micros() as u64;
 
         if dispatched > 0 {
-            info!(
+            debug!(
                 total_us = total_start.elapsed().as_micros() as u64,
                 db_fetch_us = db_us,
                 dispatch_us = dispatch_us,
@@ -704,6 +746,18 @@ impl WorkQueueHandler {
                 sleeps = sleep_count,
                 "fetch_and_dispatch timing"
             );
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_fetch_and_dispatch(FetchAndDispatchStats {
+                total_us: total_start.elapsed().as_micros() as u64,
+                db_us,
+                dispatch_us,
+                dispatched,
+                actions: action_count,
+                barriers: barrier_count,
+                sleeps: sleep_count,
+            });
         }
 
         Ok(dispatched)
@@ -823,12 +877,27 @@ impl WorkQueueHandler {
             Vec::new(),
             None,
         );
+        let inbox_writes = plan.inbox_writes.clone();
         let inline_us = inline_start.elapsed().as_micros() as u64;
 
         // Execute completion plan in single atomic transaction
         let db_start = std::time::Instant::now();
         let result = self.db.execute_completion_plan(instance_id, plan).await?;
         let db_us = db_start.elapsed().as_micros() as u64;
+
+        if !result.was_stale {
+            if !inbox_writes.is_empty() {
+                let updated_at = match result.inbox_updated_at {
+                    Some(updated_at) => updated_at,
+                    None => self.db.get_inbox_updated_at(instance_id).await?,
+                };
+                self.apply_inbox_writes_to_cache(instance_id, &inbox_writes, updated_at)
+                    .await;
+            }
+            if result.workflow_completed {
+                self.clear_inbox_cache(instance_id).await;
+            }
+        }
 
         info!(
             barrier_id = %node_id,
@@ -915,9 +984,24 @@ impl WorkQueueHandler {
             Vec::new(),
             None,
         );
+        let inbox_writes = plan.inbox_writes.clone();
 
         // Execute completion plan in single atomic transaction
         let result = self.db.execute_completion_plan(instance_id, plan).await?;
+
+        if !result.was_stale {
+            if !inbox_writes.is_empty() {
+                let updated_at = match result.inbox_updated_at {
+                    Some(updated_at) => updated_at,
+                    None => self.db.get_inbox_updated_at(instance_id).await?,
+                };
+                self.apply_inbox_writes_to_cache(instance_id, &inbox_writes, updated_at)
+                    .await;
+            }
+            if result.workflow_completed {
+                self.clear_inbox_cache(instance_id).await;
+            }
+        }
 
         info!(
             sleep_id = %node_id,
@@ -944,12 +1028,6 @@ impl WorkQueueHandler {
             }
         };
 
-        // Track in-flight
-        {
-            let mut in_flight = self.in_flight.lock().await;
-            in_flight.add(action.clone(), worker_idx);
-        }
-
         // Build dispatch payload - convert JSON to WorkflowArguments
         let kwargs = json_bytes_to_workflow_args(&action.dispatch_payload);
 
@@ -968,6 +1046,13 @@ impl WorkQueueHandler {
 
         // Get worker and send
         let worker = self.worker_pool.get_worker(worker_idx).await;
+        let worker_id = worker.worker_id();
+
+        // Track in-flight
+        {
+            let mut in_flight = self.in_flight.lock().await;
+            in_flight.add(action.clone(), worker_idx, worker_id);
+        }
         let delivery_token = action.delivery_token;
         let in_flight_tracker = Arc::clone(&self.in_flight);
         let slot_tracker = Arc::clone(&self.slot_tracker);
@@ -986,7 +1071,10 @@ impl WorkQueueHandler {
                     if let Some(in_flight) = in_flight_action {
                         slot_tracker.release_slot(in_flight.worker_idx);
                         if let Err(e) = completion_tx.send((in_flight, metrics)).await {
-                            error!("Failed to send completion: {}", e);
+                            debug!(
+                                "Completion channel closed, dropping completion result: {}",
+                                e
+                            );
                         }
                     } else {
                         debug!(
@@ -1026,6 +1114,41 @@ impl WorkQueueHandler {
 
         timed_out.len()
     }
+
+    async fn apply_inbox_writes_to_cache(
+        &self,
+        instance_id: WorkflowInstanceId,
+        inbox_writes: &[crate::completion::InboxWrite],
+        inbox_updated_at: DateTime<Utc>,
+    ) {
+        if inbox_writes.is_empty() {
+            return;
+        }
+
+        let mut cache = self.instance_inboxes.write().await;
+        let instance_cache = cache
+            .entry(instance_id.0)
+            .or_insert_with(|| InstanceInboxCache {
+                values: HashMap::new(),
+                updated_at: inbox_updated_at,
+            });
+        instance_cache.updated_at = inbox_updated_at;
+        for write in inbox_writes {
+            if write.spread_index.is_some() {
+                continue;
+            }
+            let node_cache = instance_cache
+                .values
+                .entry(write.target_node_id.clone())
+                .or_default();
+            node_cache.insert(write.variable_name.clone(), write.value.clone());
+        }
+    }
+
+    async fn clear_inbox_cache(&self, instance_id: WorkflowInstanceId) {
+        let mut cache = self.instance_inboxes.write().await;
+        cache.remove(&instance_id.0);
+    }
 }
 
 // ============================================================================
@@ -1051,14 +1174,19 @@ impl WorkCompletionHandler {
     }
 
     /// Write a completion batch to the database in a single transaction.
-    pub async fn write_batch(&self, batch: CompletionBatch) -> RunnerResult<()> {
+    pub async fn write_batch(
+        &self,
+        batch: CompletionBatch,
+    ) -> RunnerResult<HashMap<Uuid, DateTime<Utc>>> {
         // Complete actions
         for completion in batch.completions {
             self.db.complete_action(completion).await?;
         }
 
         // Write inbox entries (data flow between nodes)
+        let mut inbox_instance_ids: HashSet<Uuid> = HashSet::new();
         for inbox_write in batch.inbox_writes {
+            inbox_instance_ids.insert(inbox_write.instance_id.0);
             self.db
                 .append_to_inbox(
                     inbox_write.instance_id,
@@ -1070,6 +1198,8 @@ impl WorkCompletionHandler {
                 )
                 .await?;
         }
+        let touch_ids: Vec<Uuid> = inbox_instance_ids.into_iter().collect();
+        let updated_at_by_instance = self.db.touch_inbox_updated_at(&touch_ids).await?;
 
         // Enqueue new actions
         for new_action in batch.new_actions {
@@ -1095,7 +1225,166 @@ impl WorkCompletionHandler {
                 .await?;
         }
 
-        Ok(())
+        Ok(updated_at_by_instance)
+    }
+}
+
+// ============================================================================
+// Completion Batching
+// ============================================================================
+
+struct CompletionFlushRequest {
+    instance_id: WorkflowInstanceId,
+    plan: CompletionPlan,
+    response_tx: oneshot::Sender<crate::db::DbResult<crate::completion::CompletionResult>>,
+}
+
+#[derive(Clone)]
+struct CompletionBatcher {
+    db: Arc<Database>,
+    sender: Option<mpsc::Sender<CompletionFlushRequest>>,
+    batching_enabled: bool,
+}
+
+impl CompletionBatcher {
+    fn new(db: Arc<Database>, max_batch_size: usize, flush_interval_ms: u64) -> Self {
+        let batch_size = max_batch_size.max(1);
+        let batching_enabled = batch_size > 1;
+        let interval_ms = flush_interval_ms.max(1);
+        if !batching_enabled {
+            return Self {
+                db,
+                sender: None,
+                batching_enabled,
+            };
+        }
+
+        let channel_capacity = batch_size.saturating_mul(4).max(100);
+        let (sender, mut receiver) = mpsc::channel(channel_capacity);
+        let db_task = Arc::clone(&db);
+
+        tokio::spawn(async move {
+            let mut pending: Vec<CompletionFlushRequest> = Vec::with_capacity(batch_size);
+            let mut ticker = tokio::time::interval(Duration::from_millis(interval_ms));
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            loop {
+                tokio::select! {
+                    maybe_req = receiver.recv() => {
+                        match maybe_req {
+                            Some(req) => {
+                                pending.push(req);
+                                if pending.len() >= batch_size {
+                                    Self::flush_pending(&db_task, &mut pending, batch_size).await;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        if !pending.is_empty() {
+                            Self::flush_pending(&db_task, &mut pending, batch_size).await;
+                        }
+                    }
+                }
+            }
+
+            if !pending.is_empty() {
+                Self::flush_pending(&db_task, &mut pending, batch_size).await;
+            }
+        });
+
+        Self {
+            db,
+            sender: Some(sender),
+            batching_enabled,
+        }
+    }
+
+    async fn execute(
+        &self,
+        instance_id: WorkflowInstanceId,
+        plan: CompletionPlan,
+    ) -> RunnerResult<crate::completion::CompletionResult> {
+        if !self.batching_enabled {
+            return self
+                .db
+                .execute_completion_plan(instance_id, plan)
+                .await
+                .map_err(RunnerError::Database);
+        }
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let sender = self.sender.as_ref().ok_or(RunnerError::ChannelClosed)?;
+        sender
+            .send(CompletionFlushRequest {
+                instance_id,
+                plan,
+                response_tx,
+            })
+            .await
+            .map_err(|_| RunnerError::ChannelClosed)?;
+        response_rx
+            .await
+            .map_err(|_| RunnerError::ChannelClosed)?
+            .map_err(RunnerError::Database)
+    }
+
+    async fn flush_pending(
+        db: &Database,
+        pending: &mut Vec<CompletionFlushRequest>,
+        batch_size: usize,
+    ) {
+        let mut requests = Vec::new();
+        requests.append(pending);
+        if requests.is_empty() {
+            return;
+        }
+
+        let mut batch_requests = requests;
+        if batch_requests.len() > batch_size {
+            let deferred = batch_requests.split_off(batch_size);
+            pending.extend(deferred);
+        }
+
+        if batch_requests.is_empty() {
+            return;
+        }
+
+        let mut plans = Vec::with_capacity(batch_requests.len());
+        for req in &batch_requests {
+            plans.push((req.instance_id, req.plan.clone()));
+        }
+
+        match db.execute_completion_plans_batch(plans).await {
+            Ok(results) if results.len() == batch_requests.len() => {
+                for (req, result) in batch_requests.into_iter().zip(results) {
+                    let _ = req.response_tx.send(Ok(result));
+                }
+            }
+            Ok(results) => {
+                error!(
+                    expected = batch_requests.len(),
+                    actual = results.len(),
+                    "completion batch size mismatch"
+                );
+                for req in batch_requests {
+                    let _ = req.response_tx.send(Err(crate::db::DbError::NotFound(
+                        "completion batch size mismatch".to_string(),
+                    )));
+                }
+            }
+            Err(err) => {
+                error!(
+                    "completion batch failed, falling back to per-plan writes: {}",
+                    err
+                );
+                for req in batch_requests {
+                    let result = db.execute_completion_plan(req.instance_id, req.plan).await;
+                    let _ = req.response_tx.send(result);
+                }
+            }
+        }
     }
 }
 
@@ -1115,6 +1404,12 @@ pub struct InboxWrite {
     pub spread_index: Option<i32>,
 }
 
+struct StartPlan {
+    instance_id: WorkflowInstanceId,
+    plan: CompletionPlan,
+    inbox_writes: Vec<crate::completion::InboxWrite>,
+}
+
 /// Result of creating actions for a node.
 /// Includes actions to enqueue and any inbox writes needed.
 #[derive(Debug, Default)]
@@ -1132,6 +1427,158 @@ pub struct ExceptionInfo {
 }
 
 // ============================================================================
+// Runner Metrics
+// ============================================================================
+
+#[derive(Debug, Default)]
+pub(crate) struct RunnerMetrics {
+    fetch_and_dispatch_calls: AtomicU64,
+    fetch_and_dispatch_total_us: AtomicU64,
+    fetch_and_dispatch_db_us: AtomicU64,
+    fetch_and_dispatch_dispatch_us: AtomicU64,
+    fetch_and_dispatch_dispatched: AtomicU64,
+    fetch_and_dispatch_actions: AtomicU64,
+    fetch_and_dispatch_barriers: AtomicU64,
+    fetch_and_dispatch_sleeps: AtomicU64,
+    start_unstarted_calls: AtomicU64,
+    start_unstarted_total_us: AtomicU64,
+    start_unstarted_instances: AtomicU64,
+    process_completion_calls: AtomicU64,
+    process_completion_total_us: AtomicU64,
+    process_completion_subgraph_us: AtomicU64,
+    process_completion_inbox_us: AtomicU64,
+    process_completion_inline_us: AtomicU64,
+    process_completion_db_us: AtomicU64,
+    process_completion_newly_ready: AtomicU64,
+    process_completion_workflow_completed: AtomicU64,
+}
+
+struct FetchAndDispatchStats {
+    total_us: u64,
+    db_us: u64,
+    dispatch_us: u64,
+    dispatched: usize,
+    actions: usize,
+    barriers: usize,
+    sleeps: usize,
+}
+
+struct ProcessCompletionStats {
+    total_us: u64,
+    subgraph_us: u64,
+    inbox_us: u64,
+    inline_us: u64,
+    db_us: u64,
+    newly_ready: usize,
+    workflow_completed: bool,
+}
+
+impl RunnerMetrics {
+    fn record_fetch_and_dispatch(&self, stats: FetchAndDispatchStats) {
+        self.fetch_and_dispatch_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.fetch_and_dispatch_total_us
+            .fetch_add(stats.total_us, Ordering::Relaxed);
+        self.fetch_and_dispatch_db_us
+            .fetch_add(stats.db_us, Ordering::Relaxed);
+        self.fetch_and_dispatch_dispatch_us
+            .fetch_add(stats.dispatch_us, Ordering::Relaxed);
+        self.fetch_and_dispatch_dispatched
+            .fetch_add(stats.dispatched as u64, Ordering::Relaxed);
+        self.fetch_and_dispatch_actions
+            .fetch_add(stats.actions as u64, Ordering::Relaxed);
+        self.fetch_and_dispatch_barriers
+            .fetch_add(stats.barriers as u64, Ordering::Relaxed);
+        self.fetch_and_dispatch_sleeps
+            .fetch_add(stats.sleeps as u64, Ordering::Relaxed);
+    }
+
+    fn record_start_unstarted(&self, total_us: u64, instances: usize) {
+        self.start_unstarted_calls.fetch_add(1, Ordering::Relaxed);
+        self.start_unstarted_total_us
+            .fetch_add(total_us, Ordering::Relaxed);
+        self.start_unstarted_instances
+            .fetch_add(instances as u64, Ordering::Relaxed);
+    }
+
+    fn record_process_completion(&self, stats: ProcessCompletionStats) {
+        self.process_completion_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.process_completion_total_us
+            .fetch_add(stats.total_us, Ordering::Relaxed);
+        self.process_completion_subgraph_us
+            .fetch_add(stats.subgraph_us, Ordering::Relaxed);
+        self.process_completion_inbox_us
+            .fetch_add(stats.inbox_us, Ordering::Relaxed);
+        self.process_completion_inline_us
+            .fetch_add(stats.inline_us, Ordering::Relaxed);
+        self.process_completion_db_us
+            .fetch_add(stats.db_us, Ordering::Relaxed);
+        self.process_completion_newly_ready
+            .fetch_add(stats.newly_ready as u64, Ordering::Relaxed);
+        self.process_completion_workflow_completed
+            .fetch_add(stats.workflow_completed as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> RunnerMetricsSnapshot {
+        RunnerMetricsSnapshot {
+            fetch_and_dispatch_calls: self.fetch_and_dispatch_calls.load(Ordering::Relaxed),
+            fetch_and_dispatch_total_us: self.fetch_and_dispatch_total_us.load(Ordering::Relaxed),
+            fetch_and_dispatch_db_us: self.fetch_and_dispatch_db_us.load(Ordering::Relaxed),
+            fetch_and_dispatch_dispatch_us: self
+                .fetch_and_dispatch_dispatch_us
+                .load(Ordering::Relaxed),
+            fetch_and_dispatch_dispatched: self
+                .fetch_and_dispatch_dispatched
+                .load(Ordering::Relaxed),
+            fetch_and_dispatch_actions: self.fetch_and_dispatch_actions.load(Ordering::Relaxed),
+            fetch_and_dispatch_barriers: self.fetch_and_dispatch_barriers.load(Ordering::Relaxed),
+            fetch_and_dispatch_sleeps: self.fetch_and_dispatch_sleeps.load(Ordering::Relaxed),
+            start_unstarted_calls: self.start_unstarted_calls.load(Ordering::Relaxed),
+            start_unstarted_total_us: self.start_unstarted_total_us.load(Ordering::Relaxed),
+            start_unstarted_instances: self.start_unstarted_instances.load(Ordering::Relaxed),
+            process_completion_calls: self.process_completion_calls.load(Ordering::Relaxed),
+            process_completion_total_us: self.process_completion_total_us.load(Ordering::Relaxed),
+            process_completion_subgraph_us: self
+                .process_completion_subgraph_us
+                .load(Ordering::Relaxed),
+            process_completion_inbox_us: self.process_completion_inbox_us.load(Ordering::Relaxed),
+            process_completion_inline_us: self.process_completion_inline_us.load(Ordering::Relaxed),
+            process_completion_db_us: self.process_completion_db_us.load(Ordering::Relaxed),
+            process_completion_newly_ready: self
+                .process_completion_newly_ready
+                .load(Ordering::Relaxed),
+            process_completion_workflow_completed: self
+                .process_completion_workflow_completed
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RunnerMetricsSnapshot {
+    pub fetch_and_dispatch_calls: u64,
+    pub fetch_and_dispatch_total_us: u64,
+    pub fetch_and_dispatch_db_us: u64,
+    pub fetch_and_dispatch_dispatch_us: u64,
+    pub fetch_and_dispatch_dispatched: u64,
+    pub fetch_and_dispatch_actions: u64,
+    pub fetch_and_dispatch_barriers: u64,
+    pub fetch_and_dispatch_sleeps: u64,
+    pub start_unstarted_calls: u64,
+    pub start_unstarted_total_us: u64,
+    pub start_unstarted_instances: u64,
+    pub process_completion_calls: u64,
+    pub process_completion_total_us: u64,
+    pub process_completion_subgraph_us: u64,
+    pub process_completion_inbox_us: u64,
+    pub process_completion_inline_us: u64,
+    pub process_completion_db_us: u64,
+    pub process_completion_newly_ready: u64,
+    pub process_completion_workflow_completed: u64,
+}
+
+// ============================================================================
 // DAG Runner
 // ============================================================================
 
@@ -1140,6 +1587,8 @@ pub struct ExceptionInfo {
 pub struct RunnerConfig {
     /// Maximum actions to fetch per batch
     pub batch_size: usize,
+    /// Enable internal runner metrics collection.
+    pub enable_metrics: bool,
     /// Maximum concurrent actions per worker
     pub max_slots_per_worker: usize,
     /// Polling interval when idle (milliseconds)
@@ -1154,18 +1603,35 @@ pub struct RunnerConfig {
     pub schedule_check_batch_size: i32,
     /// Worker status upsert interval (milliseconds)
     pub worker_status_interval_ms: u64,
+    /// Action log flush interval (milliseconds). If 0, flush is disabled.
+    pub action_log_flush_interval_ms: u64,
+    /// Maximum action logs to flush per cycle.
+    pub action_log_flush_batch_size: i64,
+    /// Maximum completion plans to flush per batch.
+    pub completion_batch_size: usize,
+    /// Completion flush interval (milliseconds).
+    pub completion_flush_interval_ms: u64,
     /// Garbage collection interval (milliseconds). If None, GC is disabled.
     pub gc_interval_ms: Option<u64>,
     /// Minimum age in seconds for completed/failed instances before cleanup.
     pub gc_retention_seconds: i64,
     /// Batch size for garbage collection operations.
     pub gc_batch_size: i32,
+    /// Maximum age in milliseconds for a start claim before reclaiming it.
+    pub start_claim_timeout_ms: u64,
+    /// Inbox compaction interval (milliseconds). If None, compaction is disabled.
+    pub inbox_compaction_interval_ms: Option<u64>,
+    /// Maximum inbox rows to compact per pass.
+    pub inbox_compaction_batch_size: i64,
+    /// Minimum age in seconds for inbox rows eligible for compaction.
+    pub inbox_compaction_min_age_seconds: i64,
 }
 
 impl Default for RunnerConfig {
     fn default() -> Self {
         Self {
             batch_size: 100,
+            enable_metrics: false,
             max_slots_per_worker: 10,
             poll_interval_ms: 100,
             timeout_check_interval_ms: 1000,
@@ -1173,9 +1639,17 @@ impl Default for RunnerConfig {
             schedule_check_interval_ms: 10000, // 10 seconds
             schedule_check_batch_size: 100,
             worker_status_interval_ms: 10000,
+            action_log_flush_interval_ms: 200,
+            action_log_flush_batch_size: 1000,
+            completion_batch_size: 1,
+            completion_flush_interval_ms: 1,
             gc_interval_ms: None,
             gc_retention_seconds: 86400, // 24 hours
             gc_batch_size: 100,
+            start_claim_timeout_ms: 60000,
+            inbox_compaction_interval_ms: None,
+            inbox_compaction_batch_size: 10000,
+            inbox_compaction_min_age_seconds: 60,
         }
     }
 }
@@ -1196,9 +1670,12 @@ pub struct DAGRunner {
     /// Stores initial input scope per workflow instance.
     /// Used to provide workflow input variables during inline evaluation.
     instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
+    /// Best-effort cache of latest inbox values per instance/node.
+    instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
     /// Shutdown signal
     shutdown: Arc<tokio::sync::Notify>,
     shutdown_flag: Arc<AtomicBool>,
+    metrics: Option<Arc<RunnerMetrics>>,
 }
 
 impl DAGRunner {
@@ -1215,13 +1692,23 @@ impl DAGRunner {
         ));
         let in_flight = Arc::new(Mutex::new(InFlightTracker::new()));
 
+        let metrics = if config.enable_metrics {
+            Some(Arc::new(RunnerMetrics::default()))
+        } else {
+            None
+        };
+
         let dag_cache = Arc::new(DAGCache::new(Arc::clone(&db)));
+        let instance_contexts = Arc::new(RwLock::new(HashMap::new()));
+        let instance_inboxes = Arc::new(RwLock::new(HashMap::new()));
         let work_handler = Arc::new(WorkQueueHandler::new(
             Arc::clone(&db),
             worker_pool,
             slot_tracker,
             in_flight,
             Arc::clone(&dag_cache),
+            Arc::clone(&instance_inboxes),
+            metrics.clone(),
         ));
         let completion_handler = WorkCompletionHandler::new(db);
 
@@ -1230,9 +1717,11 @@ impl DAGRunner {
             work_handler,
             completion_handler,
             dag_cache,
-            instance_contexts: Arc::new(RwLock::new(HashMap::new())),
+            instance_contexts,
+            instance_inboxes,
             shutdown: Arc::new(tokio::sync::Notify::new()),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            metrics,
         }
     }
 
@@ -1243,6 +1732,11 @@ impl DAGRunner {
         // Channel for completion results
         let (completion_tx, mut completion_rx) =
             mpsc::channel::<(InFlightAction, RoundTripMetrics)>(1000);
+        let completion_batcher = Arc::new(CompletionBatcher::new(
+            Arc::clone(&self.completion_handler.db),
+            self.config.completion_batch_size,
+            self.config.completion_flush_interval_ms,
+        ));
 
         let make_interval = |ms: u64, name: &'static str| {
             let clamped = ms.max(1);
@@ -1444,6 +1938,47 @@ impl DAGRunner {
             }
         });
 
+        // Action log flush loop.
+        if self.config.action_log_flush_interval_ms > 0 {
+            let log_runner = Arc::clone(&self);
+            let _log_handle = tokio::spawn(async move {
+                let mut interval = make_interval(
+                    log_runner.config.action_log_flush_interval_ms,
+                    "action_log_flush",
+                );
+                loop {
+                    if log_runner.shutdown_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = log_runner.shutdown.notified() => break,
+                        _ = interval.tick() => {
+                            let batch_size = log_runner.config.action_log_flush_batch_size;
+                            let mut should_continue = true;
+                            while should_continue {
+                                should_continue = false;
+                                match log_runner
+                                    .completion_handler
+                                    .db
+                                    .flush_action_log_queue(batch_size)
+                                    .await
+                                {
+                                    Ok(count) => {
+                                        if count >= batch_size {
+                                            should_continue = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error!(?err, "failed to flush action log queue");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Garbage collection loop (only if GC is enabled).
         if let Some(gc_interval_ms) = self.config.gc_interval_ms {
             let gc_runner = Arc::clone(&self);
@@ -1486,6 +2021,80 @@ impl DAGRunner {
             });
         }
 
+        // Inbox compaction loop (only if enabled).
+        if let Some(compact_interval_ms) = self.config.inbox_compaction_interval_ms {
+            let compact_runner = Arc::clone(&self);
+            let _compact_handle = tokio::spawn(async move {
+                let mut interval = make_interval(compact_interval_ms, "inbox_compaction");
+                loop {
+                    if compact_runner.shutdown_flag.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = compact_runner.shutdown.notified() => break,
+                        _ = interval.tick() => {
+                            let min_age_seconds =
+                                compact_runner.config.inbox_compaction_min_age_seconds;
+                            let batch_size = compact_runner.config.inbox_compaction_batch_size;
+                            let mut should_continue = true;
+
+                            while should_continue {
+                                should_continue = false;
+                                match compact_runner
+                                    .completion_handler
+                                    .db
+                                    .compact_node_inputs(min_age_seconds, batch_size)
+                                    .await
+                                {
+                                    Ok(count) => {
+                                        if count >= batch_size {
+                                            should_continue = true;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error!(?err, "failed to compact node_inputs");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Start unstarted instances loop.
+        let start_runner = Arc::clone(&self);
+        let start_interval =
+            tokio::time::Duration::from_millis(start_runner.config.poll_interval_ms);
+        let _start_handle = tokio::spawn(async move {
+            loop {
+                if start_runner.shutdown_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                tokio::select! {
+                    _ = start_runner.shutdown.notified() => break,
+                    _ = tokio::time::sleep(start_interval) => {
+                        let batch_size = start_runner.config.batch_size;
+                        let mut should_continue = true;
+
+                        while should_continue {
+                            should_continue = false;
+                            match start_runner.start_unstarted_instances().await {
+                                Ok(count) => {
+                                    if count >= batch_size {
+                                        should_continue = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!("Failed to start unstarted instances: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         // Poll + dispatch loop - uses sleep() like original for consistent timing behavior
         let poll_runner = Arc::clone(&self);
         let poll_tx = completion_tx.clone();
@@ -1505,18 +2114,6 @@ impl DAGRunner {
                         // Keep processing until we've drained work or hit capacity
                         while should_continue {
                             should_continue = false;
-
-                            // Start unstarted instances - if we hit batch size, loop immediately
-                            match poll_runner.start_unstarted_instances().await {
-                                Ok(count) => {
-                                    if count >= batch_size {
-                                        should_continue = true;
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to start unstarted instances: {}", e);
-                                }
-                            }
 
                             // Skip dispatch if no slots available
                             if poll_runner.work_handler.available_slots() == 0 {
@@ -1565,10 +2162,13 @@ impl DAGRunner {
                     let handler = self.completion_handler.clone();
                     let dag_cache = Arc::clone(&self.dag_cache);
                     let instance_contexts = Arc::clone(&self.instance_contexts);
+                    let instance_inboxes = Arc::clone(&self.instance_inboxes);
+                    let completion_batcher = Arc::clone(&completion_batcher);
                     let instance_id = in_flight.action.instance_id;
                     // Capture worker tracking info for action logs
                     let pool_id = self.work_handler.worker_pool_id();
-                    let worker_id = in_flight.worker_idx as i64;
+                    let worker_id = in_flight.worker_id as i64;
+                    let runner_metrics = self.metrics.clone();
 
                     tokio::spawn(async move {
                         // Use unified completion path for successful actions
@@ -1578,11 +2178,14 @@ impl DAGRunner {
                                 &handler.db,
                                 &dag_cache,
                                 &instance_contexts,
+                                &instance_inboxes,
+                                completion_batcher,
                                 &in_flight,
                                 &metrics,
                                 WorkflowInstanceId(instance_id),
                                 Some(pool_id),
                                 Some(worker_id),
+                                runner_metrics.clone(),
                             ).await {
                                 error!("Unified completion processing failed: {}", e);
 
@@ -1601,6 +2204,7 @@ impl DAGRunner {
                                 handler,
                                 dag_cache,
                                 instance_contexts,
+                                instance_inboxes,
                                 in_flight,
                                 metrics,
                                 WorkflowInstanceId(instance_id),
@@ -1744,15 +2348,32 @@ impl DAGRunner {
     /// Every frontier node gets readiness tracking. A node is only enqueued
     /// when `completed_count == required_count`.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        level = "info",
+        skip(
+            db,
+            dag_cache,
+            instance_contexts,
+            instance_inboxes,
+            completion_batcher,
+            in_flight,
+            metrics,
+            runner_metrics
+        ),
+        fields(instance_id = %instance_id.0)
+    )]
     async fn process_completion_unified(
         db: &Database,
         dag_cache: &DAGCache,
         instance_contexts: &Arc<RwLock<HashMap<Uuid, Scope>>>,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        completion_batcher: Arc<CompletionBatcher>,
         in_flight: &InFlightAction,
         metrics: &RoundTripMetrics,
         instance_id: WorkflowInstanceId,
         pool_id: Option<Uuid>,
         worker_id: Option<i64>,
+        runner_metrics: Option<Arc<RunnerMetrics>>,
     ) -> RunnerResult<crate::completion::CompletionResult> {
         let total_start = std::time::Instant::now();
 
@@ -1821,25 +2442,10 @@ impl DAGRunner {
 
         // Step 2: Batch fetch inbox for all nodes in subgraph
         let inbox_start = std::time::Instant::now();
-        let existing_inbox = inbox_json_to_workflow(
-            db.batch_read_inbox(instance_id, &subgraph.all_node_ids)
-                .await?,
-        );
+        let existing_inbox =
+            Self::load_inbox_with_cache(db, instance_inboxes, instance_id, &subgraph.all_node_ids)
+                .await?;
         let inbox_ms = inbox_start.elapsed().as_micros() as u64;
-
-        // DEBUG: Log full inbox state for completed node
-        info!(
-            node_id = %node_id,
-            existing_inbox_keys = ?existing_inbox.keys().collect::<Vec<_>>(),
-            "DEBUG: existing inbox node keys"
-        );
-        for (inbox_node_id, inbox_vars) in &existing_inbox {
-            info!(
-                inbox_node_id = %inbox_node_id,
-                inbox_vars = ?inbox_vars,
-                "DEBUG: inbox contents for node"
-            );
-        }
 
         // Step 3: Execute inline subgraph and build completion plan
         let inline_start = std::time::Instant::now();
@@ -1872,36 +2478,33 @@ impl DAGRunner {
             "built completion plan"
         );
 
-        // DEBUG: Log all inbox writes in the plan
-        for write in &plan.inbox_writes {
-            info!(
-                target_node_id = %write.target_node_id,
-                variable_name = %write.variable_name,
-                value = ?write.value,
-                source_node_id = %write.source_node_id,
-                spread_index = ?write.spread_index,
-                "DEBUG: plan inbox write"
-            );
-        }
-
-        // DEBUG: Log all readiness increments
-        for inc in &plan.readiness_increments {
-            info!(
-                node_id = %inc.node_id,
-                required_count = inc.required_count,
-                node_type = ?inc.node_type,
-                action_name = ?inc.action_name,
-                "DEBUG: plan readiness increment"
-            );
-        }
-
         // Step 4: Execute completion plan in single atomic transaction
+        let inbox_writes = plan.inbox_writes.clone();
         let db_start = std::time::Instant::now();
-        let result = db.execute_completion_plan(instance_id, plan).await?;
+        let result = completion_batcher.execute(instance_id, plan).await?;
         let db_ms = db_start.elapsed().as_micros() as u64;
 
+        if !result.was_stale {
+            if !inbox_writes.is_empty() {
+                let updated_at = match result.inbox_updated_at {
+                    Some(updated_at) => updated_at,
+                    None => db.get_inbox_updated_at(instance_id).await?,
+                };
+                Self::apply_inbox_writes_to_cache(
+                    instance_inboxes,
+                    instance_id,
+                    &inbox_writes,
+                    updated_at,
+                )
+                .await;
+            }
+            if result.workflow_completed {
+                Self::clear_inbox_cache(instance_inboxes, instance_id).await;
+            }
+        }
+
         let total_ms = total_start.elapsed().as_micros() as u64;
-        info!(
+        debug!(
             node_id = %node_id,
             total_us = total_ms,
             subgraph_us = subgraph_ms,
@@ -1912,6 +2515,18 @@ impl DAGRunner {
             workflow_completed = result.workflow_completed,
             "process_completion timing"
         );
+
+        if let Some(metrics) = &runner_metrics {
+            metrics.record_process_completion(ProcessCompletionStats {
+                total_us: total_ms,
+                subgraph_us: subgraph_ms,
+                inbox_us: inbox_ms,
+                inline_us: inline_ms,
+                db_us: db_ms,
+                newly_ready: result.newly_ready_nodes.len(),
+                workflow_completed: result.workflow_completed,
+            });
+        }
 
         Ok(result)
     }
@@ -2062,6 +2677,7 @@ impl DAGRunner {
         handler: WorkCompletionHandler,
         dag_cache: Arc<DAGCache>,
         instance_contexts: Arc<RwLock<HashMap<Uuid, Scope>>>,
+        instance_inboxes: Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
         in_flight: InFlightAction,
         metrics: RoundTripMetrics,
         instance_id: WorkflowInstanceId,
@@ -2139,7 +2755,7 @@ impl DAGRunner {
                     let node_id = match in_flight.action.node_id.as_deref() {
                         Some(id) => id,
                         None => {
-                            handler.write_batch(batch).await?;
+                            let _ = handler.write_batch(batch).await?;
                             return Ok(());
                         }
                     };
@@ -2169,7 +2785,13 @@ impl DAGRunner {
                             max_retries = in_flight.action.max_retries,
                             "retries still available, not checking for exception handlers yet"
                         );
-                        handler.write_batch(batch).await?;
+                        Self::write_batch_and_update_cache(
+                            &handler,
+                            batch,
+                            &instance_inboxes,
+                            instance_id,
+                        )
+                        .await?;
                         return Ok(());
                     }
 
@@ -2249,7 +2871,13 @@ impl DAGRunner {
                             &handler.db,
                         )
                         .await?;
-                        handler.write_batch(batch).await?;
+                        Self::write_batch_and_update_cache(
+                            &handler,
+                            batch,
+                            &instance_inboxes,
+                            instance_id,
+                        )
+                        .await?;
                         // Mark the failed action as caught so fail_instances_with_exhausted_actions
                         // doesn't mark the workflow as failed. This must be AFTER write_batch
                         // because the action is still 'dispatched' until write_batch completes.
@@ -2344,7 +2972,13 @@ impl DAGRunner {
                                 &handler.db,
                             )
                             .await?;
-                            handler.write_batch(batch).await?;
+                            Self::write_batch_and_update_cache(
+                                &handler,
+                                batch,
+                                &instance_inboxes,
+                                instance_id,
+                            )
+                            .await?;
                             // Mark the failed action as caught so fail_instances_with_exhausted_actions
                             // doesn't mark the workflow as failed. This must be AFTER write_batch
                             // because the action is still 'dispatched' until write_batch completes.
@@ -2361,13 +2995,14 @@ impl DAGRunner {
                 }
             }
 
-            handler.write_batch(batch).await?;
+            Self::write_batch_and_update_cache(&handler, batch, &instance_inboxes, instance_id)
+                .await?;
             return Ok(());
         }
 
         // If we get here, the action failed but no exception handler was found
         // Just write the completion record
-        handler.write_batch(batch).await?;
+        Self::write_batch_and_update_cache(&handler, batch, &instance_inboxes, instance_id).await?;
         Ok(())
     }
 
@@ -2909,6 +3544,27 @@ impl DAGRunner {
                         Self::create_actions_for_node(succ_node, instance_id, &inbox, dag)?;
                     batch.new_actions.extend(action_result.actions);
                     batch.inbox_writes.extend(action_result.inbox_writes);
+
+                    if succ_node.node_type == "action_call" && !succ_node.is_spread {
+                        for (var_name, value) in &inbox {
+                            if let Some(existing) = batch.inbox_writes.iter_mut().find(|write| {
+                                write.target_node_id == current_node_id
+                                    && write.variable_name == *var_name
+                            }) {
+                                existing.value = value.clone();
+                                continue;
+                            }
+
+                            batch.inbox_writes.push(InboxWrite {
+                                instance_id,
+                                target_node_id: current_node_id.clone(),
+                                variable_name: var_name.clone(),
+                                value: value.clone(),
+                                source_node_id: current_node_id.clone(),
+                                spread_index: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -3161,9 +3817,183 @@ impl DAGRunner {
         self.shutdown.notify_waiters();
     }
 
+    /// Snapshot internal runner metrics if enabled.
+    pub fn metrics_snapshot(&self) -> Option<RunnerMetricsSnapshot> {
+        self.metrics.as_ref().map(|metrics| metrics.snapshot())
+    }
+
     /// Register a DAG for a workflow version (for testing or warm-up).
     pub async fn register_dag(&self, version_id: Uuid, dag: DAG) {
         self.dag_cache.preload(version_id, dag).await;
+    }
+
+    /// Best-effort inbox cache lookup; fetches missing nodes from DB.
+    async fn load_inbox_with_cache(
+        db: &Database,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        instance_id: WorkflowInstanceId,
+        node_ids: &std::collections::HashSet<String>,
+    ) -> RunnerResult<InboxValues> {
+        if node_ids.is_empty() {
+            return Ok(InboxValues::new());
+        }
+
+        let db_updated_at = db.get_inbox_updated_at(instance_id).await?;
+        let mut merged: InboxValues = InboxValues::new();
+        let mut missing: std::collections::HashSet<String> = node_ids.clone();
+        let mut cache_valid = false;
+
+        {
+            let cache = instance_inboxes.read().await;
+            if let Some(instance_cache) = cache.get(&instance_id.0)
+                && db_updated_at <= instance_cache.updated_at
+            {
+                cache_valid = true;
+            }
+        }
+
+        if cache_valid {
+            let cache = instance_inboxes.read().await;
+            if let Some(instance_cache) = cache.get(&instance_id.0) {
+                for node_id in node_ids {
+                    if let Some(values) = instance_cache.values.get(node_id) {
+                        merged.insert(node_id.clone(), values.clone());
+                        missing.remove(node_id);
+                    }
+                }
+            }
+        } else {
+            let mut cache = instance_inboxes.write().await;
+            cache.remove(&instance_id.0);
+            missing = node_ids.clone();
+            merged.clear();
+        }
+
+        if !missing.is_empty() {
+            let fetched = inbox_json_to_workflow(db.batch_read_inbox(instance_id, &missing).await?);
+            {
+                let mut cache = instance_inboxes.write().await;
+                let instance_cache =
+                    cache
+                        .entry(instance_id.0)
+                        .or_insert_with(|| InstanceInboxCache {
+                            values: HashMap::new(),
+                            updated_at: db_updated_at,
+                        });
+                instance_cache.updated_at = db_updated_at;
+                for (node_id, values) in &fetched {
+                    instance_cache
+                        .values
+                        .insert(node_id.clone(), values.clone());
+                }
+            }
+            for (node_id, values) in fetched {
+                merged.insert(node_id, values);
+            }
+        }
+
+        Ok(merged)
+    }
+
+    /// Update inbox cache with newly written non-spread values.
+    async fn apply_inbox_writes_to_cache(
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        instance_id: WorkflowInstanceId,
+        inbox_writes: &[crate::completion::InboxWrite],
+        inbox_updated_at: DateTime<Utc>,
+    ) {
+        if inbox_writes.is_empty() {
+            return;
+        }
+
+        let mut cache = instance_inboxes.write().await;
+        let instance_cache = cache
+            .entry(instance_id.0)
+            .or_insert_with(|| InstanceInboxCache {
+                values: HashMap::new(),
+                updated_at: inbox_updated_at,
+            });
+        instance_cache.updated_at = inbox_updated_at;
+        for write in inbox_writes {
+            if write.spread_index.is_some() {
+                continue;
+            }
+            let node_cache = instance_cache
+                .values
+                .entry(write.target_node_id.clone())
+                .or_default();
+            node_cache.insert(write.variable_name.clone(), write.value.clone());
+        }
+    }
+
+    /// Update inbox cache with newly written non-spread values from completion batches.
+    async fn apply_batch_inbox_writes_to_cache(
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        instance_id: WorkflowInstanceId,
+        inbox_writes: &[InboxWrite],
+        inbox_updated_at: DateTime<Utc>,
+    ) {
+        if inbox_writes.is_empty() {
+            return;
+        }
+
+        let mut cache = instance_inboxes.write().await;
+        let instance_cache = cache
+            .entry(instance_id.0)
+            .or_insert_with(|| InstanceInboxCache {
+                values: HashMap::new(),
+                updated_at: inbox_updated_at,
+            });
+        instance_cache.updated_at = inbox_updated_at;
+        for write in inbox_writes {
+            if write.spread_index.is_some() {
+                continue;
+            }
+            let node_cache = instance_cache
+                .values
+                .entry(write.target_node_id.clone())
+                .or_default();
+            node_cache.insert(write.variable_name.clone(), write.value.clone());
+        }
+    }
+
+    /// Drop cached inbox data for an instance.
+    async fn clear_inbox_cache(
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        instance_id: WorkflowInstanceId,
+    ) {
+        let mut cache = instance_inboxes.write().await;
+        cache.remove(&instance_id.0);
+    }
+
+    async fn write_batch_and_update_cache(
+        handler: &WorkCompletionHandler,
+        batch: CompletionBatch,
+        instance_inboxes: &Arc<RwLock<HashMap<Uuid, InstanceInboxCache>>>,
+        instance_id: WorkflowInstanceId,
+    ) -> RunnerResult<()> {
+        let inbox_writes = batch.inbox_writes.clone();
+        let completed = batch.instance_completion.is_some();
+
+        let updated_at_by_instance = handler.write_batch(batch).await?;
+        if !inbox_writes.is_empty() {
+            let updated_at = match updated_at_by_instance.get(&instance_id.0) {
+                Some(updated_at) => *updated_at,
+                None => handler.db.get_inbox_updated_at(instance_id).await?,
+            };
+            Self::apply_batch_inbox_writes_to_cache(
+                instance_inboxes,
+                instance_id,
+                &inbox_writes,
+                updated_at,
+            )
+            .await;
+        }
+        if completed {
+            Self::clear_inbox_cache(instance_inboxes, instance_id).await;
+        }
+
+        Ok(())
     }
 
     /// Get count of in-flight actions.
@@ -3177,13 +4007,18 @@ impl DAGRunner {
     /// and starts them by parsing their input and creating the initial actions.
     ///
     /// Returns the number of instances that were processed.
+    #[tracing::instrument(level = "info", skip(self))]
     async fn start_unstarted_instances(&self) -> RunnerResult<usize> {
+        let total_start = std::time::Instant::now();
         let db = &self.completion_handler.db;
+        let stale_before =
+            Utc::now() - Duration::from_millis(self.config.start_claim_timeout_ms.max(1));
         // Use the same batch size as dispatch to ensure we can keep up with workflow creation rate
         let instances = db
-            .find_unstarted_instances(self.config.batch_size as i32)
+            .find_unstarted_instances(self.config.batch_size as i32, stale_before)
             .await?;
         let count = instances.len();
+        let mut pending_start_plans: Vec<StartPlan> = Vec::with_capacity(count);
 
         for instance in instances {
             let instance_id = WorkflowInstanceId(instance.id);
@@ -3215,20 +4050,19 @@ impl DAGRunner {
                     std::collections::HashMap::new()
                 };
 
-            info!(
+            debug!(
                 instance_id = %instance.id,
                 workflow = %instance.workflow_name,
                 input_keys = ?initial_inputs.keys().collect::<Vec<_>>(),
                 "starting unstarted instance"
             );
 
-            match self.start_instance(instance_id, initial_inputs).await {
-                Ok(count) => {
-                    debug!(
-                        instance_id = %instance.id,
-                        actions_created = count,
-                        "successfully started instance"
-                    );
+            match self
+                .build_start_plan(instance_id, initial_inputs, instance.workflow_version_id)
+                .await
+            {
+                Ok(start_plan) => {
+                    pending_start_plans.push(start_plan);
                 }
                 Err(RunnerError::GuardEvaluationFailed(guard_errors)) => {
                     let error_message = Self::format_guard_errors(&guard_errors);
@@ -3261,8 +4095,68 @@ impl DAGRunner {
                         error = %e,
                         "failed to start instance"
                     );
+                    if let Err(db_err) = db.clear_instance_started_at(instance_id).await {
+                        error!(
+                            instance_id = %instance.id,
+                            error = %db_err,
+                            "failed to clear started_at after start error"
+                        );
+                    }
                 }
             }
+        }
+
+        if !pending_start_plans.is_empty() {
+            let claimed_instance_ids: Vec<WorkflowInstanceId> = pending_start_plans
+                .iter()
+                .map(|plan| plan.instance_id)
+                .collect();
+            let mut plans = Vec::with_capacity(pending_start_plans.len());
+            let mut inbox_writes = Vec::with_capacity(pending_start_plans.len());
+            for plan in pending_start_plans {
+                plans.push((plan.instance_id, plan.plan));
+                inbox_writes.push((plan.instance_id, plan.inbox_writes));
+            }
+
+            let results = match db.execute_completion_plans_batch(plans).await {
+                Ok(results) => results,
+                Err(err) => {
+                    for instance_id in claimed_instance_ids {
+                        if let Err(db_err) = db.clear_instance_started_at(instance_id).await {
+                            error!(
+                                instance_id = %instance_id.0,
+                                error = %db_err,
+                                "failed to clear started_at after batch start failure"
+                            );
+                        }
+                    }
+                    return Err(err.into());
+                }
+            };
+            for ((instance_id, writes), result) in inbox_writes.into_iter().zip(results) {
+                if !result.was_stale {
+                    if !writes.is_empty() {
+                        let updated_at = match result.inbox_updated_at {
+                            Some(updated_at) => updated_at,
+                            None => db.get_inbox_updated_at(instance_id).await?,
+                        };
+                        Self::apply_inbox_writes_to_cache(
+                            &self.instance_inboxes,
+                            instance_id,
+                            &writes,
+                            updated_at,
+                        )
+                        .await;
+                    }
+                    if result.workflow_completed {
+                        Self::clear_inbox_cache(&self.instance_inboxes, instance_id).await;
+                    }
+                }
+            }
+        }
+
+        if let Some(metrics) = &self.metrics {
+            metrics.record_start_unstarted(total_start.elapsed().as_micros() as u64, count);
         }
 
         Ok(count)
@@ -3282,12 +4176,65 @@ impl DAGRunner {
         instance_id: WorkflowInstanceId,
         initial_inputs: HashMap<String, WorkflowValue>,
     ) -> RunnerResult<usize> {
+        let start_plan = self
+            .build_start_plan(instance_id, initial_inputs, None)
+            .await?;
+
+        let db = &self.completion_handler.db;
+        let inbox_writes = start_plan.inbox_writes.clone();
+        let result = db
+            .execute_completion_plan(instance_id, start_plan.plan)
+            .await?;
+        if !inbox_writes.is_empty() {
+            let updated_at = match result.inbox_updated_at {
+                Some(updated_at) => updated_at,
+                None => db.get_inbox_updated_at(instance_id).await?,
+            };
+            Self::apply_inbox_writes_to_cache(
+                &self.instance_inboxes,
+                instance_id,
+                &inbox_writes,
+                updated_at,
+            )
+            .await;
+        }
+        if result.workflow_completed {
+            Self::clear_inbox_cache(&self.instance_inboxes, instance_id).await;
+        }
+        if result.workflow_completed {
+            info!(
+                instance_id = %instance_id.0,
+                "completed workflow instance during start_instance"
+            );
+        }
+
+        info!(
+            instance_id = %instance_id.0,
+            actions = result.newly_ready_nodes.len(),
+            "started workflow instance"
+        );
+        Ok(result.newly_ready_nodes.len())
+    }
+
+    async fn build_start_plan(
+        &self,
+        instance_id: WorkflowInstanceId,
+        initial_inputs: HashMap<String, WorkflowValue>,
+        workflow_version_id: Option<Uuid>,
+    ) -> RunnerResult<StartPlan> {
         // Load the DAG for this instance
-        let dag = self
-            .dag_cache
-            .get_dag_for_instance(instance_id)
-            .await?
-            .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.0))?;
+        let dag = if let Some(version_id) = workflow_version_id {
+            let version_id = WorkflowVersionId(version_id);
+            self.dag_cache
+                .cache_instance_version(instance_id, version_id)
+                .await;
+            self.dag_cache.get_dag(version_id).await?
+        } else {
+            self.dag_cache
+                .get_dag_for_instance(instance_id)
+                .await?
+                .ok_or_else(|| RunnerError::InstanceNotFound(instance_id.0))?
+        };
 
         // Find the entry function and its input node
         let helper = DAGHelper::new(&dag);
@@ -3367,21 +4314,11 @@ impl DAGRunner {
             other => RunnerError::Dag(other.to_string()),
         })?;
 
-        let db = &self.completion_handler.db;
-        let result = db.execute_completion_plan(instance_id, plan).await?;
-        if result.workflow_completed {
-            info!(
-                instance_id = %instance_id.0,
-                "completed workflow instance during start_instance"
-            );
-        }
-
-        info!(
-            instance_id = %instance_id.0,
-            actions = result.newly_ready_nodes.len(),
-            "started workflow instance"
-        );
-        Ok(result.newly_ready_nodes.len())
+        Ok(StartPlan {
+            instance_id,
+            inbox_writes: plan.inbox_writes.clone(),
+            plan,
+        })
     }
 
     /// Create action(s) for a node using inbox values.
@@ -3956,7 +4893,7 @@ mod tests {
             last_error: None,
         };
 
-        tracker.add(action.clone(), 0);
+        tracker.add(action.clone(), 0, 1);
         assert_eq!(tracker.count(), 1);
 
         let timed_out = tracker.take_timed_out(Instant::now() + Duration::from_secs(31));

@@ -64,6 +64,13 @@ class SingleData(BaseModel):
     result: BenchmarkResult | BenchmarkError
 
 
+class SuiteData(BaseModel):
+    """Multiple benchmark runs with shared configuration."""
+
+    config: dict
+    results: dict[str, BenchmarkResult | BenchmarkError]
+
+
 # =============================================================================
 # Output Formatters
 # =============================================================================
@@ -80,6 +87,11 @@ class OutputFormatter(ABC):
     @abstractmethod
     def format_grid(self, data: GridData) -> str:
         """Format grid benchmark results."""
+        pass
+
+    @abstractmethod
+    def format_suite(self, data: SuiteData) -> str:
+        """Format multiple benchmark results."""
         pass
 
 
@@ -102,6 +114,18 @@ class JsonFormatter(OutputFormatter):
             },
             "grid": [cell.model_dump() for cell in data.cells],
         }
+        return json.dumps(output, indent=2)
+
+    def format_suite(self, data: SuiteData) -> str:
+        output = {
+            "_meta": {
+                "benchmark_available": True,
+                "mode": "suite",
+                "config": data.config,
+            }
+        }
+        for bench, result in data.results.items():
+            output[bench] = result.model_dump()
         return json.dumps(output, indent=2)
 
 
@@ -208,6 +232,21 @@ class TextFormatter(OutputFormatter):
         lines.extend(self._scaling_analysis(data))
 
         return "\n".join(lines)
+
+    def format_suite(self, data: SuiteData) -> str:
+        lines = [
+            "Benchmark Suite Results",
+            "=" * 50,
+        ]
+        for key, value in data.config.items():
+            lines.append(f"{key}: {value}")
+        lines.append("")
+
+        for bench_name, result in data.results.items():
+            lines.append(self.format_single(SingleData(benchmark=bench_name, result=result)))
+            lines.append("")
+
+        return "\n".join(lines).strip()
 
     def _scaling_analysis(self, data: GridData) -> list[str]:
         """Analyze how throughput scales with workers/instances."""
@@ -366,6 +405,23 @@ class MarkdownFormatter(OutputFormatter):
 
         return "\n".join(lines)
 
+    def format_suite(self, data: SuiteData) -> str:
+        lines = [
+            "## Benchmark Suite Results",
+            "",
+            "### Configuration",
+            "",
+        ]
+        for key, value in data.config.items():
+            lines.append(f"- **{key}:** {value}")
+        lines.append("")
+
+        for bench_name, result in data.results.items():
+            lines.append(self.format_single(SingleData(benchmark=bench_name, result=result)))
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
 
 class CsvFormatter(OutputFormatter):
     """Output as CSV for spreadsheet import."""
@@ -404,6 +460,18 @@ class CsvFormatter(OutputFormatter):
             else:
                 lines.append(f"{base},,,,,,{cell.result.error}")
 
+        return "\n".join(lines)
+
+    def format_suite(self, data: SuiteData) -> str:
+        lines = ["benchmark,total,elapsed_s,throughput,avg_ms,p95_ms,error"]
+        for bench_name, result in data.results.items():
+            if isinstance(result, BenchmarkResult):
+                lines.append(
+                    f"{bench_name},{result.total},{result.elapsed_s:.3f},{result.throughput:.2f},"
+                    f"{result.avg_round_trip_ms:.2f},{result.p95_round_trip_ms:.2f},"
+                )
+            else:
+                lines.append(f"{bench_name},,,,,,{result.error}")
         return "\n".join(lines)
 
 
@@ -553,7 +621,7 @@ def cli():
     "--benchmark",
     "-b",
     default="for-loop",
-    type=click.Choice(["for-loop", "fan-out"]),
+    type=click.Choice(["for-loop", "fan-out", "queue-noop"]),
     help="Benchmark type",
 )
 @click.option(
@@ -613,6 +681,125 @@ def single(
         print(formatted)
 
 
+@cli.command()
+@click.option(
+    "--output", "-o", type=click.Path(), help="Output file path (stdout if not specified)"
+)
+@click.option(
+    "--format",
+    "-f",
+    "fmt",
+    type=click.Choice(list(FORMATTERS.keys())),
+    default="text",
+    help="Output format",
+)
+@click.option(
+    "--benchmarks",
+    default="for-loop,fan-out,queue-noop",
+    help="Comma-separated list of benchmark types",
+)
+@click.option(
+    "--loop-size",
+    default=16,
+    help="Number of actions to spawn (fan-out width / for-loop iterations)",
+)
+@click.option("--complexity", default=1000, help="CPU complexity per action (hash iterations)")
+@click.option("--workers-per-host", default=4, help="Number of Python workers per host")
+@click.option("--hosts", default=1, help="Number of hosts")
+@click.option("--instances", default=1, help="Number of workflow instances")
+@click.option("--timeout", default=300, help="Timeout per benchmark run in seconds")
+@click.option(
+    "--benchmark-config",
+    "benchmark_config_str",
+    default=None,
+    help="Per-benchmark config: 'bench:loop_size:complexity,...' e.g. 'for-loop:64:500,fan-out:32:200'",
+)
+def suite(
+    output: str | None,
+    fmt: str,
+    benchmarks: str,
+    loop_size: int,
+    complexity: int,
+    workers_per_host: int,
+    hosts: int,
+    instances: int,
+    timeout: int,
+    benchmark_config_str: str | None,
+):
+    """Run multiple benchmarks with the same configuration."""
+    if not check_benchmark_available():
+        print("Benchmark binary not found. Run 'cargo build --release' first.", file=sys.stderr)
+        sys.exit(1)
+
+    benchmark_types = [b.strip() for b in benchmarks.split(",") if b.strip()]
+    allowed = {"for-loop", "fan-out", "queue-noop"}
+    invalid = [b for b in benchmark_types if b not in allowed]
+    if invalid:
+        print(f"Unknown benchmarks: {', '.join(invalid)}", file=sys.stderr)
+        sys.exit(1)
+
+    benchmark_configs: dict[str, dict[str, int]] = {}
+    if benchmark_config_str:
+        benchmark_configs = parse_benchmark_config(benchmark_config_str)
+
+    unknown_configs = [b for b in benchmark_configs if b not in allowed]
+    if unknown_configs:
+        print(f"Unknown benchmarks in config: {', '.join(unknown_configs)}", file=sys.stderr)
+        sys.exit(1)
+
+    for bench in benchmark_types:
+        if bench not in benchmark_configs:
+            benchmark_configs[bench] = {"loop_size": loop_size, "complexity": complexity}
+
+    results: dict[str, BenchmarkResult | BenchmarkError] = {}
+    for benchmark in benchmark_types:
+        bench_cfg = benchmark_configs[benchmark]
+        print(f"=== Running {benchmark} Benchmark ===", file=sys.stderr)
+        reset_database()
+        result = run_benchmark(
+            [
+                "--benchmark",
+                benchmark,
+                "--loop-size",
+                str(bench_cfg["loop_size"]),
+                "--complexity",
+                str(bench_cfg["complexity"]),
+                "--workers-per-host",
+                str(workers_per_host),
+                "--hosts",
+                str(hosts),
+                "--instances",
+                str(instances),
+                "--log-interval",
+                "0",
+            ],
+            timeout=timeout,
+        )
+        results[benchmark] = result
+
+    data = SuiteData(
+        config={
+            "benchmarks": benchmark_types,
+            "loop_size": loop_size,
+            "complexity": complexity,
+            "workers_per_host": workers_per_host,
+            "hosts": hosts,
+            "instances": instances,
+            "timeout": timeout,
+            "benchmark_configs": benchmark_configs,
+        },
+        results=results,
+    )
+    formatter = FORMATTERS[fmt]
+    formatted = formatter.format_suite(data)
+
+    if output:
+        Path(output).write_text(formatted)
+        print(f"Results written to {output}", file=sys.stderr)
+    else:
+        print(formatted)
+
+
 def parse_benchmark_config(config_str: str) -> dict[str, dict[str, int]]:
     """Parse benchmark-specific config string.
 
@@ -649,7 +836,9 @@ def parse_benchmark_config(config_str: str) -> dict[str, dict[str, int]]:
 @click.option("--instances", default="1,2,4,8", help="Comma-separated list of instance counts")
 @click.option("--workers-per-host", default=4, help="Number of Python workers per host")
 @click.option(
-    "--benchmarks", default="for-loop,fan-out", help="Comma-separated list of benchmark types"
+    "--benchmarks",
+    default="for-loop,fan-out",
+    help="Comma-separated list of benchmark types",
 )
 @click.option("--loop-size", default=16, help="Default number of actions to spawn per workflow")
 @click.option(
@@ -804,7 +993,7 @@ def grid(
 
 def main():
     """Entry point with backwards compatibility."""
-    if len(sys.argv) > 1 and sys.argv[1] in ["single", "grid"]:
+    if len(sys.argv) > 1 and sys.argv[1] in ["single", "suite", "grid"]:
         cli()
     else:
         # Legacy: default to 'single' with old argument style

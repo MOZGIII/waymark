@@ -4,17 +4,21 @@
 //! by webapp features. All operations here are on the critical path for
 //! workflow execution.
 
-use sqlx::Row;
+use sqlx::{Postgres, QueryBuilder, Row};
+use std::collections::{HashMap, HashSet};
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::completion::{CompletionPlan, CompletionResult};
+use crate::completion::{
+    CompletionPlan, CompletionResult, InboxWrite, InstanceCompletion, NodeType, ReadinessIncrement,
+    ReadinessInit,
+};
 
 use chrono::{DateTime, Utc};
 
 use super::{
-    ActionId, CompletionRecord, Database, DbError, DbResult, LoopState, NewAction, QueuedAction,
-    ReadinessResult, ScheduleId, ScheduleType, WorkerStatusUpdate, WorkflowInstance,
+    ActionId, BackoffKind, CompletionRecord, Database, DbError, DbResult, LoopState, NewAction,
+    QueuedAction, ReadinessResult, ScheduleId, ScheduleType, WorkerStatusUpdate, WorkflowInstance,
     WorkflowInstanceId, WorkflowSchedule, WorkflowVersion, WorkflowVersionId,
 };
 
@@ -124,29 +128,136 @@ impl Database {
         Ok(WorkflowInstanceId(id))
     }
 
-    /// Find instances that need to be started (running but no actions created yet)
-    /// Orders by priority DESC (higher priority first), then by created_at ASC
-    pub async fn find_unstarted_instances(&self, limit: i32) -> DbResult<Vec<WorkflowInstance>> {
+    /// Create workflow instances in bulk with a specific priority (returns instance IDs).
+    pub async fn create_instances_batch_with_priority(
+        &self,
+        workflow_name: &str,
+        version_id: WorkflowVersionId,
+        input_payloads: &[Option<Vec<u8>>],
+        schedule_id: Option<ScheduleId>,
+        priority: i32,
+    ) -> DbResult<Vec<WorkflowInstanceId>> {
+        if input_payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            WITH new_instances AS (
+                INSERT INTO workflow_instances
+                    (workflow_name, workflow_version_id, input_payload, schedule_id, priority)
+                SELECT $1, $2, payload, $3, $4
+                FROM UNNEST($5::bytea[]) AS payload
+                RETURNING id
+            )
+            INSERT INTO instance_context (instance_id)
+            SELECT id FROM new_instances
+            RETURNING instance_id
+            "#,
+        )
+        .bind(workflow_name)
+        .bind(version_id.0)
+        .bind(schedule_id.map(|id| id.0))
+        .bind(priority)
+        .bind(input_payloads)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| WorkflowInstanceId(row.get::<Uuid, _>("instance_id")))
+            .collect())
+    }
+
+    /// Create workflow instances in bulk with a specific priority (returns count).
+    pub async fn create_instances_batch_count_with_priority(
+        &self,
+        workflow_name: &str,
+        version_id: WorkflowVersionId,
+        input_payloads: &[Option<Vec<u8>>],
+        schedule_id: Option<ScheduleId>,
+        priority: i32,
+    ) -> DbResult<i64> {
+        if input_payloads.is_empty() {
+            return Ok(0);
+        }
+
+        let result = sqlx::query(
+            r#"
+            WITH new_instances AS (
+                INSERT INTO workflow_instances
+                    (workflow_name, workflow_version_id, input_payload, schedule_id, priority)
+                SELECT $1, $2, payload, $3, $4
+                FROM UNNEST($5::bytea[]) AS payload
+                RETURNING id
+            )
+            INSERT INTO instance_context (instance_id)
+            SELECT id FROM new_instances
+            "#,
+        )
+        .bind(workflow_name)
+        .bind(version_id.0)
+        .bind(schedule_id.map(|id| id.0))
+        .bind(priority)
+        .bind(input_payloads)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as i64)
+    }
+
+    /// Claim instances that need to be started (running but no actions created yet).
+    /// Orders by priority DESC (higher priority first), then by created_at ASC.
+    pub async fn find_unstarted_instances(
+        &self,
+        limit: i32,
+        stale_before: DateTime<Utc>,
+    ) -> DbResult<Vec<WorkflowInstance>> {
         let instances = sqlx::query_as::<_, WorkflowInstance>(
             r#"
-            SELECT i.id, i.partition_id, i.workflow_name, i.workflow_version_id,
-                   i.schedule_id, i.next_action_seq, i.input_payload, i.result_payload, i.status,
-                   i.created_at, i.completed_at, i.priority
-            FROM workflow_instances i
-            WHERE i.status = 'running'
-              AND i.next_action_seq = 0
-              AND NOT EXISTS (
-                  SELECT 1 FROM action_queue a WHERE a.instance_id = i.id
-              )
-            ORDER BY i.priority DESC, i.created_at ASC
-            LIMIT $1
+            WITH claimed AS (
+                SELECT id
+                FROM workflow_instances
+                WHERE status = 'running'
+                  AND next_action_seq = 0
+                  AND (started_at IS NULL OR started_at < $2)
+                ORDER BY priority DESC, created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $1
+            )
+            UPDATE workflow_instances i
+            SET started_at = NOW()
+            FROM claimed
+            WHERE i.id = claimed.id
+            RETURNING i.id, i.partition_id, i.workflow_name, i.workflow_version_id,
+                      i.schedule_id, i.next_action_seq, i.input_payload, i.result_payload, i.status,
+                      i.created_at, i.completed_at, i.priority
             "#,
         )
         .bind(limit)
+        .bind(stale_before)
         .fetch_all(&self.pool)
         .await?;
 
         Ok(instances)
+    }
+
+    /// Clear started_at for a running instance with no actions enqueued.
+    pub async fn clear_instance_started_at(&self, id: WorkflowInstanceId) -> DbResult<()> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_instances
+            SET started_at = NULL
+            WHERE id = $1
+              AND status = 'running'
+              AND next_action_seq = 0
+            "#,
+        )
+        .bind(id.0)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     /// Mark an instance as completed
@@ -354,7 +465,7 @@ impl Database {
 
         let count = actions.len();
         if count > 0 {
-            tracing::info!(
+            tracing::debug!(
                 elapsed_ms = start.elapsed().as_millis() as u64,
                 count = count,
                 "dispatch_actions"
@@ -546,28 +657,30 @@ impl Database {
     ///
     /// Uses delivery_token for idempotent completion - if the token doesn't match,
     /// the action was already completed by another worker or timed out.
-    /// Also updates the action log entry with completion information.
+    /// Logs are persisted via background flush for successes; failures log immediately.
     ///
-    /// On success: Deletes the action from action_queue immediately (action_logs has history)
+    /// On success: Deletes the action row and enqueues a log entry.
     /// On failure: Updates status to 'failed' so retry logic can process it
     pub async fn complete_action(&self, record: CompletionRecord) -> DbResult<bool> {
         let result = if record.success {
-            // Success: DELETE from queue immediately, INSERT log with full context
+            // Success: delete action row and enqueue log entry.
             sqlx::query(
                 r#"
                 WITH deleted AS (
                     DELETE FROM action_queue
                     WHERE id = $1 AND delivery_token = $2 AND status = 'dispatched'
                     RETURNING id, instance_id, attempt_number, dispatched_at,
-                              module_name, action_name, node_id, dispatch_payload
+                              module_name, action_name, node_id, dispatch_payload, enqueued_at
                 ),
                 log_insert AS (
-                    INSERT INTO action_logs (action_id, instance_id, attempt_number, dispatched_at,
-                                            completed_at, success, result_payload, duration_ms,
-                                            module_name, action_name, node_id, dispatch_payload)
-                    SELECT id, instance_id, attempt_number, dispatched_at, NOW(), true, $3,
+                    INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
+                                            completed_at, success, result_payload, error_message, duration_ms,
+                                            module_name, action_name, node_id, dispatch_payload,
+                                            pool_id, worker_id, enqueued_at)
+                    SELECT id, instance_id, attempt_number, dispatched_at, NOW(), true, $3, NULL,
                            EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
-                           module_name, action_name, node_id, dispatch_payload
+                           module_name, action_name, node_id, dispatch_payload,
+                           $4, $5, enqueued_at
                     FROM deleted
                 )
                 SELECT COUNT(*) FROM deleted
@@ -576,6 +689,8 @@ impl Database {
             .bind(record.action_id.0)
             .bind(record.delivery_token)
             .bind(&record.result_payload)
+            .bind(record.pool_id)
+            .bind(record.worker_id)
             .fetch_one(&self.pool)
             .await?
         } else {
@@ -589,17 +704,19 @@ impl Database {
                         result_payload = $3,
                         last_error = $4,
                         completed_at = NOW()
-                    WHERE id = $1 AND delivery_token = $5 AND status = 'dispatched'
+                    WHERE id = $1 AND delivery_token = $2 AND status = 'dispatched'
                     RETURNING id, instance_id, attempt_number, dispatched_at,
-                              module_name, action_name, node_id, dispatch_payload
+                              module_name, action_name, node_id, dispatch_payload, enqueued_at
                 ),
                 log_insert AS (
-                    INSERT INTO action_logs (action_id, instance_id, attempt_number, dispatched_at,
+                    INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
                                             completed_at, success, result_payload, error_message, duration_ms,
-                                            module_name, action_name, node_id, dispatch_payload)
+                                            module_name, action_name, node_id, dispatch_payload,
+                                            pool_id, worker_id, enqueued_at)
                     SELECT id, instance_id, attempt_number, dispatched_at, NOW(), false, $3, $4,
                            EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
-                           module_name, action_name, node_id, dispatch_payload
+                           module_name, action_name, node_id, dispatch_payload,
+                           $5, $6, enqueued_at
                     FROM updated
                 )
                 SELECT COUNT(*) FROM updated
@@ -609,7 +726,8 @@ impl Database {
             .bind(record.delivery_token)
             .bind(&record.result_payload)
             .bind(&record.error_message)
-            .bind(record.delivery_token)
+            .bind(record.pool_id)
+            .bind(record.worker_id)
             .fetch_one(&self.pool)
             .await?
         };
@@ -653,7 +771,7 @@ impl Database {
                           aq.module_name, aq.action_name, aq.node_id, aq.dispatch_payload
             ),
             log_insert AS (
-                INSERT INTO action_logs (action_id, instance_id, attempt_number, dispatched_at,
+                INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
                                         completed_at, success, error_message, duration_ms,
                                         module_name, action_name, node_id, dispatch_payload)
                 SELECT id, instance_id, attempt_number, dispatched_at, NOW(), false, 'Action timed out',
@@ -672,6 +790,103 @@ impl Database {
         if count > 0 {
             tracing::info!(count = count, "marked timed-out actions as failed");
         }
+
+        Ok(count)
+    }
+
+    /// Flush buffered action logs into action_logs in bulk.
+    ///
+    /// Returns the number of logs flushed.
+    pub async fn flush_action_log_queue(&self, limit: i64) -> DbResult<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            WITH moved AS (
+                DELETE FROM action_log_queue
+                WHERE id IN (
+                    SELECT id
+                    FROM action_log_queue
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $1
+                )
+                RETURNING action_id, instance_id, attempt_number, dispatched_at,
+                          completed_at, success, result_payload, error_message, duration_ms,
+                          module_name, action_name, node_id, dispatch_payload,
+                          pool_id, worker_id, enqueued_at
+            ),
+            inserted AS (
+                INSERT INTO action_logs (
+                    action_id, instance_id, attempt_number, dispatched_at,
+                    completed_at, success, result_payload, error_message, duration_ms,
+                    module_name, action_name, node_id, dispatch_payload,
+                    pool_id, worker_id, enqueued_at
+                )
+                SELECT action_id, instance_id, attempt_number, dispatched_at,
+                       completed_at, success, result_payload, error_message, duration_ms,
+                       module_name, action_name, node_id, dispatch_payload,
+                       pool_id, worker_id, enqueued_at
+                FROM moved
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM workflow_instances
+                    WHERE id = moved.instance_id
+                )
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM inserted
+            "#,
+        )
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(count)
+    }
+
+    /// Flush completed actions from action_queue into action_logs in bulk.
+    ///
+    /// Returns the number of logs flushed.
+    pub async fn flush_completed_actions(&self, limit: i64) -> DbResult<i64> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            WITH moved AS (
+                DELETE FROM action_queue
+                WHERE id IN (
+                    SELECT id
+                    FROM action_queue
+                    WHERE status = 'completed'
+                    ORDER BY completed_at NULLS LAST, id
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT $1
+                )
+                RETURNING id, instance_id, attempt_number, dispatched_at, completed_at,
+                          success, result_payload, last_error, module_name, action_name,
+                          node_id, dispatch_payload, enqueued_at
+            ),
+            inserted AS (
+                INSERT INTO action_logs (
+                    action_id, instance_id, attempt_number, dispatched_at,
+                    completed_at, success, result_payload, error_message, duration_ms,
+                    module_name, action_name, node_id, dispatch_payload,
+                    enqueued_at
+                )
+                SELECT id, instance_id, attempt_number, dispatched_at,
+                       completed_at, success, result_payload, last_error,
+                       CASE
+                           WHEN dispatched_at IS NULL OR completed_at IS NULL THEN NULL
+                           ELSE EXTRACT(EPOCH FROM (completed_at - dispatched_at)) * 1000
+                       END,
+                       module_name, action_name, node_id, dispatch_payload,
+                       enqueued_at
+                FROM moved
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM inserted
+            "#,
+        )
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
 
         Ok(count)
     }
@@ -921,11 +1136,10 @@ impl Database {
     // Node Inputs (Inbox Pattern)
     // ========================================================================
 
-    /// Write a value to a node's inbox (O(1) upsert, no locks).
+    /// Write a value to a node's inbox (O(1) insert, append-only).
     ///
     /// When Node A completes, it calls this for each downstream node that needs the value.
-    /// Uses UPSERT to overwrite existing values for the same (target, variable, spread_index),
-    /// preventing unbounded inbox growth during loops.
+    /// The inbox is append-only; reads pick the latest value per variable.
     pub async fn append_to_inbox(
         &self,
         instance_id: WorkflowInstanceId,
@@ -939,8 +1153,6 @@ impl Database {
             r#"
             INSERT INTO node_inputs (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)
             VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (instance_id, target_node_id, variable_name, COALESCE(spread_index, -1))
-            DO UPDATE SET value = EXCLUDED.value, source_node_id = EXCLUDED.source_node_id, created_at = NOW()
             "#,
         )
         .bind(instance_id.0)
@@ -955,21 +1167,77 @@ impl Database {
         Ok(())
     }
 
+    /// Fetch the latest inbox update timestamp for cache invalidation.
+    pub async fn get_inbox_updated_at(
+        &self,
+        instance_id: WorkflowInstanceId,
+    ) -> DbResult<DateTime<Utc>> {
+        let updated_at: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r#"
+            SELECT inbox_updated_at
+            FROM workflow_instances
+            WHERE id = $1
+            "#,
+        )
+        .bind(instance_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        updated_at.ok_or_else(|| {
+            DbError::NotFound(format!(
+                "workflow instance {} (inbox updated_at)",
+                instance_id.0
+            ))
+        })
+    }
+
+    /// Mark inbox updated_at for a set of instances after inbox writes.
+    pub async fn touch_inbox_updated_at(
+        &self,
+        instance_ids: &[Uuid],
+    ) -> DbResult<HashMap<Uuid, DateTime<Utc>>> {
+        if instance_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            UPDATE workflow_instances
+            SET inbox_updated_at = NOW()
+            WHERE id = ANY($1)
+            RETURNING id, inbox_updated_at
+            "#,
+        )
+        .bind(instance_ids)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut updated = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let id: Uuid = row.get(0);
+            let updated_at: DateTime<Utc> = row.get(1);
+            updated.insert(id, updated_at);
+        }
+
+        Ok(updated)
+    }
+
     /// Read all pending inputs for a node (single query).
     ///
-    /// Returns a map of variable_name -> value.
-    /// For spread results, returns the values as a list ordered by spread_index.
+    /// Returns a map of variable_name -> latest value (non-spread only).
     pub async fn read_inbox(
         &self,
         instance_id: WorkflowInstanceId,
         target_node_id: &str,
     ) -> DbResult<std::collections::HashMap<String, serde_json::Value>> {
-        let rows: Vec<(String, serde_json::Value, Option<i32>)> = sqlx::query_as(
+        let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
             r#"
-            SELECT variable_name, value, spread_index
+            SELECT DISTINCT ON (variable_name) variable_name, value
             FROM node_inputs
-            WHERE instance_id = $1 AND target_node_id = $2
-            ORDER BY spread_index NULLS FIRST, created_at
+            WHERE instance_id = $1
+              AND target_node_id = $2
+              AND spread_index IS NULL
+            ORDER BY variable_name, created_at DESC
             "#,
         )
         .bind(instance_id.0)
@@ -978,7 +1246,7 @@ impl Database {
         .await?;
 
         let mut result = std::collections::HashMap::new();
-        for (var_name, value, _spread_index) in rows {
+        for (var_name, value) in rows {
             result.insert(var_name, value);
         }
         Ok(result)
@@ -986,7 +1254,7 @@ impl Database {
 
     /// Read spread/parallel results for an aggregator node.
     ///
-    /// Returns list of (spread_index, value) tuples for ordering.
+    /// Returns latest (spread_index, value) tuples for ordering.
     pub async fn read_inbox_for_aggregator(
         &self,
         instance_id: WorkflowInstanceId,
@@ -994,10 +1262,12 @@ impl Database {
     ) -> DbResult<Vec<(i32, serde_json::Value)>> {
         let rows: Vec<(i32, serde_json::Value)> = sqlx::query_as(
             r#"
-            SELECT spread_index, value
+            SELECT DISTINCT ON (spread_index) spread_index, value
             FROM node_inputs
-            WHERE instance_id = $1 AND target_node_id = $2 AND spread_index IS NOT NULL
-            ORDER BY spread_index
+            WHERE instance_id = $1
+              AND target_node_id = $2
+              AND spread_index IS NOT NULL
+            ORDER BY spread_index, created_at DESC
             "#,
         )
         .bind(instance_id.0)
@@ -1020,6 +1290,50 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Compact inbox rows by removing older duplicates per variable/spread index.
+    ///
+    /// Keeps the latest row per (instance_id, target_node_id, variable_name, spread_index).
+    pub async fn compact_node_inputs(&self, min_age_seconds: i64, limit: i64) -> DbResult<i64> {
+        if limit <= 0 {
+            return Ok(0);
+        }
+
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            WITH ranked AS (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY instance_id, target_node_id, variable_name, COALESCE(spread_index, -1)
+                           ORDER BY created_at DESC
+                       ) AS rn
+                FROM node_inputs
+                WHERE created_at < NOW() - ($1 || ' seconds')::interval
+            ),
+            deleted AS (
+                DELETE FROM node_inputs
+                WHERE id IN (
+                    SELECT id
+                    FROM ranked
+                    WHERE rn > 1
+                    LIMIT $2
+                )
+                RETURNING 1
+            )
+            SELECT COUNT(*) FROM deleted
+            "#,
+        )
+        .bind(min_age_seconds)
+        .bind(limit)
+        .fetch_one(&self.pool)
+        .await?;
+
+        if count > 0 {
+            tracing::info!(count = count, "compact_node_inputs");
+        }
+
+        Ok(count)
     }
 
     /// Count completed actions for a set of node IDs within an instance.
@@ -1147,20 +1461,29 @@ impl Database {
     ) -> DbResult<ReadinessResult> {
         let mut tx = self.pool.begin().await?;
 
-        // Write all inbox entries
-        for (target_node_id, variable_name, value, source_node_id, spread_index) in inbox_writes {
+        // Write all inbox entries in a single insert.
+        if !inbox_writes.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO node_inputs (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)",
+            );
+            builder.push_values(inbox_writes, |mut row, write| {
+                row.push_bind(instance_id.0)
+                    .push_bind(&write.0)
+                    .push_bind(&write.1)
+                    .push_bind(&write.2)
+                    .push_bind(&write.3)
+                    .push_bind(write.4);
+            });
+            builder.build().execute(&mut *tx).await?;
+
             sqlx::query(
                 r#"
-                INSERT INTO node_inputs (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)
-                VALUES ($1, $2, $3, $4, $5, $6)
+                UPDATE workflow_instances
+                SET inbox_updated_at = NOW()
+                WHERE id = $1
                 "#,
             )
             .bind(instance_id.0)
-            .bind(target_node_id)
-            .bind(variable_name)
-            .bind(value)
-            .bind(source_node_id)
-            .bind(spread_index)
             .execute(&mut *tx)
             .await?;
         }
@@ -1286,6 +1609,17 @@ impl Database {
         .execute(&mut *tx)
         .await?;
 
+        sqlx::query(
+            r#"
+            UPDATE workflow_instances
+            SET inbox_updated_at = NOW()
+            WHERE id = $1
+            "#,
+        )
+        .bind(instance_id.0)
+        .execute(&mut *tx)
+        .await?;
+
         // Atomically increment completed_count and return both counts
         let row = sqlx::query(
             r#"
@@ -1370,14 +1704,15 @@ impl Database {
 
         let node_ids_vec: Vec<&str> = node_ids.iter().map(|s| s.as_str()).collect();
 
-        // With UPSERT, each (target_node_id, variable_name, spread_index) is unique,
-        // so we just need a simple SELECT. Non-spread variables (spread_index IS NULL)
-        // are also unique due to the COALESCE(-1) in the unique index.
+        // Append-only inbox; pick latest non-spread value per variable.
         let rows: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
             r#"
-            SELECT target_node_id, variable_name, value
+            SELECT DISTINCT ON (target_node_id, variable_name) target_node_id, variable_name, value
             FROM node_inputs
-            WHERE instance_id = $1 AND target_node_id = ANY($2)
+            WHERE instance_id = $1
+              AND target_node_id = ANY($2)
+              AND spread_index IS NULL
+            ORDER BY target_node_id, variable_name, created_at DESC
             "#,
         )
         .bind(instance_id.0)
@@ -1424,12 +1759,12 @@ impl Database {
 
         let rows: Vec<(String, i32, serde_json::Value)> = sqlx::query_as(
             r#"
-            SELECT target_node_id, spread_index, value
+            SELECT DISTINCT ON (target_node_id, spread_index) target_node_id, spread_index, value
             FROM node_inputs
             WHERE instance_id = $1
               AND target_node_id = ANY($2)
               AND spread_index IS NOT NULL
-            ORDER BY target_node_id, spread_index
+            ORDER BY target_node_id, spread_index, created_at DESC
             "#,
         )
         .bind(instance_id.0)
@@ -1448,6 +1783,849 @@ impl Database {
         }
 
         Ok(result)
+    }
+
+    /// Execute multiple completion plans in a single transaction.
+    pub async fn execute_completion_plans_batch(
+        &self,
+        plans: Vec<(WorkflowInstanceId, CompletionPlan)>,
+    ) -> DbResult<Vec<CompletionResult>> {
+        if plans.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        #[derive(Debug)]
+        struct BatchPlan {
+            index: usize,
+            instance_id: WorkflowInstanceId,
+            inbox_writes: Vec<InboxWrite>,
+            readiness_resets: Vec<String>,
+            readiness_inits: Vec<ReadinessInit>,
+            direct_increments: Vec<ReadinessIncrement>,
+            tracked_increments: Vec<ReadinessIncrement>,
+            barrier_enqueues: Vec<String>,
+            instance_completion: Option<InstanceCompletion>,
+        }
+
+        struct BatchReadinessReset {
+            instance_id: WorkflowInstanceId,
+            node_id: String,
+        }
+
+        struct BatchReadinessInit {
+            instance_id: WorkflowInstanceId,
+            node_id: String,
+            required_count: i32,
+        }
+
+        struct BatchReadinessIncrement {
+            instance_id: WorkflowInstanceId,
+            plan_index: usize,
+            increment: ReadinessIncrement,
+        }
+
+        struct BatchBarrierEnqueue {
+            instance_id: WorkflowInstanceId,
+            plan_index: usize,
+            node_id: String,
+        }
+
+        struct BatchInstanceCompletion {
+            instance_id: WorkflowInstanceId,
+            plan_index: usize,
+            result_payload: Vec<u8>,
+        }
+
+        #[derive(Debug)]
+        struct PendingEnqueue {
+            instance_id: WorkflowInstanceId,
+            plan_index: usize,
+            node_id: String,
+            module_name: String,
+            action_name: String,
+            dispatch_payload: Vec<u8>,
+            timeout_seconds: i32,
+            max_retries: i32,
+            backoff_kind: BackoffKind,
+            backoff_base_delay_ms: i32,
+            node_type: NodeType,
+            scheduled_at: Option<DateTime<Utc>>,
+        }
+
+        struct EnqueueRow {
+            instance_id: WorkflowInstanceId,
+            node_id: String,
+            module_name: String,
+            action_name: String,
+            dispatch_payload: Vec<u8>,
+            timeout_seconds: i32,
+            max_retries: i32,
+            backoff_kind: BackoffKind,
+            backoff_base_delay_ms: i32,
+            node_type: NodeType,
+            scheduled_at: DateTime<Utc>,
+            priority: i32,
+            action_seq: i32,
+        }
+
+        #[derive(Default, Debug)]
+        struct BatchDbTimings {
+            action_complete_us: u64,
+            inbox_insert_us: u64,
+            readiness_reset_us: u64,
+            readiness_init_us: u64,
+            readiness_increment_us: u64,
+            next_action_seq_us: u64,
+            enqueue_insert_us: u64,
+            instance_complete_us: u64,
+            total_us: u64,
+        }
+
+        let total_start = std::time::Instant::now();
+        let mut tx = self.pool.begin().await?;
+        let mut results = vec![CompletionResult::default(); plans.len()];
+        let mut timings = BatchDbTimings::default();
+
+        let mut batch_plans = Vec::with_capacity(plans.len());
+        let mut action_update_plan_indices = Vec::new();
+        let mut action_ids = Vec::new();
+        let mut delivery_tokens = Vec::new();
+        let mut result_payloads = Vec::new();
+        let mut pool_ids = Vec::new();
+        let mut worker_ids = Vec::new();
+
+        for (index, (instance_id, plan)) in plans.into_iter().enumerate() {
+            let CompletionPlan {
+                completed_action_id,
+                delivery_token,
+                success: _,
+                result_payload,
+                error_message: _,
+                pool_id,
+                worker_id,
+                inbox_writes,
+                readiness_resets,
+                readiness_inits,
+                readiness_increments,
+                barrier_enqueues,
+                instance_completion,
+                ..
+            } = plan;
+
+            let mut direct_increments = Vec::new();
+            let mut tracked_increments = Vec::new();
+            for increment in readiness_increments {
+                if increment.required_count == 1 && !increment.is_aggregator {
+                    direct_increments.push(increment);
+                } else {
+                    tracked_increments.push(increment);
+                }
+            }
+
+            let mut direct_nodes = HashSet::new();
+            for increment in &direct_increments {
+                direct_nodes.insert(increment.node_id.clone());
+            }
+
+            let readiness_resets: Vec<String> = readiness_resets
+                .into_iter()
+                .filter(|node_id| !direct_nodes.contains(node_id))
+                .collect();
+            let readiness_inits: Vec<_> = readiness_inits
+                .into_iter()
+                .filter(|init| !direct_nodes.contains(&init.node_id))
+                .collect();
+
+            if let (Some(action_id), Some(token)) = (completed_action_id, delivery_token) {
+                action_update_plan_indices.push(index);
+                action_ids.push(action_id.0);
+                delivery_tokens.push(token);
+                result_payloads.push(result_payload);
+                pool_ids.push(pool_id);
+                worker_ids.push(worker_id);
+            }
+
+            batch_plans.push(BatchPlan {
+                index,
+                instance_id,
+                inbox_writes,
+                readiness_resets,
+                readiness_inits,
+                direct_increments,
+                tracked_increments,
+                barrier_enqueues,
+                instance_completion,
+            });
+        }
+
+        let mut is_fresh = vec![true; batch_plans.len()];
+
+        if !action_ids.is_empty() {
+            let step_start = std::time::Instant::now();
+            let rows = sqlx::query(
+                r#"
+                WITH updates AS (
+                    SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::bytea[], $4::uuid[], $5::bigint[])
+                        WITH ORDINALITY
+                        AS u(action_id, delivery_token, result_payload, pool_id, worker_id, ord)
+                ),
+                deleted AS (
+                    DELETE FROM action_queue aq
+                    USING updates
+                    WHERE aq.id = updates.action_id
+                      AND aq.delivery_token = updates.delivery_token
+                      AND aq.status = 'dispatched'
+                    RETURNING updates.ord,
+                              aq.id,
+                              aq.instance_id,
+                              aq.attempt_number,
+                              aq.dispatched_at,
+                              aq.module_name,
+                              aq.action_name,
+                              aq.node_id,
+                              aq.dispatch_payload,
+                              aq.enqueued_at,
+                              updates.result_payload,
+                              updates.pool_id,
+                              updates.worker_id
+                ),
+                log_insert AS (
+                    INSERT INTO action_log_queue (
+                        action_id, instance_id, attempt_number, dispatched_at,
+                        completed_at, success, result_payload, error_message, duration_ms,
+                        module_name, action_name, node_id, dispatch_payload,
+                        pool_id, worker_id, enqueued_at
+                    )
+                    SELECT id, instance_id, attempt_number, dispatched_at,
+                           NOW(), true, result_payload, NULL,
+                           EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
+                           module_name, action_name, node_id, dispatch_payload,
+                           pool_id, worker_id, enqueued_at
+                    FROM deleted
+                )
+                SELECT ord FROM deleted
+                "#,
+            )
+            .bind(&action_ids)
+            .bind(&delivery_tokens)
+            .bind(&result_payloads)
+            .bind(&pool_ids)
+            .bind(&worker_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            timings.action_complete_us = step_start.elapsed().as_micros() as u64;
+
+            let mut updated = vec![false; action_update_plan_indices.len()];
+            for row in rows {
+                let ord: i64 = row.get(0);
+                if ord >= 1 {
+                    let idx = (ord - 1) as usize;
+                    if idx < updated.len() {
+                        updated[idx] = true;
+                    }
+                }
+            }
+
+            for (update_idx, plan_index) in action_update_plan_indices.iter().enumerate() {
+                if !updated[update_idx] {
+                    is_fresh[*plan_index] = false;
+                    results[*plan_index] = CompletionResult::stale();
+                }
+            }
+        }
+
+        let mut inbox_writes: Vec<InboxWrite> = Vec::new();
+        let mut readiness_resets: Vec<BatchReadinessReset> = Vec::new();
+        let mut readiness_inits: Vec<BatchReadinessInit> = Vec::new();
+        let mut direct_increments: Vec<BatchReadinessIncrement> = Vec::new();
+        let mut tracked_increments: Vec<BatchReadinessIncrement> = Vec::new();
+        let mut barrier_enqueues: Vec<BatchBarrierEnqueue> = Vec::new();
+        let mut instance_completions: Vec<BatchInstanceCompletion> = Vec::new();
+        let mut inbox_updated_at: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+
+        for plan in batch_plans.iter_mut() {
+            if !is_fresh[plan.index] {
+                continue;
+            }
+
+            inbox_writes.append(&mut plan.inbox_writes);
+            for node_id in plan.readiness_resets.drain(..) {
+                readiness_resets.push(BatchReadinessReset {
+                    instance_id: plan.instance_id,
+                    node_id,
+                });
+            }
+            for init in plan.readiness_inits.drain(..) {
+                readiness_inits.push(BatchReadinessInit {
+                    instance_id: plan.instance_id,
+                    node_id: init.node_id,
+                    required_count: init.required_count,
+                });
+            }
+            for increment in plan.direct_increments.drain(..) {
+                direct_increments.push(BatchReadinessIncrement {
+                    instance_id: plan.instance_id,
+                    plan_index: plan.index,
+                    increment,
+                });
+            }
+            for increment in plan.tracked_increments.drain(..) {
+                tracked_increments.push(BatchReadinessIncrement {
+                    instance_id: plan.instance_id,
+                    plan_index: plan.index,
+                    increment,
+                });
+            }
+            for node_id in plan.barrier_enqueues.drain(..) {
+                barrier_enqueues.push(BatchBarrierEnqueue {
+                    instance_id: plan.instance_id,
+                    plan_index: plan.index,
+                    node_id,
+                });
+            }
+            if let Some(completion) = plan.instance_completion.take() {
+                instance_completions.push(BatchInstanceCompletion {
+                    instance_id: completion.instance_id,
+                    plan_index: plan.index,
+                    result_payload: completion.result_payload,
+                });
+            }
+        }
+
+        let inbox_write_count = inbox_writes.len();
+        let readiness_reset_count = readiness_resets.len();
+        let readiness_init_count = readiness_inits.len();
+        let instance_completion_count = instance_completions.len();
+
+        if !inbox_writes.is_empty() {
+            let step_start = std::time::Instant::now();
+            let mut touch_instance_ids: HashSet<Uuid> = HashSet::new();
+            for write in &inbox_writes {
+                touch_instance_ids.insert(write.instance_id.0);
+            }
+            let mut instance_ids = Vec::with_capacity(inbox_writes.len());
+            let mut target_node_ids = Vec::with_capacity(inbox_writes.len());
+            let mut variable_names = Vec::with_capacity(inbox_writes.len());
+            let mut values = Vec::with_capacity(inbox_writes.len());
+            let mut source_node_ids = Vec::with_capacity(inbox_writes.len());
+            let mut spread_indexes: Vec<Option<i32>> = Vec::with_capacity(inbox_writes.len());
+
+            for write in inbox_writes {
+                instance_ids.push(write.instance_id.0);
+                target_node_ids.push(write.target_node_id);
+                variable_names.push(write.variable_name);
+                values.push(write.value.to_json());
+                source_node_ids.push(write.source_node_id);
+                spread_indexes.push(write.spread_index);
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO node_inputs (
+                    instance_id,
+                    target_node_id,
+                    variable_name,
+                    value,
+                    source_node_id,
+                    spread_index
+                )
+                SELECT *
+                FROM UNNEST(
+                    $1::uuid[],
+                    $2::text[],
+                    $3::text[],
+                    $4::jsonb[],
+                    $5::text[],
+                    $6::int4[]
+                )
+                "#,
+            )
+            .bind(&instance_ids)
+            .bind(&target_node_ids)
+            .bind(&variable_names)
+            .bind(&values)
+            .bind(&source_node_ids)
+            .bind(&spread_indexes)
+            .execute(&mut *tx)
+            .await?;
+
+            let touch_ids: Vec<Uuid> = touch_instance_ids.into_iter().collect();
+            let rows = sqlx::query(
+                r#"
+                UPDATE workflow_instances
+                SET inbox_updated_at = NOW()
+                WHERE id = ANY($1)
+                RETURNING id, inbox_updated_at
+                "#,
+            )
+            .bind(&touch_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+            for row in rows {
+                let id: Uuid = row.get(0);
+                let updated_at: DateTime<Utc> = row.get(1);
+                inbox_updated_at.insert(id, updated_at);
+            }
+            timings.inbox_insert_us = step_start.elapsed().as_micros() as u64;
+        }
+
+        if !readiness_resets.is_empty() {
+            let step_start = std::time::Instant::now();
+            let instance_ids: Vec<Uuid> = readiness_resets
+                .iter()
+                .map(|reset| reset.instance_id.0)
+                .collect();
+            let node_ids: Vec<String> = readiness_resets
+                .iter()
+                .map(|reset| reset.node_id.clone())
+                .collect();
+            sqlx::query(
+                r#"
+                WITH resets AS (
+                    SELECT * FROM UNNEST($1::uuid[], $2::text[]) AS r(instance_id, node_id)
+                )
+                UPDATE node_readiness nr
+                SET completed_count = 0, updated_at = NOW()
+                FROM resets
+                WHERE nr.instance_id = resets.instance_id AND nr.node_id = resets.node_id
+                "#,
+            )
+            .bind(&instance_ids)
+            .bind(&node_ids)
+            .execute(&mut *tx)
+            .await?;
+            timings.readiness_reset_us = step_start.elapsed().as_micros() as u64;
+        }
+
+        let readiness_inits = if readiness_inits.len() > 1 {
+            let mut init_map: HashMap<(Uuid, String), i32> = HashMap::new();
+            for init in readiness_inits {
+                init_map.insert((init.instance_id.0, init.node_id), init.required_count);
+            }
+            init_map
+                .into_iter()
+                .map(
+                    |((instance_id, node_id), required_count)| BatchReadinessInit {
+                        instance_id: WorkflowInstanceId(instance_id),
+                        node_id,
+                        required_count,
+                    },
+                )
+                .collect()
+        } else {
+            readiness_inits
+        };
+
+        if !readiness_inits.is_empty() {
+            let step_start = std::time::Instant::now();
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)",
+            );
+            builder.push_values(&readiness_inits, |mut row, init| {
+                row.push_bind(init.instance_id.0)
+                    .push_bind(&init.node_id)
+                    .push_bind(init.required_count)
+                    .push_bind(0i32);
+            });
+            builder.push(
+                " ON CONFLICT (instance_id, node_id) DO UPDATE SET required_count = EXCLUDED.required_count, completed_count = 0, updated_at = NOW()",
+            );
+            builder.build().execute(&mut *tx).await?;
+            timings.readiness_init_us = step_start.elapsed().as_micros() as u64;
+        }
+
+        let direct_increment_count = direct_increments.len();
+        let tracked_increment_count = tracked_increments.len();
+        let barrier_enqueue_count = barrier_enqueues.len();
+        let mut pending_enqueues: Vec<PendingEnqueue> = Vec::new();
+
+        for increment in direct_increments {
+            pending_enqueues.push(PendingEnqueue {
+                instance_id: increment.instance_id,
+                plan_index: increment.plan_index,
+                node_id: increment.increment.node_id.clone(),
+                module_name: increment
+                    .increment
+                    .module_name
+                    .clone()
+                    .unwrap_or_else(|| "__internal__".to_string()),
+                action_name: increment
+                    .increment
+                    .action_name
+                    .clone()
+                    .unwrap_or_else(|| "__barrier__".to_string()),
+                dispatch_payload: increment
+                    .increment
+                    .dispatch_payload
+                    .clone()
+                    .unwrap_or_default(),
+                timeout_seconds: increment.increment.timeout_seconds,
+                max_retries: increment.increment.max_retries,
+                backoff_kind: increment.increment.backoff_kind,
+                backoff_base_delay_ms: increment.increment.backoff_base_delay_ms,
+                node_type: increment.increment.node_type,
+                scheduled_at: increment.increment.scheduled_at,
+            });
+        }
+
+        if !tracked_increments.is_empty() {
+            let step_start = std::time::Instant::now();
+            struct AggregatedIncrement {
+                instance_id: WorkflowInstanceId,
+                node_id: String,
+                required_count: i32,
+                delta: i32,
+                plan_index: usize,
+                increment: ReadinessIncrement,
+            }
+
+            let mut aggregated: HashMap<(Uuid, String), AggregatedIncrement> = HashMap::new();
+            for increment in tracked_increments {
+                let key = (increment.instance_id.0, increment.increment.node_id.clone());
+                let entry = aggregated
+                    .entry(key)
+                    .or_insert_with(|| AggregatedIncrement {
+                        instance_id: increment.instance_id,
+                        node_id: increment.increment.node_id.clone(),
+                        required_count: increment.increment.required_count,
+                        delta: 0,
+                        plan_index: increment.plan_index,
+                        increment: increment.increment.clone(),
+                    });
+                if entry.required_count != increment.increment.required_count {
+                    tx.rollback().await?;
+                    return Err(DbError::NotFound(format!(
+                        "Readiness required_count mismatch for node {}",
+                        entry.node_id
+                    )));
+                }
+                entry.delta += 1;
+            }
+
+            let aggregated_increments: Vec<AggregatedIncrement> =
+                aggregated.into_values().collect();
+
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)",
+            );
+            builder.push_values(&aggregated_increments, |mut row, increment| {
+                row.push_bind(increment.instance_id.0)
+                    .push_bind(&increment.node_id)
+                    .push_bind(increment.required_count)
+                    .push_bind(increment.delta);
+            });
+            builder.push(
+                " ON CONFLICT (instance_id, node_id) DO UPDATE SET completed_count = node_readiness.completed_count + EXCLUDED.completed_count, updated_at = NOW() RETURNING instance_id, node_id, completed_count, required_count",
+            );
+            let rows: Vec<(Uuid, String, i32, i32)> =
+                builder.build_query_as().fetch_all(&mut *tx).await?;
+            timings.readiness_increment_us = step_start.elapsed().as_micros() as u64;
+
+            let mut aggregated_by_key: HashMap<(Uuid, String), &AggregatedIncrement> =
+                HashMap::new();
+            for increment in &aggregated_increments {
+                aggregated_by_key.insert(
+                    (increment.instance_id.0, increment.node_id.clone()),
+                    increment,
+                );
+            }
+
+            for (instance_id, node_id, completed_count, required_count) in rows {
+                if completed_count > required_count {
+                    tx.rollback().await?;
+                    return Err(DbError::NotFound(format!(
+                        "Readiness overflow for node {}: {} > {}",
+                        node_id, completed_count, required_count
+                    )));
+                }
+
+                if completed_count == required_count {
+                    let Some(increment) = aggregated_by_key.get(&(instance_id, node_id.clone()))
+                    else {
+                        tx.rollback().await?;
+                        return Err(DbError::NotFound(format!(
+                            "Missing readiness increment for node {}",
+                            node_id
+                        )));
+                    };
+
+                    pending_enqueues.push(PendingEnqueue {
+                        instance_id: increment.instance_id,
+                        plan_index: increment.plan_index,
+                        node_id: increment.node_id.clone(),
+                        module_name: increment
+                            .increment
+                            .module_name
+                            .clone()
+                            .unwrap_or_else(|| "__internal__".to_string()),
+                        action_name: increment
+                            .increment
+                            .action_name
+                            .clone()
+                            .unwrap_or_else(|| "__barrier__".to_string()),
+                        dispatch_payload: increment
+                            .increment
+                            .dispatch_payload
+                            .clone()
+                            .unwrap_or_default(),
+                        timeout_seconds: increment.increment.timeout_seconds,
+                        max_retries: increment.increment.max_retries,
+                        backoff_kind: increment.increment.backoff_kind,
+                        backoff_base_delay_ms: increment.increment.backoff_base_delay_ms,
+                        node_type: increment.increment.node_type,
+                        scheduled_at: increment.increment.scheduled_at,
+                    });
+                }
+            }
+        }
+
+        for barrier in barrier_enqueues {
+            pending_enqueues.push(PendingEnqueue {
+                instance_id: barrier.instance_id,
+                plan_index: barrier.plan_index,
+                node_id: barrier.node_id,
+                module_name: "__internal__".to_string(),
+                action_name: "__barrier__".to_string(),
+                dispatch_payload: Vec::new(),
+                timeout_seconds: 300,
+                max_retries: 3,
+                backoff_kind: BackoffKind::Exponential,
+                backoff_base_delay_ms: 1000,
+                node_type: NodeType::Barrier,
+                scheduled_at: Some(Utc::now()),
+            });
+        }
+
+        let pending_enqueue_count = pending_enqueues.len();
+        if !pending_enqueues.is_empty() {
+            let mut per_instance_counts: HashMap<Uuid, i32> = HashMap::new();
+            for enqueue in &pending_enqueues {
+                *per_instance_counts
+                    .entry(enqueue.instance_id.0)
+                    .or_insert(0) += 1;
+            }
+
+            let mut instance_ids = Vec::with_capacity(per_instance_counts.len());
+            let mut enqueue_counts = Vec::with_capacity(per_instance_counts.len());
+            for (instance_id, count) in per_instance_counts {
+                instance_ids.push(instance_id);
+                enqueue_counts.push(count);
+            }
+
+            let step_start = std::time::Instant::now();
+            let rows: Vec<(Uuid, i32, i32)> = sqlx::query_as(
+                r#"
+                WITH counts AS (
+                    SELECT * FROM UNNEST($1::uuid[], $2::int[]) AS c(instance_id, enqueue_count)
+                )
+                UPDATE workflow_instances wi
+                SET next_action_seq = next_action_seq + counts.enqueue_count
+                FROM counts
+                WHERE wi.id = counts.instance_id
+                RETURNING wi.id, wi.next_action_seq - counts.enqueue_count, wi.priority
+                "#,
+            )
+            .bind(&instance_ids)
+            .bind(&enqueue_counts)
+            .fetch_all(&mut *tx)
+            .await?;
+            timings.next_action_seq_us = step_start.elapsed().as_micros() as u64;
+
+            let mut next_seq_by_instance: HashMap<Uuid, (i32, i32)> = HashMap::new();
+            for (instance_id, start_seq, priority) in rows {
+                next_seq_by_instance.insert(instance_id, (start_seq, priority));
+            }
+
+            let default_scheduled_at = Utc::now();
+            let mut enqueue_rows = Vec::with_capacity(pending_enqueues.len());
+            for enqueue in pending_enqueues {
+                let Some((next_seq, priority)) =
+                    next_seq_by_instance.get_mut(&enqueue.instance_id.0)
+                else {
+                    tx.rollback().await?;
+                    return Err(DbError::NotFound(format!(
+                        "Missing action sequence for instance {}",
+                        enqueue.instance_id.0
+                    )));
+                };
+
+                let action_seq = *next_seq;
+                *next_seq += 1;
+
+                results[enqueue.plan_index]
+                    .newly_ready_nodes
+                    .push(enqueue.node_id.clone());
+
+                enqueue_rows.push(EnqueueRow {
+                    instance_id: enqueue.instance_id,
+                    node_id: enqueue.node_id,
+                    module_name: enqueue.module_name,
+                    action_name: enqueue.action_name,
+                    dispatch_payload: enqueue.dispatch_payload,
+                    timeout_seconds: enqueue.timeout_seconds,
+                    max_retries: enqueue.max_retries,
+                    backoff_kind: enqueue.backoff_kind,
+                    backoff_base_delay_ms: enqueue.backoff_base_delay_ms,
+                    node_type: enqueue.node_type,
+                    scheduled_at: enqueue.scheduled_at.unwrap_or(default_scheduled_at),
+                    priority: *priority,
+                    action_seq,
+                });
+            }
+
+            let step_start = std::time::Instant::now();
+            let mut instance_ids = Vec::with_capacity(enqueue_rows.len());
+            let mut action_seqs = Vec::with_capacity(enqueue_rows.len());
+            let mut module_names = Vec::with_capacity(enqueue_rows.len());
+            let mut action_names = Vec::with_capacity(enqueue_rows.len());
+            let mut dispatch_payloads = Vec::with_capacity(enqueue_rows.len());
+            let mut timeout_seconds = Vec::with_capacity(enqueue_rows.len());
+            let mut max_retries = Vec::with_capacity(enqueue_rows.len());
+            let mut backoff_kinds: Vec<&'static str> = Vec::with_capacity(enqueue_rows.len());
+            let mut backoff_base_delays = Vec::with_capacity(enqueue_rows.len());
+            let mut node_ids = Vec::with_capacity(enqueue_rows.len());
+            let mut node_types: Vec<&'static str> = Vec::with_capacity(enqueue_rows.len());
+            let mut scheduled_ats = Vec::with_capacity(enqueue_rows.len());
+            let mut priorities = Vec::with_capacity(enqueue_rows.len());
+
+            for enqueue in enqueue_rows {
+                instance_ids.push(enqueue.instance_id.0);
+                action_seqs.push(enqueue.action_seq);
+                module_names.push(enqueue.module_name);
+                action_names.push(enqueue.action_name);
+                dispatch_payloads.push(enqueue.dispatch_payload);
+                timeout_seconds.push(enqueue.timeout_seconds);
+                max_retries.push(enqueue.max_retries);
+                backoff_kinds.push(enqueue.backoff_kind.as_str());
+                backoff_base_delays.push(enqueue.backoff_base_delay_ms);
+                node_ids.push(enqueue.node_id);
+                node_types.push(enqueue.node_type.as_str());
+                scheduled_ats.push(enqueue.scheduled_at);
+                priorities.push(enqueue.priority);
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO action_queue (
+                    instance_id, action_seq, module_name, action_name,
+                    dispatch_payload, timeout_seconds, max_retries, backoff_kind,
+                    backoff_base_delay_ms, node_id, node_type, scheduled_at, priority
+                )
+                SELECT *
+                FROM UNNEST(
+                    $1::uuid[],
+                    $2::int4[],
+                    $3::text[],
+                    $4::text[],
+                    $5::bytea[],
+                    $6::int4[],
+                    $7::int4[],
+                    $8::text[],
+                    $9::int4[],
+                    $10::text[],
+                    $11::text[],
+                    $12::timestamptz[],
+                    $13::int4[]
+                )
+                "#,
+            )
+            .bind(&instance_ids)
+            .bind(&action_seqs)
+            .bind(&module_names)
+            .bind(&action_names)
+            .bind(&dispatch_payloads)
+            .bind(&timeout_seconds)
+            .bind(&max_retries)
+            .bind(&backoff_kinds)
+            .bind(&backoff_base_delays)
+            .bind(&node_ids)
+            .bind(&node_types)
+            .bind(&scheduled_ats)
+            .bind(&priorities)
+            .execute(&mut *tx)
+            .await?;
+            timings.enqueue_insert_us = step_start.elapsed().as_micros() as u64;
+        }
+
+        if !instance_completions.is_empty() {
+            let step_start = std::time::Instant::now();
+            let mut instance_ids = Vec::with_capacity(instance_completions.len());
+            let mut result_payloads = Vec::with_capacity(instance_completions.len());
+            let mut completion_indices: HashMap<Uuid, Vec<usize>> = HashMap::new();
+            for completion in instance_completions {
+                instance_ids.push(completion.instance_id.0);
+                result_payloads.push(completion.result_payload);
+                completion_indices
+                    .entry(completion.instance_id.0)
+                    .or_default()
+                    .push(completion.plan_index);
+            }
+
+            let rows = sqlx::query(
+                r#"
+                WITH updates AS (
+                    SELECT * FROM UNNEST($1::uuid[], $2::bytea[]) AS u(instance_id, result_payload)
+                )
+                UPDATE workflow_instances wi
+                SET status = 'completed',
+                    result_payload = updates.result_payload,
+                    completed_at = NOW()
+                FROM updates
+                WHERE wi.id = updates.instance_id AND wi.status = 'running'
+                RETURNING wi.id
+                "#,
+            )
+            .bind(&instance_ids)
+            .bind(&result_payloads)
+            .fetch_all(&mut *tx)
+            .await?;
+
+            for row in rows {
+                let instance_id: Uuid = row.get(0);
+                if let Some(indices) = completion_indices.get(&instance_id) {
+                    for index in indices {
+                        results[*index].workflow_completed = true;
+                    }
+                }
+            }
+            timings.instance_complete_us = step_start.elapsed().as_micros() as u64;
+        }
+
+        if !inbox_updated_at.is_empty() {
+            for plan in &batch_plans {
+                if let Some(updated_at) = inbox_updated_at.get(&plan.instance_id.0) {
+                    results[plan.index].inbox_updated_at = Some(*updated_at);
+                }
+            }
+        }
+
+        tx.commit().await?;
+        timings.total_us = total_start.elapsed().as_micros() as u64;
+
+        debug!(
+            plans = results.len(),
+            actions = action_ids.len(),
+            inbox_writes = inbox_write_count,
+            readiness_resets = readiness_reset_count,
+            readiness_inits = readiness_init_count,
+            readiness_increments = tracked_increment_count,
+            direct_enqueues = direct_increment_count,
+            barrier_enqueues = barrier_enqueue_count,
+            pending_enqueues = pending_enqueue_count,
+            instance_completions = instance_completion_count,
+            action_complete_us = timings.action_complete_us,
+            inbox_insert_us = timings.inbox_insert_us,
+            readiness_reset_us = timings.readiness_reset_us,
+            readiness_init_us = timings.readiness_init_us,
+            readiness_increment_us = timings.readiness_increment_us,
+            next_action_seq_us = timings.next_action_seq_us,
+            enqueue_insert_us = timings.enqueue_insert_us,
+            instance_complete_us = timings.instance_complete_us,
+            total_us = timings.total_us,
+            "execute_completion_plans_batch"
+        );
+
+        Ok(results)
     }
 
     /// Execute a completion plan in a single atomic transaction.
@@ -1470,30 +2648,72 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         let mut result = CompletionResult::default();
 
-        // 1. Mark the completed action as complete (idempotent guard)
-        // Also update the action log entry with completion information
-        // On success: DELETE from queue immediately (action_logs has history)
-        // On failure: UPDATE status to 'failed' so retry logic can process it
-        if let Some(action_id) = plan.completed_action_id
-            && let Some(delivery_token) = plan.delivery_token
+        let CompletionPlan {
+            completed_action_id,
+            delivery_token,
+            success,
+            result_payload,
+            error_message,
+            pool_id,
+            worker_id,
+            inbox_writes,
+            readiness_resets,
+            readiness_inits,
+            readiness_increments,
+            barrier_enqueues,
+            instance_completion,
+            ..
+        } = plan;
+
+        let mut direct_increments = Vec::new();
+        let mut tracked_increments = Vec::new();
+        for increment in readiness_increments {
+            if increment.required_count == 1 && !increment.is_aggregator {
+                direct_increments.push(increment);
+            } else {
+                tracked_increments.push(increment);
+            }
+        }
+
+        let mut direct_nodes = HashSet::new();
+        for increment in &direct_increments {
+            direct_nodes.insert(increment.node_id.clone());
+        }
+
+        let readiness_resets: Vec<String> = readiness_resets
+            .into_iter()
+            .filter(|node_id| !direct_nodes.contains(node_id))
+            .collect();
+        let readiness_inits: Vec<_> = readiness_inits
+            .into_iter()
+            .filter(|init| !direct_nodes.contains(&init.node_id))
+            .collect();
+
+        // 1. Mark the completed action as complete (idempotent guard).
+        // On success: delete action row and enqueue log entry.
+        // On failure: update status to 'failed' so retry logic can process it.
+        if let Some(action_id) = completed_action_id
+            && let Some(delivery_token) = delivery_token
         {
-            let row = if plan.success {
-                // Success: DELETE from queue immediately, INSERT log with full context
+            let row = if success {
+                // Success: delete action row and enqueue log entry.
                 sqlx::query(
                     r#"
                     WITH deleted AS (
                         DELETE FROM action_queue
                         WHERE id = $1 AND delivery_token = $2 AND status = 'dispatched'
                         RETURNING id, instance_id, attempt_number, dispatched_at,
-                                  module_name, action_name, node_id, dispatch_payload
+                                  module_name, action_name, node_id, dispatch_payload, enqueued_at
                     ),
                     log_insert AS (
-                        INSERT INTO action_logs (action_id, instance_id, attempt_number, dispatched_at,
-                                                completed_at, success, result_payload, duration_ms,
-                                                module_name, action_name, node_id, dispatch_payload)
-                        SELECT id, instance_id, attempt_number, dispatched_at, NOW(), true, $3,
+                        INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
+                                                completed_at, success, result_payload, error_message, duration_ms,
+                                                module_name, action_name, node_id, dispatch_payload,
+                                                pool_id, worker_id, enqueued_at)
+                        SELECT id, instance_id, attempt_number, dispatched_at, NOW(), true, $3, NULL,
                                EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
-                               module_name, action_name, node_id, dispatch_payload
+                               module_name, action_name, node_id, dispatch_payload,
+                               $4, $5, enqueued_at
                         FROM deleted
                     )
                     SELECT COUNT(*) FROM deleted
@@ -1501,7 +2721,9 @@ impl Database {
                 )
                 .bind(action_id.0)
                 .bind(delivery_token)
-                .bind(&plan.result_payload)
+                .bind(&result_payload)
+                .bind(pool_id)
+                .bind(worker_id)
                 .fetch_one(&mut *tx)
                 .await?
             } else {
@@ -1515,17 +2737,19 @@ impl Database {
                             result_payload = $3,
                             last_error = $4,
                             completed_at = NOW()
-                        WHERE id = $1 AND delivery_token = $5 AND status = 'dispatched'
+                        WHERE id = $1 AND delivery_token = $2 AND status = 'dispatched'
                         RETURNING id, instance_id, attempt_number, dispatched_at,
-                                  module_name, action_name, node_id, dispatch_payload
+                                  module_name, action_name, node_id, dispatch_payload, enqueued_at
                     ),
                     log_insert AS (
-                        INSERT INTO action_logs (action_id, instance_id, attempt_number, dispatched_at,
+                        INSERT INTO action_log_queue (action_id, instance_id, attempt_number, dispatched_at,
                                                 completed_at, success, result_payload, error_message, duration_ms,
-                                                module_name, action_name, node_id, dispatch_payload)
+                                                module_name, action_name, node_id, dispatch_payload,
+                                                pool_id, worker_id, enqueued_at)
                         SELECT id, instance_id, attempt_number, dispatched_at, NOW(), false, $3, $4,
                                EXTRACT(EPOCH FROM (NOW() - dispatched_at)) * 1000,
-                               module_name, action_name, node_id, dispatch_payload
+                               module_name, action_name, node_id, dispatch_payload,
+                               $5, $6, enqueued_at
                         FROM updated
                     )
                     SELECT COUNT(*) FROM updated
@@ -1533,23 +2757,23 @@ impl Database {
                 )
                 .bind(action_id.0)
                 .bind(delivery_token)
-                .bind(&plan.result_payload)
-                .bind(&plan.error_message)
-                .bind(delivery_token)
+                .bind(&result_payload)
+                .bind(&error_message)
+                .bind(pool_id)
+                .bind(worker_id)
                 .fetch_one(&mut *tx)
                 .await?
             };
 
             let count: i64 = row.get(0);
             if count == 0 {
-                // Stale or duplicate completion - roll back
-                tx.rollback().await?;
+                // Stale or duplicate completion
                 return Ok(CompletionResult::stale());
             }
         }
 
         // 2. Write inbox entries for all frontier nodes
-        for write in &plan.inbox_writes {
+        for write in &inbox_writes {
             if write.variable_name == "__loop_loop_8_i" {
                 debug!(
                     target_node_id = %write.target_node_id,
@@ -1559,198 +2783,228 @@ impl Database {
                     "DB writing __loop_loop_8_i to inbox"
                 );
             }
-            sqlx::query(
+        }
+        if !inbox_writes.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO node_inputs (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)",
+            );
+            builder.push_values(&inbox_writes, |mut row, write| {
+                row.push_bind(instance_id.0)
+                    .push_bind(&write.target_node_id)
+                    .push_bind(&write.variable_name)
+                    .push_bind(write.value.to_json())
+                    .push_bind(&write.source_node_id)
+                    .push_bind(write.spread_index);
+            });
+            builder.build().execute(&mut *tx).await?;
+
+            let row = sqlx::query(
                 r#"
-                INSERT INTO node_inputs
-                    (instance_id, target_node_id, variable_name, value, source_node_id, spread_index)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (instance_id, target_node_id, variable_name, COALESCE(spread_index, -1))
-                DO UPDATE SET value = EXCLUDED.value, source_node_id = EXCLUDED.source_node_id, created_at = NOW()
+                UPDATE workflow_instances
+                SET inbox_updated_at = NOW()
+                WHERE id = $1
+                RETURNING inbox_updated_at
                 "#,
             )
             .bind(instance_id.0)
-            .bind(&write.target_node_id)
-            .bind(&write.variable_name)
-            .bind(write.value.to_json())
-            .bind(&write.source_node_id)
-            .bind(write.spread_index)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
+            if let Some(row) = row {
+                let updated_at: DateTime<Utc> = row.get(0);
+                result.inbox_updated_at = Some(updated_at);
+            }
         }
 
         // 2.5. Reset readiness for loop re-triggering (before increments)
-        for node_id in &plan.readiness_resets {
+        if !readiness_resets.is_empty() {
             sqlx::query(
                 r#"
                 UPDATE node_readiness
                 SET completed_count = 0, updated_at = NOW()
-                WHERE instance_id = $1 AND node_id = $2
+                WHERE instance_id = $1 AND node_id = ANY($2)
                 "#,
             )
             .bind(instance_id.0)
-            .bind(node_id)
+            .bind(&readiness_resets)
             .execute(&mut *tx)
             .await?;
         }
 
         // 2.75. Initialize readiness for frontier nodes (before increments)
-        for init in &plan.readiness_inits {
-            sqlx::query(
-                r#"
-                INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)
-                VALUES ($1, $2, $3, 0)
-                ON CONFLICT (instance_id, node_id)
-                DO UPDATE SET required_count = EXCLUDED.required_count,
-                              completed_count = 0,
-                              updated_at = NOW()
-                "#,
-            )
-            .bind(instance_id.0)
-            .bind(&init.node_id)
-            .bind(init.required_count)
-            .execute(&mut *tx)
-            .await?;
+        if !readiness_inits.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)",
+            );
+            builder.push_values(&readiness_inits, |mut row, init| {
+                row.push_bind(instance_id.0)
+                    .push_bind(&init.node_id)
+                    .push_bind(init.required_count)
+                    .push_bind(0i32);
+            });
+            builder.push(
+                " ON CONFLICT (instance_id, node_id) DO UPDATE SET required_count = EXCLUDED.required_count, completed_count = 0, updated_at = NOW()",
+            );
+            builder.build().execute(&mut *tx).await?;
+        }
+
+        #[derive(Debug)]
+        struct PendingEnqueue {
+            node_id: String,
+            module_name: String,
+            action_name: String,
+            dispatch_payload: Vec<u8>,
+            timeout_seconds: i32,
+            max_retries: i32,
+            backoff_kind: BackoffKind,
+            backoff_base_delay_ms: i32,
+            node_type: crate::completion::NodeType,
+            scheduled_at: Option<DateTime<Utc>>,
+        }
+
+        let mut pending_enqueues: Vec<PendingEnqueue> = Vec::new();
+
+        for increment in &direct_increments {
+            pending_enqueues.push(PendingEnqueue {
+                node_id: increment.node_id.clone(),
+                module_name: increment
+                    .module_name
+                    .clone()
+                    .unwrap_or_else(|| "__internal__".to_string()),
+                action_name: increment
+                    .action_name
+                    .clone()
+                    .unwrap_or_else(|| "__barrier__".to_string()),
+                dispatch_payload: increment.dispatch_payload.clone().unwrap_or_default(),
+                timeout_seconds: increment.timeout_seconds,
+                max_retries: increment.max_retries,
+                backoff_kind: increment.backoff_kind,
+                backoff_base_delay_ms: increment.backoff_base_delay_ms,
+                node_type: increment.node_type,
+                scheduled_at: increment.scheduled_at,
+            });
         }
 
         // 3. Increment readiness for frontier nodes, enqueue if ready
-        for increment in &plan.readiness_increments {
-            let row = sqlx::query(
-                r#"
-                INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)
-                VALUES ($1, $2, $3, 1)
-                ON CONFLICT (instance_id, node_id)
-                DO UPDATE SET completed_count = node_readiness.completed_count + 1,
-                              updated_at = NOW()
-                RETURNING completed_count, required_count
-                "#,
-            )
-            .bind(instance_id.0)
-            .bind(&increment.node_id)
-            .bind(increment.required_count)
-            .fetch_one(&mut *tx)
-            .await?;
-
-            let completed_count: i32 = row.get(0);
-            let required_count: i32 = row.get(1);
-
-            debug!(
-                node_id = %increment.node_id,
-                completed_count = completed_count,
-                required_count = required_count,
-                "incremented node readiness"
+        if !tracked_increments.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO node_readiness (instance_id, node_id, required_count, completed_count)",
             );
+            builder.push_values(&tracked_increments, |mut row, increment| {
+                row.push_bind(instance_id.0)
+                    .push_bind(&increment.node_id)
+                    .push_bind(increment.required_count)
+                    .push_bind(1i32);
+            });
+            builder.push(
+                " ON CONFLICT (instance_id, node_id) DO UPDATE SET completed_count = node_readiness.completed_count + 1, updated_at = NOW() RETURNING node_id, completed_count, required_count",
+            );
+            let rows: Vec<(String, i32, i32)> =
+                builder.build_query_as().fetch_all(&mut *tx).await?;
 
-            // Check for overflow (indicates a bug)
-            if completed_count > required_count {
-                tx.rollback().await?;
-                return Err(DbError::NotFound(format!(
-                    "Readiness overflow for node {}: {} > {}",
-                    increment.node_id, completed_count, required_count
-                )));
+            let mut increment_by_node: HashMap<String, &crate::completion::ReadinessIncrement> =
+                HashMap::new();
+            for increment in &tracked_increments {
+                increment_by_node.insert(increment.node_id.clone(), increment);
             }
 
-            let is_immediately_ready = completed_count == required_count;
+            for (node_id, completed_count, required_count) in rows {
+                // Check for overflow (indicates a bug)
+                if completed_count > required_count {
+                    tx.rollback().await?;
+                    return Err(DbError::NotFound(format!(
+                        "Readiness overflow for node {}: {} > {}",
+                        node_id, completed_count, required_count
+                    )));
+                }
 
-            // If this increment made the node ready, enqueue it
-            if is_immediately_ready {
-                // Get the next action_seq for this instance
-                let seq_row = sqlx::query(
-                    r#"
-                    UPDATE workflow_instances
-                    SET next_action_seq = next_action_seq + 1
-                    WHERE id = $1
-                    RETURNING next_action_seq - 1
-                    "#,
-                )
-                .bind(instance_id.0)
-                .fetch_one(&mut *tx)
-                .await?;
-                let action_seq: i32 = seq_row.get(0);
-
-                // Enqueue the node based on its type
-                sqlx::query(
-                    r#"
-                    INSERT INTO action_queue
-                        (instance_id, action_seq, module_name, action_name,
-                         dispatch_payload, timeout_seconds, max_retries,
-                         backoff_kind, backoff_base_delay_ms, node_id, node_type,
-                         scheduled_at, priority)
-                    SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, COALESCE($12, NOW()), wi.priority
-                    FROM workflow_instances wi
-                    WHERE wi.id = $1
-                    "#,
-                )
-                .bind(instance_id.0)
-                .bind(action_seq)
-                .bind(increment.module_name.as_deref().unwrap_or("__internal__"))
-                .bind(increment.action_name.as_deref().unwrap_or("__barrier__"))
-                .bind(increment.dispatch_payload.as_deref().unwrap_or(&[]))
-                .bind(increment.timeout_seconds)
-                .bind(increment.max_retries)
-                .bind(increment.backoff_kind.as_str())
-                .bind(increment.backoff_base_delay_ms)
-                .bind(&increment.node_id)
-                .bind(increment.node_type.as_str())
-                .bind(increment.scheduled_at)
-                .execute(&mut *tx)
-                .await?;
-
-                result.newly_ready_nodes.push(increment.node_id.clone());
-
-                debug!(
-                    node_id = %increment.node_id,
-                    node_type = %increment.node_type.as_str(),
-                    action_seq = action_seq,
-                    "enqueued ready node"
-                );
+                if completed_count == required_count
+                    && let Some(increment) = increment_by_node.get(&node_id)
+                {
+                    pending_enqueues.push(PendingEnqueue {
+                        node_id: increment.node_id.clone(),
+                        module_name: increment
+                            .module_name
+                            .clone()
+                            .unwrap_or_else(|| "__internal__".to_string()),
+                        action_name: increment
+                            .action_name
+                            .clone()
+                            .unwrap_or_else(|| "__barrier__".to_string()),
+                        dispatch_payload: increment.dispatch_payload.clone().unwrap_or_default(),
+                        timeout_seconds: increment.timeout_seconds,
+                        max_retries: increment.max_retries,
+                        backoff_kind: increment.backoff_kind,
+                        backoff_base_delay_ms: increment.backoff_base_delay_ms,
+                        node_type: increment.node_type,
+                        scheduled_at: increment.scheduled_at,
+                    });
+                }
             }
         }
 
         // 3.5. Enqueue barriers directly (no readiness tracking)
-        for node_id in &plan.barrier_enqueues {
-            let seq_row = sqlx::query(
+        for node_id in &barrier_enqueues {
+            pending_enqueues.push(PendingEnqueue {
+                node_id: node_id.clone(),
+                module_name: "__internal__".to_string(),
+                action_name: "__barrier__".to_string(),
+                dispatch_payload: Vec::new(),
+                timeout_seconds: 300,
+                max_retries: 3,
+                backoff_kind: BackoffKind::Exponential,
+                backoff_base_delay_ms: 1000,
+                node_type: crate::completion::NodeType::Barrier,
+                scheduled_at: Some(Utc::now()),
+            });
+        }
+
+        if !pending_enqueues.is_empty() {
+            let row = sqlx::query(
                 r#"
                 UPDATE workflow_instances
-                SET next_action_seq = next_action_seq + 1
+                SET next_action_seq = next_action_seq + $2
                 WHERE id = $1
-                RETURNING next_action_seq - 1
+                RETURNING next_action_seq - $2, priority
                 "#,
             )
             .bind(instance_id.0)
+            .bind(pending_enqueues.len() as i32)
             .fetch_one(&mut *tx)
             .await?;
-            let action_seq: i32 = seq_row.get(0);
+            let mut next_action_seq: i32 = row.get(0);
+            let priority: i32 = row.get(1);
+            let default_scheduled_at = Utc::now();
 
-            sqlx::query(
-                r#"
-                INSERT INTO action_queue
-                    (instance_id, action_seq, module_name, action_name,
-                     dispatch_payload, timeout_seconds, max_retries,
-                     backoff_kind, backoff_base_delay_ms, node_id, node_type,
-                     scheduled_at, priority)
-                SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'barrier', NOW(), wi.priority
-                FROM workflow_instances wi
-                WHERE wi.id = $1
-                "#,
-            )
-            .bind(instance_id.0)
-            .bind(action_seq)
-            .bind("__internal__")
-            .bind("__barrier__")
-            .bind(Vec::<u8>::new())
-            .bind(300)
-            .bind(3)
-            .bind("exponential")
-            .bind(1000)
-            .bind(node_id)
-            .execute(&mut *tx)
-            .await?;
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "INSERT INTO action_queue (instance_id, action_seq, module_name, action_name, dispatch_payload, timeout_seconds, max_retries, backoff_kind, backoff_base_delay_ms, node_id, node_type, scheduled_at, priority)",
+            );
+            builder.push_values(&pending_enqueues, |mut row, enqueue| {
+                let action_seq = next_action_seq;
+                next_action_seq += 1;
+                let scheduled_at = enqueue.scheduled_at.unwrap_or(default_scheduled_at);
+                row.push_bind(instance_id.0)
+                    .push_bind(action_seq)
+                    .push_bind(&enqueue.module_name)
+                    .push_bind(&enqueue.action_name)
+                    .push_bind(&enqueue.dispatch_payload)
+                    .push_bind(enqueue.timeout_seconds)
+                    .push_bind(enqueue.max_retries)
+                    .push_bind(enqueue.backoff_kind.as_str())
+                    .push_bind(enqueue.backoff_base_delay_ms)
+                    .push_bind(&enqueue.node_id)
+                    .push_bind(enqueue.node_type.as_str())
+                    .push_bind(scheduled_at)
+                    .push_bind(priority);
+            });
+            builder.build().execute(&mut *tx).await?;
 
-            result.newly_ready_nodes.push(node_id.clone());
+            for enqueue in &pending_enqueues {
+                result.newly_ready_nodes.push(enqueue.node_id.clone());
+            }
         }
 
         // 4. Complete workflow instance if output node was reached
-        if let Some(completion) = &plan.instance_completion {
+        if let Some(completion) = &instance_completion {
             let rows = sqlx::query(
                 r#"
                 UPDATE workflow_instances
@@ -1778,12 +3032,13 @@ impl Database {
         // 5. Commit the transaction
         tx.commit().await?;
 
-        tracing::info!(
+        tracing::debug!(
             elapsed_ms = start.elapsed().as_millis() as u64,
-            inbox_writes = plan.inbox_writes.len(),
-            readiness_inits = plan.readiness_inits.len(),
-            readiness_increments = plan.readiness_increments.len(),
-            barrier_enqueues = plan.barrier_enqueues.len(),
+            inbox_writes = inbox_writes.len(),
+            readiness_inits = readiness_inits.len(),
+            readiness_increments = tracked_increments.len(),
+            direct_enqueues = direct_increments.len(),
+            barrier_enqueues = barrier_enqueues.len(),
             "execute_completion_plan"
         );
 
@@ -2098,8 +3353,8 @@ impl Database {
 
     /// Calculate median timing metrics for workers from action_logs.
     ///
-    /// Returns median dequeue time (dispatched_at - enqueued_at) and median handling time
-    /// (completed_at - enqueued_at) for each worker in the pool over the given time window.
+    /// Returns median dequeue time (dispatched_at - enqueued_at) and median execution time
+    /// (completed_at - dispatched_at) for each worker in the pool over the given time window.
     pub async fn calculate_worker_median_times(
         &self,
         pool_id: Uuid,
@@ -2113,12 +3368,16 @@ impl Database {
                     ORDER BY EXTRACT(EPOCH FROM (dispatched_at - enqueued_at)) * 1000
                 )::BIGINT as median_dequeue_ms,
                 PERCENTILE_CONT(0.5) WITHIN GROUP (
-                    ORDER BY EXTRACT(EPOCH FROM (completed_at - enqueued_at)) * 1000
+                    ORDER BY COALESCE(
+                        duration_ms::DOUBLE PRECISION,
+                        EXTRACT(EPOCH FROM (completed_at - dispatched_at)) * 1000
+                    )
                 )::BIGINT as median_handling_ms
             FROM action_logs
             WHERE pool_id = $1
               AND worker_id IS NOT NULL
               AND enqueued_at IS NOT NULL
+              AND dispatched_at IS NOT NULL
               AND completed_at IS NOT NULL
               AND completed_at >= NOW() - ($2 || ' seconds')::interval
             GROUP BY worker_id
@@ -2199,8 +3458,13 @@ impl Database {
         let count = ids.len() as i64;
 
         // Step 2: Delete from child tables using the collected IDs
-        // Delete action_logs first (references action_queue)
+        // Delete action logs first (references action_queue)
         sqlx::query("DELETE FROM action_logs WHERE instance_id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM action_log_queue WHERE instance_id = ANY($1)")
             .bind(&ids)
             .execute(&mut *tx)
             .await?;

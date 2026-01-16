@@ -59,15 +59,32 @@ async fn main() -> Result<()> {
     );
 
     // Connect to database
-    let database = Arc::new(Database::connect(&config.database_url).await?);
+    let database = Arc::new(
+        Database::connect_with_pool_size(&config.database_url, config.db_max_connections).await?,
+    );
     info!("connected to database");
+
+    let webapp_database = if config.webapp.enabled {
+        Some(Arc::new(
+            Database::connect_with_pool_size(
+                &config.database_url,
+                config.webapp.db_max_connections,
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
 
     // Start worker bridge server
     let worker_bridge = WorkerBridgeServer::start(Some(config.worker_grpc_addr)).await?;
     info!(addr = %worker_bridge.addr(), "worker bridge started");
 
     // Start webapp server if enabled
-    let webapp_server = WebappServer::start(config.webapp.clone(), Arc::clone(&database)).await?;
+    let webapp_server = match webapp_database {
+        Some(db) => WebappServer::start(config.webapp.clone(), db).await?,
+        None => WebappServer::start(config.webapp.clone(), Arc::clone(&database)).await?,
+    };
 
     // Configure Python workers
     let mut worker_config = PythonWorkerConfig::new();
@@ -93,6 +110,7 @@ async fn main() -> Result<()> {
     // Configure and create DAG runner
     let runner_config = RunnerConfig {
         batch_size: config.batch_size as usize,
+        enable_metrics: false,
         max_slots_per_worker: config.concurrent_per_worker,
         poll_interval_ms: config.poll_interval_ms,
         timeout_check_interval_ms: config.timeout_check_interval_ms,
@@ -100,9 +118,17 @@ async fn main() -> Result<()> {
         schedule_check_interval_ms: config.schedule_check_interval_ms,
         schedule_check_batch_size: config.schedule_check_batch_size,
         worker_status_interval_ms: config.worker_status_interval_ms,
+        action_log_flush_interval_ms: 200,
+        action_log_flush_batch_size: 1000,
+        completion_batch_size: 1,
+        completion_flush_interval_ms: 1,
         gc_interval_ms: config.gc.interval_ms,
         gc_retention_seconds: config.gc.retention_seconds,
         gc_batch_size: config.gc.batch_size,
+        start_claim_timeout_ms: config.start_claim_timeout_ms,
+        inbox_compaction_interval_ms: config.inbox_compaction.interval_ms,
+        inbox_compaction_batch_size: config.inbox_compaction.batch_size,
+        inbox_compaction_min_age_seconds: config.inbox_compaction.min_age_seconds,
     };
 
     let runner = Arc::new(DAGRunner::new(
