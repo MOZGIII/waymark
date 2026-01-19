@@ -12,7 +12,18 @@ from dataclasses import dataclass
 from datetime import timedelta
 from functools import wraps
 from threading import RLock
-from typing import Any, Awaitable, ClassVar, Optional, TypeVar
+from types import UnionType
+from typing import (
+    Any,
+    Awaitable,
+    ClassVar,
+    Optional,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 
 from proto import ast_pb2 as ir
 from proto import messages_pb2 as pb2
@@ -22,7 +33,7 @@ from .actions import deserialize_result_payload
 from .ir_builder import build_workflow_ir
 from .logger import configure as configure_logger
 from .serialization import build_arguments_from_kwargs
-from .workflow_runtime import WorkflowNodeResult
+from .workflow_runtime import WorkflowNodeResult, _coerce_value
 
 logger = configure_logger("rappel.workflow")
 
@@ -203,8 +214,16 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
         **kwargs: Any,
     ) -> Any:
         if _running_under_pytest():
-            cls.workflow_ir()
-            return await run_impl(self, *args, **kwargs)
+            logger.debug(
+                "pytest run: workflow=%s in_memory=%s",
+                cls.short_name(),
+                os.environ.get("RAPPEL_BRIDGE_IN_MEMORY"),
+            )
+            _enable_in_memory_broker()
+            initial_context = cls._build_initial_context(args, kwargs)
+            payload = cls._build_registration_payload(initial_context, priority=_priority)
+            result_bytes = await bridge.execute_workflow(payload.SerializeToString())
+            return _deserialize_workflow_result(cls, result_bytes)
 
         initial_context = cls._build_initial_context(args, kwargs)
 
@@ -229,27 +248,7 @@ def workflow(cls: type[TWorkflow]) -> type[TWorkflow]:
             raise TimeoutError(
                 f"workflow instance {run_result.workflow_instance_id} did not complete"
             )
-        arguments = pb2.WorkflowArguments()
-        arguments.ParseFromString(result_bytes)
-        result = deserialize_result_payload(arguments)
-        if result.error:
-            raise RuntimeError(f"workflow failed: {result.error}")
-
-        # Unwrap WorkflowNodeResult if present (internal worker representation)
-        if isinstance(result.result, WorkflowNodeResult):
-            # Extract the actual result from the variables dict
-            variables = result.result.variables
-            program = cls.workflow_ir()
-            # Get the return variable from the IR if available
-            if program.functions:
-                outputs = list(program.functions[0].io.outputs)
-                if outputs:
-                    return_var = outputs[0]
-                    if return_var in variables:
-                        return variables[return_var]
-            return None
-
-        return result.result
+        return _deserialize_workflow_result(cls, result_bytes)
 
     cls.__workflow_run_impl__ = run_impl
     cls.run = run_public  # type: ignore[assignment]
@@ -266,3 +265,74 @@ def _skip_wait_for_instance() -> bool:
     if not value:
         return False
     return value.strip().lower() not in {"0", "false", "no"}
+
+
+def _enable_in_memory_broker() -> None:
+    os.environ.setdefault("RAPPEL_BRIDGE_IN_MEMORY", "1")
+
+
+def _deserialize_workflow_result(
+    workflow_cls: type[Workflow],
+    result_bytes: bytes,
+) -> Any:
+    arguments = pb2.WorkflowArguments()
+    arguments.ParseFromString(result_bytes)
+    result = deserialize_result_payload(arguments)
+    if result.error:
+        raise RuntimeError(f"workflow failed: {result.error}")
+
+    # Unwrap WorkflowNodeResult if present (internal worker representation)
+    if isinstance(result.result, WorkflowNodeResult):
+        # Extract the actual result from the variables dict
+        variables = result.result.variables
+        program = workflow_cls.workflow_ir()
+        # Get the return variable from the IR if available
+        if program.functions:
+            outputs = list(program.functions[0].io.outputs)
+            if outputs:
+                return_var = outputs[0]
+                if return_var in variables:
+                    return variables[return_var]
+        return None
+
+    value = result.result
+    target_type = _resolve_return_type(workflow_cls)
+    if target_type is None:
+        return value
+    return _coerce_result_value(value, target_type)
+
+
+def _resolve_return_type(workflow_cls: type[Workflow]) -> Optional[type]:
+    try:
+        run_impl = workflow_cls.__workflow_run_impl__  # type: ignore[attr-defined]
+    except AttributeError:
+        run_impl = workflow_cls.run
+    try:
+        type_hints = get_type_hints(run_impl)
+    except Exception:
+        return None
+    target_type = type_hints.get("return")
+    if target_type is None or target_type is Any:
+        return None
+    return target_type
+
+
+def _coerce_result_value(value: Any, target_type: type) -> Any:
+    origin = get_origin(target_type)
+    if origin is UnionType or origin is Union:
+        for arg in get_args(target_type):
+            if arg is type(None) and value is None:
+                return None
+            try:
+                coerced = _coerce_value(value, arg)
+            except Exception:
+                continue
+            if coerced is not value:
+                return coerced
+            if isinstance(arg, type) and isinstance(value, arg):
+                return value
+        return value
+    try:
+        return _coerce_value(value, target_type)
+    except Exception:
+        return value
