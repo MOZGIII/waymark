@@ -42,7 +42,7 @@
 //! - If a runner crashes, its instances become orphaned after the lease expires
 //! - Other runners will pick up orphaned instances automatically
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -57,7 +57,9 @@ use uuid::Uuid;
 use crate::ast_evaluator::ExpressionEvaluator;
 use crate::dag::{DAG, DAGConverter, DAGNode};
 use crate::dag_state::DAGHelper;
-use crate::db::{ClaimedInstance, Database, WorkflowInstanceId, WorkflowVersionId};
+use crate::db::{
+    ClaimedInstance, Database, WorkerStatusUpdate, WorkflowInstanceId, WorkflowVersionId,
+};
 use crate::execution_graph::{Completion, ExecutionState, SLEEP_WORKER_ID};
 use crate::messages::execution::{ExecutionNode, NodeStatus};
 use crate::messages::proto;
@@ -75,7 +77,7 @@ pub const DEFAULT_LEASE_SECONDS: i64 = 60;
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Default batch size for claiming instances
-pub const DEFAULT_CLAIM_BATCH_SIZE: i32 = 10;
+pub const DEFAULT_CLAIM_BATCH_SIZE: i32 = 50;
 
 /// Default completion batch size
 pub const DEFAULT_COMPLETION_BATCH_SIZE: usize = 100;
@@ -123,27 +125,39 @@ pub type InstanceRunnerResult<T> = Result<T, InstanceRunnerError>;
 pub struct InstanceRunnerConfig {
     /// Unique identifier for this runner (used as owner_id)
     pub runner_id: String,
+    /// Unique identifier for the worker pool (used for status reporting)
+    pub pool_id: Uuid,
     /// Lease duration in seconds
     pub lease_seconds: i64,
     /// Heartbeat interval
     pub heartbeat_interval: Duration,
-    /// Max instances to claim per batch
+    /// Max instances to claim per DB query (to avoid starving worker pool)
     pub claim_batch_size: i32,
+    /// Max instances this runner can hold concurrently
+    pub max_concurrent_instances: usize,
     /// Max completions to batch before persisting
     pub completion_batch_size: usize,
     /// How long to wait if no work is available
     pub idle_poll_interval: Duration,
+    /// Interval for reporting worker status to DB
+    pub status_report_interval: Duration,
 }
+
+/// Default max concurrent instances
+pub const DEFAULT_MAX_CONCURRENT_INSTANCES: usize = 100;
 
 impl Default for InstanceRunnerConfig {
     fn default() -> Self {
         Self {
             runner_id: Uuid::new_v4().to_string(),
+            pool_id: Uuid::new_v4(),
             lease_seconds: DEFAULT_LEASE_SECONDS,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
             claim_batch_size: DEFAULT_CLAIM_BATCH_SIZE,
+            max_concurrent_instances: DEFAULT_MAX_CONCURRENT_INSTANCES,
             completion_batch_size: DEFAULT_COMPLETION_BATCH_SIZE,
             idle_poll_interval: Duration::from_millis(100),
+            status_report_interval: Duration::from_secs(5),
         }
     }
 }
@@ -179,6 +193,21 @@ struct WorkerCompletion {
     worker_idx: usize,
 }
 
+/// An action queued for dispatch to a worker.
+/// Actions are collected from ready nodes and dispatched in FIFO order.
+#[derive(Debug)]
+struct QueuedAction {
+    instance_id: Uuid,
+    node_id: String,
+    module_name: String,
+    action_name: String,
+    inputs: proto::WorkflowArguments,
+    inputs_bytes: Option<Vec<u8>>,
+    timeout_seconds: u32,
+    max_retries: u32,
+    attempt_number: u32,
+}
+
 /// The instance-local runner
 pub struct InstanceRunner {
     config: InstanceRunnerConfig,
@@ -190,6 +219,11 @@ pub struct InstanceRunner {
 
     /// Cached DAGs by version ID
     dag_cache: RwLock<HashMap<Uuid, Arc<DAG>>>,
+
+    /// FIFO queue of actions ready to be dispatched to workers.
+    /// Actions are enqueued when nodes become ready, and dequeued
+    /// based on worker capacity.
+    dispatch_queue: Mutex<VecDeque<QueuedAction>>,
 
     /// Shutdown signal
     shutdown: AtomicBool,
@@ -225,6 +259,7 @@ impl InstanceRunner {
             worker_pool,
             active_instances: RwLock::new(HashMap::new()),
             dag_cache: RwLock::new(HashMap::new()),
+            dispatch_queue: Mutex::new(VecDeque::new()),
             shutdown: AtomicBool::new(false),
             metrics: Mutex::new(InstanceRunnerMetrics::default()),
             completion_tx,
@@ -257,6 +292,9 @@ impl InstanceRunner {
         // Spawn heartbeat task
         let heartbeat_handle = self.spawn_heartbeat_task();
 
+        // Spawn status reporting task
+        let status_handle = self.spawn_status_report_task();
+
         // Main loop
         loop {
             if self.is_shutdown() {
@@ -273,15 +311,19 @@ impl InstanceRunner {
             // 3. Check for durable sleep wakeups
             self.process_sleeping_nodes().await?;
 
-            // 4. Dispatch ready work to workers
-            self.dispatch_ready_work().await?;
+            // 4. Collect ready actions from instances → enqueue to dispatch queue
+            self.collect_ready_actions().await?;
 
-            // 5. Process completed instances
+            // 5. Dispatch from queue: dequeue → mark running → sync DB → send to workers
+            self.dispatch_from_queue().await?;
+
+            // 6. Process completed instances
             self.finalize_completed_instances().await?;
 
             // Small sleep to avoid tight loop when idle
             let active_count = self.active_instances.read().await.len();
-            if active_count == 0 {
+            let queue_size = self.dispatch_queue.lock().await.len();
+            if active_count == 0 && queue_size == 0 {
                 tokio::time::sleep(self.config.idle_poll_interval).await;
             } else {
                 // Brief yield to allow other tasks to run
@@ -289,8 +331,9 @@ impl InstanceRunner {
             }
         }
 
-        // Cancel heartbeat task
+        // Cancel background tasks
         heartbeat_handle.abort();
+        status_handle.abort();
 
         // Release all owned instances
         self.release_all_instances().await?;
@@ -382,6 +425,7 @@ impl InstanceRunner {
                     error_type: None,
                     worker_id: SLEEP_WORKER_ID.to_string(),
                     duration_ms,
+                    worker_duration_ms: Some(duration_ms), // Sleep duration is the actual execution time
                 });
             }
 
@@ -433,24 +477,115 @@ impl InstanceRunner {
         })
     }
 
-    /// Claim new instances from the database
+    /// Spawn the worker status report background task.
+    ///
+    /// Periodically reports worker pool metrics to the database including:
+    /// - Per-worker throughput and completion counts
+    /// - Dispatch queue size (pool-level)
+    /// - Total in-flight actions (pool-level)
+    fn spawn_status_report_task(&self) -> tokio::task::JoinHandle<()> {
+        let db = self.db.clone();
+        let pool_id = self.config.pool_id;
+        let status_interval = self.config.status_report_interval;
+        let worker_pool = Arc::clone(&self.worker_pool);
+        let dispatch_queue = &self.dispatch_queue as *const Mutex<VecDeque<QueuedAction>>;
+        let shutdown = &self.shutdown as *const AtomicBool;
+
+        // Safety: We know self lives as long as the returned handle
+        let shutdown_ptr = unsafe { &*shutdown };
+        let dispatch_queue_ptr = unsafe { &*dispatch_queue };
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(status_interval);
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                if shutdown_ptr.load(Ordering::SeqCst) {
+                    break;
+                }
+
+                // Get dispatch queue size
+                let dispatch_queue_size = dispatch_queue_ptr.lock().await.len() as i64;
+
+                // Get total in-flight from worker pool
+                let total_in_flight = worker_pool.total_in_flight() as i64;
+
+                // Get per-worker throughput snapshots
+                let snapshots = worker_pool.throughput_snapshots();
+
+                // Convert to WorkerStatusUpdate
+                let statuses: Vec<WorkerStatusUpdate> = snapshots
+                    .into_iter()
+                    .map(|snapshot| WorkerStatusUpdate {
+                        worker_id: snapshot.worker_id as i64,
+                        throughput_per_min: snapshot.throughput_per_min,
+                        total_completed: snapshot.total_completed as i64,
+                        last_action_at: snapshot.last_action_at,
+                        median_dequeue_ms: None, // TODO: track dequeue latency
+                        median_handling_ms: None, // TODO: track handling latency
+                        dispatch_queue_size,
+                        total_in_flight,
+                    })
+                    .collect();
+
+                if !statuses.is_empty() {
+                    match db.upsert_worker_statuses(pool_id, &statuses).await {
+                        Ok(()) => {
+                            debug!(
+                                worker_count = statuses.len(),
+                                dispatch_queue_size, total_in_flight, "Reported worker status"
+                            );
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to report worker status");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    /// Claim new instances from the database.
+    ///
+    /// Loops claiming batches until we reach `max_concurrent_instances` or
+    /// no more instances are available. Each batch is limited to
+    /// `min(spots_available, claim_batch_size)` to avoid long DB queries
+    /// that could starve the worker pool.
     async fn claim_instances(&self) -> InstanceRunnerResult<()> {
-        let current_count = self.active_instances.read().await.len();
-        let capacity = self.config.claim_batch_size as usize;
+        loop {
+            let current_count = self.active_instances.read().await.len();
+            let max_instances = self.config.max_concurrent_instances;
 
-        if current_count >= capacity {
-            return Ok(());
-        }
+            if current_count >= max_instances {
+                break;
+            }
 
-        let to_claim = (capacity - current_count) as i32;
-        let claimed = self
-            .db
-            .claim_instances_batch(&self.config.runner_id, self.config.lease_seconds, to_claim)
-            .await?;
+            let spots_available = max_instances - current_count;
+            let batch_size = self.config.claim_batch_size as usize;
+            let to_claim = spots_available.min(batch_size) as i32;
 
-        for instance in claimed {
-            if let Err(e) = self.initialize_instance(instance).await {
-                error!(error = %e, "Failed to initialize claimed instance");
+            let claimed = self
+                .db
+                .claim_instances_batch(&self.config.runner_id, self.config.lease_seconds, to_claim)
+                .await?;
+
+            if claimed.is_empty() {
+                // No more instances available
+                break;
+            }
+
+            let claimed_count = claimed.len();
+            for instance in claimed {
+                if let Err(e) = self.initialize_instance(instance).await {
+                    error!(error = %e, "Failed to initialize claimed instance");
+                }
+            }
+
+            // If we got fewer than requested, no point trying again
+            if claimed_count < to_claim as usize {
+                break;
             }
         }
 
@@ -546,9 +681,12 @@ impl InstanceRunner {
         Ok(dag)
     }
 
-    /// Dispatch ready work from all active instances
-    async fn dispatch_ready_work(&self) -> InstanceRunnerResult<()> {
+    /// Collect ready actions from all active instances and enqueue them.
+    /// Inline nodes (spreads, sleeps, control flow) are handled immediately.
+    /// Worker actions are added to the dispatch queue for later processing.
+    async fn collect_ready_actions(&self) -> InstanceRunnerResult<()> {
         let mut instances = self.active_instances.write().await;
+        let mut queue = self.dispatch_queue.lock().await;
 
         for (_, instance) in instances.iter_mut() {
             // Get ready nodes from execution state
@@ -560,7 +698,7 @@ impl InstanceRunner {
                     continue;
                 }
 
-                // Resolve the execution node + DAG template node (spread nodes expand into instances).
+                // Resolve the execution node + DAG template node
                 let exec_node = match instance.state.graph.nodes.get(&node_id) {
                     Some(n) => n.clone(),
                     None => {
@@ -577,6 +715,7 @@ impl InstanceRunner {
                     }
                 };
 
+                // Handle spread nodes inline
                 if dag_node.is_spread && exec_node.spread_index.is_none() {
                     let mut completion_error = None;
                     let items = match dag_node.spread_collection_expr.as_ref() {
@@ -625,12 +764,13 @@ impl InstanceRunner {
                             .map(|_| "SpreadEvaluationError".to_string()),
                         worker_id: "inline".to_string(),
                         duration_ms: 0,
+                        worker_duration_ms: Some(0),
                     };
                     instance.pending_completions.push(completion);
                     continue;
                 }
 
-                // Check if this is a durable sleep action
+                // Handle durable sleep actions inline
                 if dag_node.action_name.as_deref() == Some(SLEEP_ACTION_NAME) {
                     if let Err(e) = self
                         .schedule_sleep_action(instance, &node_id, &dag_node)
@@ -641,14 +781,33 @@ impl InstanceRunner {
                     continue;
                 }
 
-                // Check if this is an action node that needs worker execution
-                if dag_node.module_name.is_some() && dag_node.action_name.is_some() {
-                    // Dispatch to worker
-                    if let Err(e) = self.dispatch_action(instance, &node_id, &dag_node).await {
-                        warn!(node_id = %node_id, error = %e, "Failed to dispatch action");
-                    }
+                // Check if this is a worker action - enqueue it
+                if let (Some(module_name), Some(action_name)) =
+                    (dag_node.module_name.clone(), dag_node.action_name.clone())
+                {
+                    let inputs_bytes = instance.state.get_inputs_for_node(&node_id, &instance.dag);
+                    let inputs: proto::WorkflowArguments = inputs_bytes
+                        .as_ref()
+                        .and_then(|bytes| decode_message(bytes).ok())
+                        .unwrap_or_default();
+
+                    let timeout_seconds = instance.state.get_timeout_seconds(&node_id);
+                    let max_retries = instance.state.get_max_retries(&node_id);
+                    let attempt_number = instance.state.get_attempt_number(&node_id);
+
+                    queue.push_back(QueuedAction {
+                        instance_id: instance.instance_id.0,
+                        node_id: node_id.clone(),
+                        module_name,
+                        action_name,
+                        inputs,
+                        inputs_bytes,
+                        timeout_seconds,
+                        max_retries,
+                        attempt_number,
+                    });
                 } else {
-                    // Inline node - execute locally and handle as completion
+                    // Inline node - execute locally
                     let result = self.execute_inline_node(instance, &node_id, &dag_node);
 
                     let completion = Completion {
@@ -659,10 +818,229 @@ impl InstanceRunner {
                         error_type: None,
                         worker_id: "inline".to_string(),
                         duration_ms: 0,
+                        worker_duration_ms: Some(0),
                     };
                     instance.pending_completions.push(completion);
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch actions from the queue to workers.
+    ///
+    /// Flow:
+    /// 1. Check worker capacity
+    /// 2. Dequeue actions up to available capacity
+    /// 3. Mark as Running in in-memory DAG state
+    /// 4. Sync state to DB (so crash = we know action was attempted)
+    /// 5. Send to workers
+    async fn dispatch_from_queue(&self) -> InstanceRunnerResult<()> {
+        let available = self.worker_pool.available_capacity();
+        if available == 0 {
+            return Ok(());
+        }
+
+        // Dequeue actions up to available capacity
+        let actions_to_dispatch: Vec<QueuedAction> = {
+            let mut queue = self.dispatch_queue.lock().await;
+            let count = available.min(queue.len());
+            queue.drain(..count).collect()
+        };
+
+        if actions_to_dispatch.is_empty() {
+            return Ok(());
+        }
+
+        // Group actions by instance for efficient updates
+        let mut by_instance: HashMap<Uuid, Vec<&QueuedAction>> = HashMap::new();
+        for action in &actions_to_dispatch {
+            by_instance
+                .entry(action.instance_id)
+                .or_default()
+                .push(action);
+        }
+
+        // Phase 1: Mark as Running in in-memory state
+        {
+            let mut instances = self.active_instances.write().await;
+            for (instance_id, actions) in &by_instance {
+                if let Some(instance) = instances.get_mut(instance_id) {
+                    for action in actions {
+                        // Acquire a worker slot
+                        let worker_idx = match self.worker_pool.try_acquire_slot() {
+                            Some(idx) => idx,
+                            None => {
+                                // This shouldn't happen since we checked capacity, but handle it
+                                warn!(
+                                    node_id = %action.node_id,
+                                    "No worker slot available during dispatch"
+                                );
+                                continue;
+                            }
+                        };
+                        let worker_id = format!("worker-{}", worker_idx);
+
+                        instance.state.mark_running(
+                            &action.node_id,
+                            &worker_id,
+                            action.inputs_bytes.clone(),
+                        );
+                        instance.in_flight.insert(action.node_id.clone());
+                    }
+                }
+            }
+        }
+
+        // Phase 2: Sync state to DB (before sending to workers)
+        // This ensures if we crash, the DB shows the actions were attempted
+        {
+            let instances = self.active_instances.read().await;
+            for instance_id in by_instance.keys() {
+                if let Some(instance) = instances.get(instance_id) {
+                    let graph_bytes = instance.state.to_bytes();
+                    let next_wakeup = instance
+                        .state
+                        .graph
+                        .next_wakeup_time
+                        .map(|ms| Utc.timestamp_millis_opt(ms).unwrap());
+
+                    match self
+                        .db
+                        .update_execution_graph(
+                            instance.instance_id,
+                            &self.config.runner_id,
+                            &graph_bytes,
+                            next_wakeup,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            debug!(
+                                instance_id = %instance.instance_id,
+                                "Synced running state to DB before dispatch"
+                            );
+                        }
+                        Ok(false) => {
+                            warn!(
+                                instance_id = %instance.instance_id,
+                                "Lost lease while syncing state before dispatch"
+                            );
+                            // TODO: Handle lost lease - re-enqueue actions
+                        }
+                        Err(e) => {
+                            error!(
+                                instance_id = %instance.instance_id,
+                                error = %e,
+                                "Failed to sync state to DB before dispatch"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Actually send to workers
+        for action in actions_to_dispatch {
+            let instances = self.active_instances.read().await;
+            if !instances.contains_key(&action.instance_id) {
+                continue;
+            }
+
+            // Get worker (already acquired slot above)
+            let worker_idx = self.worker_pool.next_worker_idx() % self.worker_pool.len();
+            let worker = self.worker_pool.get_worker(worker_idx).await;
+            let worker_id = format!("worker-{}", worker_idx);
+
+            let action_seq = self.action_seq.fetch_add(1, Ordering::SeqCst);
+            let dispatch_token = Uuid::new_v4();
+
+            let payload = ActionDispatchPayload {
+                action_id: action.node_id.clone(),
+                instance_id: action.instance_id.to_string(),
+                sequence: action_seq,
+                action_name: action.action_name.clone(),
+                module_name: action.module_name.clone(),
+                kwargs: action.inputs.clone(),
+                timeout_seconds: action.timeout_seconds,
+                max_retries: action.max_retries,
+                attempt_number: action.attempt_number,
+                dispatch_token,
+            };
+
+            self.metrics.lock().await.actions_dispatched += 1;
+
+            // Spawn task to send and handle completion
+            let completion_tx = self.completion_tx.clone();
+            let instance_id = action.instance_id;
+            let node_id = action.node_id.clone();
+            let worker_pool = Arc::clone(&self.worker_pool);
+            let worker_id_for_task = worker_id.clone();
+
+            tokio::spawn(async move {
+                match worker.send_action(payload).await {
+                    Ok(metrics) => {
+                        let completion = Completion {
+                            node_id: node_id.clone(),
+                            success: metrics.success,
+                            result: if metrics.response_payload.is_empty() {
+                                None
+                            } else {
+                                Some(metrics.response_payload)
+                            },
+                            error: metrics.error_message.clone(),
+                            error_type: metrics.error_type.clone(),
+                            worker_id: worker_id_for_task.clone(),
+                            duration_ms: metrics.round_trip.as_millis() as i64,
+                            worker_duration_ms: Some(metrics.worker_duration.as_millis() as i64),
+                        };
+
+                        if let Err(e) = completion_tx
+                            .send(WorkerCompletion {
+                                instance_id,
+                                completion,
+                                worker_idx,
+                            })
+                            .await
+                        {
+                            error!(node_id = %node_id, error = %e, "Failed to send completion");
+                        }
+                    }
+                    Err(e) => {
+                        error!(node_id = %node_id, error = %e, "Worker action failed");
+
+                        let completion = Completion {
+                            node_id: node_id.clone(),
+                            success: false,
+                            result: None,
+                            error: Some(format!("Worker error: {}", e)),
+                            error_type: Some("WorkerError".to_string()),
+                            worker_id: worker_id_for_task.clone(),
+                            duration_ms: 0,
+                            worker_duration_ms: None,
+                        };
+
+                        let _ = completion_tx
+                            .send(WorkerCompletion {
+                                instance_id,
+                                completion,
+                                worker_idx,
+                            })
+                            .await;
+                    }
+                }
+
+                // Record completion in worker pool (releases slot, tracks throughput)
+                worker_pool.record_completion(worker_idx, Arc::clone(&worker_pool));
+            });
+
+            debug!(
+                instance_id = %action.instance_id,
+                node_id = %action.node_id,
+                worker_id = %worker_id,
+                "Dispatched action to worker"
+            );
         }
 
         Ok(())
@@ -687,6 +1065,7 @@ impl InstanceRunner {
                 error_type: None,
                 worker_id: SLEEP_WORKER_ID.to_string(),
                 duration_ms: 0,
+                worker_duration_ms: Some(0), // Instant sleep (duration <= 0)
             };
             instance.pending_completions.push(completion);
             return Ok(());
@@ -695,6 +1074,14 @@ impl InstanceRunner {
         instance
             .state
             .mark_running(node_id, SLEEP_WORKER_ID, inputs_bytes);
+
+        // For sleep nodes, we need to set started_at_ms immediately so the wakeup
+        // time can be calculated. Unlike worker actions, sleeps don't report duration.
+        let now_ms = Utc::now().timestamp_millis();
+        if let Some(node) = instance.state.graph.nodes.get_mut(node_id) {
+            node.started_at_ms = Some(now_ms);
+        }
+
         instance.in_flight.insert(node_id.to_string());
         self.metrics.lock().await.actions_dispatched += 1;
 
@@ -1034,144 +1421,6 @@ impl InstanceRunner {
         }
     }
 
-    /// Dispatch a single action to a worker
-    async fn dispatch_action(
-        &self,
-        instance: &mut ActiveInstance,
-        node_id: &str,
-        dag_node: &DAGNode,
-    ) -> InstanceRunnerResult<()> {
-        let module_name = dag_node
-            .module_name
-            .clone()
-            .ok_or_else(|| InstanceRunnerError::Worker("No module name".into()))?;
-        let action_name = dag_node
-            .action_name
-            .clone()
-            .ok_or_else(|| InstanceRunnerError::Worker("No action name".into()))?;
-
-        // Get inputs for this node (serialized bytes)
-        let inputs_bytes = instance.state.get_inputs_for_node(node_id, &instance.dag);
-
-        // Decode to WorkflowArguments
-        let inputs: proto::WorkflowArguments = inputs_bytes
-            .as_ref()
-            .and_then(|bytes| decode_message(bytes).ok())
-            .unwrap_or_default();
-
-        // Get worker using round-robin selection
-        let worker_idx = self.worker_pool.next_worker_idx();
-        let worker = self.worker_pool.get_worker(worker_idx).await;
-        let worker_id = format!("worker-{}", worker_idx);
-
-        // Build action payload
-        let action_seq = self.action_seq.fetch_add(1, Ordering::SeqCst);
-        let dispatch_token = Uuid::new_v4();
-
-        // Get retry/timeout config from execution state (which was extracted from policies)
-        let timeout_seconds = instance.state.get_timeout_seconds(node_id);
-        let max_retries = instance.state.get_max_retries(node_id);
-        let attempt_number = instance.state.get_attempt_number(node_id);
-
-        let payload = ActionDispatchPayload {
-            action_id: node_id.to_string(),
-            instance_id: instance.instance_id.0.to_string(),
-            sequence: action_seq,
-            action_name,
-            module_name,
-            kwargs: inputs,
-            timeout_seconds,
-            max_retries,
-            attempt_number,
-            dispatch_token,
-        };
-
-        // Mark as running in execution state
-        instance
-            .state
-            .mark_running(node_id, &worker_id, inputs_bytes.clone());
-
-        // Track in-flight
-        instance.in_flight.insert(node_id.to_string());
-
-        self.metrics.lock().await.actions_dispatched += 1;
-
-        // Spawn background task to handle the action
-        let completion_tx = self.completion_tx.clone();
-        let instance_id = instance.instance_id.0;
-        let node_id_owned = node_id.to_string();
-
-        tokio::spawn(async move {
-            match worker.send_action(payload).await {
-                Ok(metrics) => {
-                    let completion = Completion {
-                        node_id: node_id_owned.clone(),
-                        success: metrics.success,
-                        result: if metrics.response_payload.is_empty() {
-                            None
-                        } else {
-                            Some(metrics.response_payload)
-                        },
-                        error: metrics.error_message.clone(),
-                        error_type: metrics.error_type.clone(),
-                        worker_id: format!("worker-{}", worker_idx),
-                        duration_ms: metrics.round_trip.as_millis() as i64,
-                    };
-
-                    if let Err(e) = completion_tx
-                        .send(WorkerCompletion {
-                            instance_id,
-                            completion,
-                            worker_idx,
-                        })
-                        .await
-                    {
-                        error!(
-                            node_id = %node_id_owned,
-                            error = %e,
-                            "Failed to send completion"
-                        );
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        node_id = %node_id_owned,
-                        error = %e,
-                        "Worker action failed"
-                    );
-
-                    // Send failure completion
-                    let completion = Completion {
-                        node_id: node_id_owned.clone(),
-                        success: false,
-                        result: None,
-                        error: Some(format!("Worker error: {}", e)),
-                        error_type: Some("WorkerError".to_string()),
-                        worker_id: format!("worker-{}", worker_idx),
-                        duration_ms: 0,
-                    };
-
-                    let _ = completion_tx
-                        .send(WorkerCompletion {
-                            instance_id,
-                            completion,
-                            worker_idx,
-                        })
-                        .await;
-                }
-            }
-        });
-
-        debug!(
-            instance_id = %instance.instance_id,
-            node_id = %node_id,
-            worker_id = %worker_id,
-            "Dispatched action to worker"
-        );
-
-        Ok(())
-    }
-
     /// Finalize completed instances
     async fn finalize_completed_instances(&self) -> InstanceRunnerResult<()> {
         let mut completed_ids = Vec::new();
@@ -1408,16 +1657,20 @@ mod tests {
     fn test_config_custom_values() {
         let config = InstanceRunnerConfig {
             runner_id: "custom-runner-123".to_string(),
+            pool_id: Uuid::new_v4(),
             lease_seconds: 120,
             heartbeat_interval: Duration::from_secs(20),
             claim_batch_size: 50,
+            max_concurrent_instances: 200,
             completion_batch_size: 200,
             idle_poll_interval: Duration::from_millis(500),
+            status_report_interval: Duration::from_secs(10),
         };
         assert_eq!(config.runner_id, "custom-runner-123");
         assert_eq!(config.lease_seconds, 120);
         assert_eq!(config.heartbeat_interval, Duration::from_secs(20));
         assert_eq!(config.claim_batch_size, 50);
+        assert_eq!(config.max_concurrent_instances, 200);
         assert_eq!(config.completion_batch_size, 200);
     }
 
@@ -1464,7 +1717,8 @@ mod tests {
         // Verify constants are reasonable values
         assert_eq!(DEFAULT_LEASE_SECONDS, 60);
         assert_eq!(DEFAULT_HEARTBEAT_INTERVAL, Duration::from_secs(10));
-        assert_eq!(DEFAULT_CLAIM_BATCH_SIZE, 10);
+        assert_eq!(DEFAULT_CLAIM_BATCH_SIZE, 50);
+        assert_eq!(DEFAULT_MAX_CONCURRENT_INSTANCES, 100);
         assert_eq!(DEFAULT_COMPLETION_BATCH_SIZE, 100);
 
         // Heartbeat should be significantly less than lease to prevent expiration
