@@ -2483,6 +2483,14 @@ const RETRY_EXHAUSTED_BREAK_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_retry_exhausted_break.py");
 const TRY_BREAK_DATAFLOW_WORKFLOW_MODULE: &str =
     include_str!("fixtures/integration_try_break_dataflow.py");
+const RETRY_EXCEPTION_CATCH_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_catch.py");
+const RETRY_EXCEPTION_SIMPLE_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_simple.py");
+const RETRY_EXCEPTION_MULTI_ACTION_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_multi_action.py");
+const RETRY_EXCEPTION_MULTI_NO_RETURN_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_retry_exception_multi_no_return.py");
 
 const REGISTER_LOOP_EXCEPTION_SCRIPT: &str = r#"
 import asyncio
@@ -2522,6 +2530,62 @@ async def main():
     os.environ.pop("PYTEST_CURRENT_TEST", None)
     wf = TryBreakDataflowWorkflow()
     result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_CATCH_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_catch import RetryExceptionCatchWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionCatchWorkflow()
+    result = await wf.run(user_id="test_user_123")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_SIMPLE_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_simple import RetryExceptionSimpleWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionSimpleWorkflow()
+    result = await wf.run()
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_MULTI_ACTION_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_multi_action import RetryExceptionMultiActionWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionMultiActionWorkflow()
+    result = await wf.run(user_id="test_user")
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+const REGISTER_RETRY_EXCEPTION_MULTI_NO_RETURN_SCRIPT: &str = r#"
+import asyncio
+import os
+
+from integration_retry_exception_multi_no_return import RetryExceptionMultiNoReturnWorkflow
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = RetryExceptionMultiNoReturnWorkflow()
+    result = await wf.run(user_id="test_user")
     print(f"Registration result: {result}")
 
 asyncio.run(main())
@@ -2713,6 +2777,213 @@ async fn try_break_dataflow_allows_followup_guard() -> Result<()> {
         .expect("workflow should have a result");
     let message = parse_result(&stored_payload)?;
     assert_eq!(message, Some("".to_string()));
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test that ValueError exception is caught after retry exhaustion.
+///
+/// This reproduces a bug where:
+/// 1. An action raises ValueError with retry=RetryPolicy(attempts=N)
+/// 2. All N attempts fail
+/// 3. The exception should be caught by `except ValueError:` handler
+/// 4. BUG: Workflow stalls instead of exception being caught
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_catch_after_exhaustion() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_catch.py",
+                RETRY_EXCEPTION_CATCH_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_RETRY_EXCEPTION_CATCH_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptioncatchworkflow",
+        user_module: "integration_retry_exception_catch",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and "caught_error" returned
+    assert_eq!(
+        message,
+        Some("caught_error".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test simple exception catch after retry exhaustion (no return inside try).
+///
+/// This is a simpler variant that doesn't have a return statement inside
+/// the try block, to isolate the exception handling issue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_simple_catch_after_exhaustion() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_simple.py",
+                RETRY_EXCEPTION_SIMPLE_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_RETRY_EXCEPTION_SIMPLE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptionsimpleworkflow",
+        user_module: "integration_retry_exception_simple",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and recovery_action should have run
+    assert_eq!(
+        message,
+        Some("recovered".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test exception catch with multiple actions in try but NO return inside try.
+///
+/// This tests if the issue is the return inside try or having multiple actions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_multi_no_return_catch() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_multi_no_return.py",
+                RETRY_EXCEPTION_MULTI_NO_RETURN_WORKFLOW_MODULE,
+            ),
+            (
+                "register.py",
+                REGISTER_RETRY_EXCEPTION_MULTI_NO_RETURN_SCRIPT,
+            ),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptionmultinoreturnworkflow",
+        user_module: "integration_retry_exception_multi_no_return",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and "caught_error" returned
+    assert_eq!(
+        message,
+        Some("caught_error".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+/// Test exception catch after retry exhaustion with multiple actions in try block.
+///
+/// This reproduces the stall bug when:
+/// 1. Multiple actions in try block
+/// 2. Return statement inside try block
+/// 3. First action fails after retry exhaustion
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn retry_exception_multi_action_catch_after_exhaustion() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_retry_exception_multi_action.py",
+                RETRY_EXCEPTION_MULTI_ACTION_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_RETRY_EXCEPTION_MULTI_ACTION_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "retryexceptionmultiactionworkflow",
+        user_module: "integration_retry_exception_multi_action",
+        inputs: &[],
+        workflow_class: None,
+        run_args: None,
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let message = parse_result(&stored_payload)?;
+
+    // The exception should have been caught and "caught_error" returned
+    assert_eq!(
+        message,
+        Some("caught_error".to_string()),
+        "Exception should be caught after retry exhaustion"
+    );
 
     harness.shutdown().await?;
     Ok(())
@@ -3185,6 +3456,133 @@ async fn run_action_spread_workflow_executes() -> Result<()> {
         message,
         Some("processed:a,processed:b,processed:c".to_string()),
         "expected all items to be processed and combined"
+    );
+
+    harness.shutdown().await?;
+    Ok(())
+}
+
+// =============================================================================
+// Spread with Reused Variable Name Test (EXACT PRODUCTION PATTERN)
+// =============================================================================
+// Tests the exact pattern where the loop variable name is used in an earlier
+// for loop AND then reused in the spread comprehension.
+
+const SPREAD_VARIABLE_REUSE_WORKFLOW_MODULE: &str =
+    include_str!("fixtures/integration_spread_variable_reuse.py");
+
+const REGISTER_SPREAD_VARIABLE_REUSE_SCRIPT: &str = r#"
+import asyncio
+import os
+from uuid import UUID
+
+from integration_spread_variable_reuse import SpreadVariableReuseWorkflow, PollSelfPostRequest
+
+async def main():
+    os.environ.pop("PYTEST_CURRENT_TEST", None)
+    wf = SpreadVariableReuseWorkflow()
+    request = PollSelfPostRequest(
+        post_id=UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+        user_id=UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"),
+    )
+    result = await wf.run(request=request)
+    print(f"Registration result: {result}")
+
+asyncio.run(main())
+"#;
+
+/// Test spread with reused variable name - EXACT PRODUCTION PATTERN.
+///
+/// In production:
+/// 1. `for comment_id in new_comments.unhandled_comment_ids:` builds a list
+/// 2. `for comment_id in new_comment_ids` in the spread comprehension
+///
+/// The same variable name `comment_id` is used in BOTH places.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn spread_variable_reuse_each_action_gets_distinct_value() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+    let _ = dotenvy::dotenv();
+
+    let Some(harness) = IntegrationHarness::new(HarnessConfig {
+        files: &[
+            (
+                "integration_spread_variable_reuse.py",
+                SPREAD_VARIABLE_REUSE_WORKFLOW_MODULE,
+            ),
+            ("register.py", REGISTER_SPREAD_VARIABLE_REUSE_SCRIPT),
+        ],
+        entrypoint: "register.py",
+        workflow_name: "spreadvariablereuseworkflow",
+        user_module: "integration_spread_variable_reuse",
+        inputs: &[],
+        workflow_class: Some("SpreadVariableReuseWorkflow"),
+        run_args: Some(
+            "request=__import__(\"integration_spread_variable_reuse\").PollSelfPostRequest(post_id=__import__(\"uuid\").UUID(\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"), user_id=__import__(\"uuid\").UUID(\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\"))",
+        ),
+    })
+    .await?
+    else {
+        return Ok(());
+    };
+
+    harness.dispatch_all().await?;
+    info!("workflow completed");
+
+    let stored_payload = harness
+        .stored_result()
+        .await?
+        .expect("workflow should have a result");
+    let db_result = parse_result_json(&stored_payload)?;
+
+    // Verify in-memory execution matches DB-backed execution
+    let in_memory_result = run_workflow_in_memory(
+        "integration_spread_variable_reuse.py",
+        SPREAD_VARIABLE_REUSE_WORKFLOW_MODULE,
+        "integration_spread_variable_reuse",
+        "SpreadVariableReuseWorkflow",
+        Some("request=__import__(\"integration_spread_variable_reuse\").PollSelfPostRequest(post_id=__import__(\"uuid\").UUID(\"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\"), user_id=__import__(\"uuid\").UUID(\"bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb\"))"),
+    )
+    .await?;
+
+    assert_eq!(
+        db_result, in_memory_result,
+        "in-memory result should match DB result"
+    );
+
+    // Verify each action received a distinct comment_id
+    let results = db_result.as_array().expect("result should be an array");
+    assert_eq!(results.len(), 3, "should have 3 results (one per comment)");
+
+    let comment_ids: Vec<&str> = results
+        .iter()
+        .map(|r| r.get("comment_id").unwrap().as_str().unwrap())
+        .collect();
+
+    // CRITICAL: Each comment_id should be unique
+    // The bug would cause all to be "33333333-3333-3333-3333-333333333333" (the last one)
+    assert_eq!(
+        comment_ids[0], "11111111-1111-1111-1111-111111111111",
+        "first action should receive first comment_id (got {})",
+        comment_ids[0]
+    );
+    assert_eq!(
+        comment_ids[1], "22222222-2222-2222-2222-222222222222",
+        "second action should receive second comment_id (got {})",
+        comment_ids[1]
+    );
+    assert_eq!(
+        comment_ids[2], "33333333-3333-3333-3333-333333333333",
+        "third action should receive third comment_id (got {})",
+        comment_ids[2]
+    );
+
+    // Verify no duplicates
+    let unique_ids: std::collections::HashSet<&str> = comment_ids.iter().copied().collect();
+    assert_eq!(
+        unique_ids.len(),
+        3,
+        "all comment_ids should be unique - variable reuse bug would cause all to be the last value"
     );
 
     harness.shutdown().await?;
