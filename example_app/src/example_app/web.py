@@ -442,7 +442,10 @@ async def register_schedule(payload: ScheduleRequest) -> ScheduleResponse:
             schedule = timedelta(seconds=payload.interval_seconds)
 
         schedule_id = await schedule_workflow(
-            workflow_cls, schedule=schedule, inputs=payload.inputs
+            workflow_cls,
+            schedule_name=payload.workflow_name,
+            schedule=schedule,
+            inputs=payload.inputs,
         )
         return ScheduleResponse(
             success=True,
