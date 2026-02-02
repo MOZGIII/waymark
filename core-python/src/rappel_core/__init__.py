@@ -33,6 +33,7 @@ from .ir_executor import (
     VariableNotFoundError,
 )
 from .ir_format import format_program
+from .runner import RunnerState
 from .worker_pool import (
     ActionDispatchPayload,
     PythonWorker,
@@ -83,4 +84,5 @@ __all__ = [
     "convert_to_dag",
     "format_program",
     "render_dag_image",
+    "RunnerState",
 ]
