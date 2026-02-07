@@ -407,7 +407,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [python-tests, rust-tests]
     timeout-minutes: 10
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && contains(toJson(github.event.pull_request.labels), 'full-build'))
     services:
       postgres:
         image: postgres:15
@@ -452,7 +452,7 @@ jobs:
         env:
           WAYMARK_DATABASE_URL: postgresql://mountaineer:mountaineer@localhost:5432/mountaineer_daemons
           WAYMARK_SKIP_UV_SYNC: "1"
-        run: cargo test --test integration_test -- --nocapture
+        run: cargo run --bin integration_test -- --backends in-memory,postgres
 
   example-app-tests:
     runs-on: ubuntu-latest
