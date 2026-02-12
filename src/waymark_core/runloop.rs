@@ -1,13 +1,13 @@
 //! Runloop for coordinating executors and worker pools.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicUsize, Ordering},
     mpsc as std_mpsc,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use prost::Message;
@@ -22,6 +22,7 @@ use crate::backends::{
 };
 use crate::messages::ast as ir;
 use crate::observability::obs;
+use crate::waymark_core::commit_barrier::{CommitBarrier, DeferredInstanceEvent};
 use crate::waymark_core::dag::{DAG, DAGNode, OutputNode, ReturnNode, convert_to_dag};
 use crate::waymark_core::lock::{InstanceLockTracker, spawn_lock_heartbeat};
 use crate::waymark_core::runner::synthetic_exceptions::{
@@ -67,7 +68,7 @@ struct ShardStep {
     instance_done: Option<InstanceDone>,
 }
 
-struct EvictionState<'a> {
+struct CoordinatorState<'a> {
     executor_shards: &'a mut HashMap<Uuid, usize>,
     shard_senders: &'a [std_mpsc::Sender<ShardCommand>],
     lock_tracker: &'a InstanceLockTracker,
@@ -76,6 +77,9 @@ struct EvictionState<'a> {
     sleeping_nodes: &'a mut HashMap<Uuid, SleepRequest>,
     sleeping_by_instance: &'a mut HashMap<Uuid, HashSet<Uuid>>,
     blocked_until_by_instance: &'a mut HashMap<Uuid, DateTime<Utc>>,
+    commit_barrier: &'a mut CommitBarrier<ShardStep>,
+    instances_done_pending: &'a mut Vec<InstanceDone>,
+    sleep_tx: &'a mpsc::UnboundedSender<SleepWake>,
 }
 
 enum ShardEvent {
@@ -107,7 +111,27 @@ enum CoordinatorEvent {
     Instance(InstanceMessage),
     Shard(ShardEvent),
     SleepWake(SleepWake),
+    PersistAck(PersistAck),
     ActionTimeoutTick,
+}
+
+struct PersistCommand {
+    batch_id: u64,
+    instance_ids: HashSet<Uuid>,
+    graph_instance_ids: HashSet<Uuid>,
+    actions_done: Vec<ActionDone>,
+    graph_updates: Vec<GraphUpdate>,
+}
+
+enum PersistAck {
+    StepsPersisted {
+        batch_id: u64,
+        lock_statuses: Vec<InstanceLockStatus>,
+    },
+    StepsPersistFailed {
+        batch_id: u64,
+        error: RunLoopError,
+    },
 }
 
 async fn send_instance_message_with_stop(
@@ -136,6 +160,91 @@ async fn send_instance_message_with_stop(
                 warned = true;
             }
         }
+    }
+}
+
+async fn send_persist_command_with_stop(
+    persist_tx: &mpsc::Sender<PersistCommand>,
+    command: PersistCommand,
+    stop_notify: &Notify,
+) -> bool {
+    let send_fut = persist_tx.send(command);
+    tokio::pin!(send_fut);
+    let mut warned = false;
+    loop {
+        tokio::select! {
+            res = &mut send_fut => {
+                if res.is_err() {
+                    warn!("persistence task receiver dropped");
+                    return false;
+                }
+                return true;
+            }
+            _ = stop_notify.notified() => {
+                info!("persist sender stop notified during send");
+                return false;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)), if !warned => {
+                warn!("persist command send pending >2s");
+                warned = true;
+            }
+        }
+    }
+}
+
+fn collect_step_updates(steps: &[ShardStep]) -> (Vec<ActionDone>, Vec<GraphUpdate>) {
+    let mut actions_done: Vec<ActionDone> = Vec::new();
+    let mut graph_updates: Vec<GraphUpdate> = Vec::new();
+    for step in steps {
+        if let Some(updates) = &step.updates {
+            if !updates.actions_done.is_empty() {
+                actions_done.extend(updates.actions_done.clone());
+            }
+            if !updates.graph_updates.is_empty() {
+                graph_updates.extend(updates.graph_updates.clone());
+            }
+        }
+    }
+    (actions_done, graph_updates)
+}
+
+fn flush_deferred_instance_events(
+    instance_id: Uuid,
+    events: VecDeque<DeferredInstanceEvent>,
+    executor_shards: &HashMap<Uuid, usize>,
+    shard_senders: &[std_mpsc::Sender<ShardCommand>],
+) {
+    let Some(shard_idx) = executor_shards.get(&instance_id).copied() else {
+        return;
+    };
+    let Some(sender) = shard_senders.get(shard_idx) else {
+        return;
+    };
+    let mut completion_batch: Vec<ActionCompletion> = Vec::new();
+    let mut wake_batch: Vec<Uuid> = Vec::new();
+    for event in events {
+        match event {
+            DeferredInstanceEvent::Completion(completion) => {
+                if !wake_batch.is_empty() {
+                    let _ = sender.send(ShardCommand::Wake(std::mem::take(&mut wake_batch)));
+                }
+                completion_batch.push(completion);
+            }
+            DeferredInstanceEvent::Wake(node_id) => {
+                if !completion_batch.is_empty() {
+                    let _ = sender.send(ShardCommand::ActionCompletions(std::mem::take(
+                        &mut completion_batch,
+                    )));
+                }
+                wake_batch.push(node_id);
+            }
+        }
+    }
+    if !completion_batch.is_empty() {
+        let _ = sender.send(ShardCommand::ActionCompletions(completion_batch));
+    }
+    if !wake_batch.is_empty() {
+        let _ = sender.send(ShardCommand::Wake(wake_batch));
     }
 }
 
@@ -547,16 +656,9 @@ impl RunLoop {
     }
 
     fn lock_mismatches(&self, locks: &[InstanceLockStatus]) -> HashSet<Uuid> {
-        let now = Utc::now();
         locks
             .iter()
-            .filter(|status| {
-                status.lock_uuid != Some(self.lock_uuid)
-                    || status
-                        .lock_expires_at
-                        .map(|expires_at| expires_at <= now)
-                        .unwrap_or(true)
-            })
+            .filter(|status| status.lock_uuid != Some(self.lock_uuid))
             .map(|status| status.instance_id)
             .collect()
     }
@@ -608,46 +710,6 @@ impl RunLoop {
         Ok(())
     }
 
-    async fn persist_shard_steps(
-        &self,
-        steps: &[ShardStep],
-    ) -> Result<Vec<InstanceLockStatus>, RunLoopError> {
-        let mut actions_done: Vec<ActionDone> = Vec::new();
-        let mut graph_updates: Vec<GraphUpdate> = Vec::new();
-        for step in steps {
-            if let Some(updates) = &step.updates {
-                if !updates.actions_done.is_empty() {
-                    actions_done.extend(updates.actions_done.clone());
-                }
-                if !updates.graph_updates.is_empty() {
-                    graph_updates.extend(updates.graph_updates.clone());
-                }
-            }
-        }
-        if actions_done.is_empty() && graph_updates.is_empty() {
-            return Ok(Vec::new());
-        }
-        if !actions_done.is_empty() {
-            self.core_backend.save_actions_done(&actions_done).await?;
-        }
-        if !graph_updates.is_empty() {
-            let lock_expires_at = Utc::now()
-                + chrono::Duration::from_std(self.lock_ttl)
-                    .unwrap_or_else(|_| chrono::Duration::seconds(0));
-            return Ok(self
-                .core_backend
-                .save_graphs(
-                    LockClaim {
-                        lock_uuid: self.lock_uuid,
-                        lock_expires_at,
-                    },
-                    &graph_updates,
-                )
-                .await?);
-        }
-        Ok(Vec::new())
-    }
-
     async fn flush_instances_done(
         &self,
         pending: &mut Vec<InstanceDone>,
@@ -660,10 +722,110 @@ impl RunLoop {
         Ok(())
     }
 
+    fn apply_confirmed_step(
+        &self,
+        step: ShardStep,
+        state: &mut CoordinatorState<'_>,
+    ) -> Result<(), RunLoopError> {
+        for request in step.actions {
+            let dispatch = request.clone();
+            self.worker_pool.queue(request)?;
+            *state.inflight_actions.entry(step.executor_id).or_insert(0) += 1;
+            let deadline_at = if dispatch.timeout_seconds > 0 {
+                Some(Utc::now() + chrono::Duration::seconds(i64::from(dispatch.timeout_seconds)))
+            } else {
+                None
+            };
+            state.inflight_dispatches.insert(
+                dispatch.execution_id,
+                InflightActionDispatch {
+                    executor_id: dispatch.executor_id,
+                    attempt_number: dispatch.attempt_number,
+                    dispatch_token: dispatch.dispatch_token,
+                    timeout_seconds: dispatch.timeout_seconds,
+                    deadline_at,
+                },
+            );
+        }
+        for mut sleep_request in step.sleep_requests {
+            if self.skip_sleep {
+                sleep_request.wake_at = Utc::now();
+            }
+            let existing = state.sleeping_nodes.get(&sleep_request.node_id);
+            let should_update = match existing {
+                Some(existing) => sleep_request.wake_at < existing.wake_at,
+                None => true,
+            };
+            let wake_at = match existing {
+                Some(existing) if !should_update => existing.wake_at,
+                _ => sleep_request.wake_at,
+            };
+            state
+                .sleeping_by_instance
+                .entry(step.executor_id)
+                .or_default()
+                .insert(sleep_request.node_id);
+            state
+                .blocked_until_by_instance
+                .entry(step.executor_id)
+                .and_modify(|existing| {
+                    if wake_at < *existing {
+                        *existing = wake_at;
+                    }
+                })
+                .or_insert(wake_at);
+
+            if should_update {
+                state
+                    .sleeping_nodes
+                    .insert(sleep_request.node_id, sleep_request.clone());
+                let sleep_tx = state.sleep_tx.clone();
+                let executor_id = step.executor_id;
+                let node_id = sleep_request.node_id;
+                let wake_at = sleep_request.wake_at;
+                tokio::spawn(async move {
+                    if let Ok(wait) = wake_at.signed_duration_since(Utc::now()).to_std()
+                        && wait > Duration::ZERO
+                    {
+                        tokio::time::sleep(wait).await;
+                    }
+                    let _ = sleep_tx.send(SleepWake {
+                        executor_id,
+                        node_id,
+                    });
+                });
+            }
+        }
+        if let Some(instance_done) = step.instance_done {
+            state.executor_shards.remove(&instance_done.executor_id);
+            state.inflight_actions.remove(&instance_done.executor_id);
+            state
+                .inflight_dispatches
+                .retain(|_, dispatch| dispatch.executor_id != instance_done.executor_id);
+            state.lock_tracker.remove_all([instance_done.executor_id]);
+            if let Some(nodes) = state
+                .sleeping_by_instance
+                .remove(&instance_done.executor_id)
+            {
+                for node_id in nodes {
+                    state.sleeping_nodes.remove(&node_id);
+                }
+            }
+            state
+                .blocked_until_by_instance
+                .remove(&instance_done.executor_id);
+            state
+                .commit_barrier
+                .remove_instance(instance_done.executor_id);
+            state.instances_done_pending.push(instance_done);
+        }
+        Ok(())
+    }
+
     async fn evict_instances(
         &self,
         instance_ids: &[Uuid],
-        state: &mut EvictionState<'_>,
+        state: &mut CoordinatorState<'_>,
     ) -> Result<(), RunLoopError> {
         if instance_ids.is_empty() {
             return Ok(());
@@ -856,6 +1018,136 @@ impl RunLoop {
             instance_notify.notify_waiters();
         });
 
+        const PERSIST_COALESCE_WINDOW: Duration = Duration::from_millis(2);
+        const PERSIST_COALESCE_MAX_COMMANDS: usize = 128;
+
+        let (persist_tx, mut persist_rx) = mpsc::channel::<PersistCommand>(64);
+        let (persist_ack_tx, mut persist_ack_rx) = mpsc::unbounded_channel::<PersistAck>();
+        let persist_backend = self.core_backend.clone();
+        let persist_lock_uuid = self.lock_uuid;
+        let persist_lock_ttl = self.lock_ttl;
+        let persist_handle = tokio::spawn(async move {
+            loop {
+                let first_command = persist_rx.recv().await;
+                let Some(first_command) = first_command else {
+                    info!("persistence task channel closed");
+                    break;
+                };
+                let mut step_commands = vec![first_command];
+                let mut channel_closed = false;
+                let deadline = Instant::now() + PERSIST_COALESCE_WINDOW;
+                while step_commands.len() < PERSIST_COALESCE_MAX_COMMANDS {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let wait = deadline.saturating_duration_since(now);
+                    match tokio::time::timeout(wait, persist_rx.recv()).await {
+                        Ok(Some(command)) => step_commands.push(command),
+                        Ok(None) => {
+                            channel_closed = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let mut all_actions_done: Vec<ActionDone> = Vec::new();
+                let mut all_graph_updates: Vec<GraphUpdate> = Vec::new();
+                for command in &mut step_commands {
+                    all_actions_done.append(&mut command.actions_done);
+                    all_graph_updates.append(&mut command.graph_updates);
+                }
+
+                let outcome: Result<HashMap<Uuid, InstanceLockStatus>, BackendError> = async {
+                    if !all_actions_done.is_empty() {
+                        persist_backend.save_actions_done(&all_actions_done).await?;
+                    }
+                    if all_graph_updates.is_empty() {
+                        return Ok(HashMap::new());
+                    }
+                    let lock_expires_at = Utc::now()
+                        + chrono::Duration::from_std(persist_lock_ttl)
+                            .unwrap_or_else(|_| chrono::Duration::seconds(0));
+                    let lock_statuses = persist_backend
+                        .save_graphs(
+                            LockClaim {
+                                lock_uuid: persist_lock_uuid,
+                                lock_expires_at,
+                            },
+                            &all_graph_updates,
+                        )
+                        .await?;
+                    let mut lock_status_by_instance: HashMap<Uuid, InstanceLockStatus> =
+                        HashMap::with_capacity(lock_statuses.len());
+                    for status in lock_statuses {
+                        lock_status_by_instance.insert(status.instance_id, status);
+                    }
+                    Ok(lock_status_by_instance)
+                }
+                .await;
+
+                match outcome {
+                    Ok(lock_status_by_instance) => {
+                        for command in step_commands {
+                            if command.instance_ids.is_empty() {
+                                continue;
+                            }
+                            let graph_instance_count = command.graph_instance_ids.len();
+                            let mut missing_lock_statuses = 0usize;
+                            let mut lock_statuses = Vec::with_capacity(graph_instance_count);
+                            for instance_id in command.graph_instance_ids {
+                                if let Some(status) = lock_status_by_instance.get(&instance_id) {
+                                    lock_statuses.push(status.clone());
+                                } else {
+                                    missing_lock_statuses += 1;
+                                    lock_statuses.push(InstanceLockStatus {
+                                        instance_id,
+                                        lock_uuid: None,
+                                        lock_expires_at: None,
+                                    });
+                                }
+                            }
+                            if missing_lock_statuses > 0 {
+                                warn!(
+                                    batch_id = command.batch_id,
+                                    graph_instance_count,
+                                    missing_lock_statuses,
+                                    "persist ack missing graph lock statuses"
+                                );
+                            }
+                            let ack = PersistAck::StepsPersisted {
+                                batch_id: command.batch_id,
+                                lock_statuses,
+                            };
+                            if persist_ack_tx.send(ack).is_err() {
+                                warn!("persistence ack receiver dropped");
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error_message = format!("persistence batch failed: {error}");
+                        for command in step_commands {
+                            let ack = PersistAck::StepsPersistFailed {
+                                batch_id: command.batch_id,
+                                error: RunLoopError::Message(error_message.clone()),
+                            };
+                            if persist_ack_tx.send(ack).is_err() {
+                                warn!("persistence ack receiver dropped");
+                                break;
+                            }
+                        }
+                    }
+                }
+                if channel_closed {
+                    info!("persistence task channel closed");
+                    break;
+                }
+            }
+            info!("persistence task exiting");
+        });
+
         let persistence_interval = if self.persistence_interval > Duration::ZERO {
             self.persistence_interval
         } else {
@@ -880,6 +1172,7 @@ impl RunLoop {
         let mut sleeping_nodes: HashMap<Uuid, SleepRequest> = HashMap::new();
         let mut sleeping_by_instance: HashMap<Uuid, HashSet<Uuid>> = HashMap::new();
         let mut blocked_until_by_instance: HashMap<Uuid, DateTime<Utc>> = HashMap::new();
+        let mut commit_barrier: CommitBarrier<ShardStep> = CommitBarrier::new();
         let mut instances_idle = false;
         let mut instances_done_pending: Vec<InstanceDone> = Vec::new();
         let mut run_result = Ok(());
@@ -932,6 +1225,9 @@ impl RunLoop {
                 Some(event) = event_rx.recv() => {
                     Some(CoordinatorEvent::Shard(event))
                 }
+                Some(ack) = persist_ack_rx.recv() => {
+                    Some(CoordinatorEvent::PersistAck(ack))
+                }
                 _ = persistence_tick.tick() => {
                     if self.persistence_interval > Duration::ZERO {
                         self.flush_instances_done(&mut instances_done_pending).await?;
@@ -959,6 +1255,7 @@ impl RunLoop {
             let mut all_steps: Vec<ShardStep> = Vec::new();
             let mut all_failed_instances: Vec<InstanceDone> = Vec::new();
             let mut all_wakes: Vec<SleepWake> = Vec::new();
+            let mut all_persist_acks: Vec<PersistAck> = Vec::new();
             let mut saw_empty_instances = false;
 
             match first_event {
@@ -994,6 +1291,9 @@ impl RunLoop {
                 },
                 CoordinatorEvent::SleepWake(wake) => {
                     all_wakes.push(wake);
+                }
+                CoordinatorEvent::PersistAck(ack) => {
+                    all_persist_acks.push(ack);
                 }
                 CoordinatorEvent::ActionTimeoutTick => {}
             }
@@ -1045,6 +1345,9 @@ impl RunLoop {
             while let Ok(wake) = sleep_rx.try_recv() {
                 all_wakes.push(wake);
             }
+            while let Ok(ack) = persist_ack_rx.try_recv() {
+                all_persist_acks.push(ack);
+            }
 
             if !inflight_dispatches.is_empty() {
                 let now = Utc::now();
@@ -1079,6 +1382,92 @@ impl RunLoop {
                         timeout_completions.append(&mut all_completions);
                         all_completions = timeout_completions;
                     }
+                }
+            }
+
+            if !all_persist_acks.is_empty() {
+                for ack in all_persist_acks {
+                    match ack {
+                        PersistAck::StepsPersisted {
+                            batch_id,
+                            lock_statuses,
+                        } => {
+                            let Some(batch) = commit_barrier.take_batch(batch_id) else {
+                                warn!(batch_id, "received ack for unknown persist batch");
+                                continue;
+                            };
+                            let evict_ids: HashSet<Uuid> = self
+                                .lock_mismatches(&lock_statuses)
+                                .into_iter()
+                                .filter(|instance_id| batch.instance_ids.contains(instance_id))
+                                .collect();
+                            let mut state = CoordinatorState {
+                                executor_shards: &mut executor_shards,
+                                shard_senders: &shard_senders,
+                                lock_tracker: &lock_tracker,
+                                inflight_actions: &mut inflight_actions,
+                                inflight_dispatches: &mut inflight_dispatches,
+                                sleeping_nodes: &mut sleeping_nodes,
+                                sleeping_by_instance: &mut sleeping_by_instance,
+                                blocked_until_by_instance: &mut blocked_until_by_instance,
+                                commit_barrier: &mut commit_barrier,
+                                instances_done_pending: &mut instances_done_pending,
+                                sleep_tx: &sleep_tx,
+                            };
+                            if !evict_ids.is_empty()
+                                && let Err(err) = self
+                                    .evict_instances(
+                                        &evict_ids.iter().copied().collect::<Vec<_>>(),
+                                        &mut state,
+                                    )
+                                    .await
+                            {
+                                run_result = Err(err);
+                                break;
+                            }
+                            for step in batch.steps {
+                                if !batch.instance_ids.contains(&step.executor_id) {
+                                    continue;
+                                }
+                                if evict_ids.contains(&step.executor_id) {
+                                    continue;
+                                }
+                                if !state.executor_shards.contains_key(&step.executor_id)
+                                    && step.instance_done.is_none()
+                                {
+                                    continue;
+                                }
+                                if let Err(err) = self.apply_confirmed_step(step, &mut state) {
+                                    run_result = Err(err);
+                                    break;
+                                }
+                            }
+                            if run_result.is_err() {
+                                break;
+                            }
+                            for instance_id in batch.instance_ids {
+                                if evict_ids.contains(&instance_id) {
+                                    state.commit_barrier.remove_instance(instance_id);
+                                    continue;
+                                }
+                                let events = state.commit_barrier.unblock_instance(instance_id);
+                                flush_deferred_instance_events(
+                                    instance_id,
+                                    events,
+                                    state.executor_shards,
+                                    state.shard_senders,
+                                );
+                            }
+                        }
+                        PersistAck::StepsPersistFailed { batch_id, error } => {
+                            warn!(batch_id, error = %error, "persist step batch failed");
+                            run_result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                if run_result.is_err() {
+                    break;
                 }
             }
 
@@ -1129,6 +1518,9 @@ impl RunLoop {
                 if !accepted.is_empty() {
                     let mut by_shard: HashMap<usize, Vec<ActionCompletion>> = HashMap::new();
                     for completion in accepted {
+                        let Some(completion) = commit_barrier.route_completion(completion) else {
+                            continue;
+                        };
                         if let Some(shard_idx) =
                             executor_shards.get(&completion.executor_id).copied()
                         {
@@ -1180,7 +1572,12 @@ impl RunLoop {
                         }
                     }
                     if let Some(shard_idx) = executor_shards.get(&wake.executor_id).copied() {
-                        by_shard.entry(shard_idx).or_default().push(wake.node_id);
+                        let Some(node_id) =
+                            commit_barrier.route_wake(wake.executor_id, wake.node_id)
+                        else {
+                            continue;
+                        };
+                        by_shard.entry(shard_idx).or_default().push(node_id);
                     }
                 }
                 for (shard_idx, nodes) in by_shard {
@@ -1235,6 +1632,9 @@ impl RunLoop {
                         replaced_instance_ids.iter().copied().collect();
                     inflight_dispatches
                         .retain(|_, dispatch| !replaced_set.contains(&dispatch.executor_id));
+                    for instance_id in &replaced_set {
+                        commit_barrier.remove_instance(*instance_id);
+                    }
                 }
                 let claimed_count = claimed_instance_ids.len();
                 lock_tracker.insert_all(claimed_instance_ids);
@@ -1252,10 +1652,6 @@ impl RunLoop {
                 instances_idle = true;
             }
 
-            let failed_executor_ids: HashSet<Uuid> = all_failed_instances
-                .iter()
-                .map(|instance_done| instance_done.executor_id)
-                .collect();
             if !all_failed_instances.is_empty() {
                 for instance_done in all_failed_instances {
                     warn!(
@@ -1274,140 +1670,41 @@ impl RunLoop {
                         }
                     }
                     blocked_until_by_instance.remove(&instance_done.executor_id);
+                    commit_barrier.remove_instance(instance_done.executor_id);
                     instances_done_pending.push(instance_done);
                 }
             }
 
             if !all_steps.is_empty() {
-                let lock_statuses = match self.persist_shard_steps(&all_steps).await {
-                    Ok(statuses) => statuses,
-                    Err(err) => {
-                        run_result = Err(err);
-                        break;
-                    }
-                };
-                let evict_ids = self.lock_mismatches(&lock_statuses);
-                if !evict_ids.is_empty()
-                    && let Err(err) = self
-                        .evict_instances(
-                            &evict_ids.iter().copied().collect::<Vec<_>>(),
-                            &mut EvictionState {
-                                executor_shards: &mut executor_shards,
-                                shard_senders: &shard_senders,
-                                lock_tracker: &lock_tracker,
-                                inflight_actions: &mut inflight_actions,
-                                inflight_dispatches: &mut inflight_dispatches,
-                                sleeping_nodes: &mut sleeping_nodes,
-                                sleeping_by_instance: &mut sleeping_by_instance,
-                                blocked_until_by_instance: &mut blocked_until_by_instance,
-                            },
-                        )
-                        .await
+                let instance_ids: HashSet<Uuid> =
+                    all_steps.iter().map(|step| step.executor_id).collect();
+                let (actions_done, graph_updates) = collect_step_updates(&all_steps);
+                let graph_instance_ids: HashSet<Uuid> = graph_updates
+                    .iter()
+                    .map(|update| update.instance_id)
+                    .collect();
+                let batch_id = commit_barrier.register_batch(instance_ids.clone(), all_steps);
+                if !send_persist_command_with_stop(
+                    &persist_tx,
+                    PersistCommand {
+                        batch_id,
+                        instance_ids,
+                        graph_instance_ids,
+                        actions_done,
+                        graph_updates,
+                    },
+                    &stop_notify,
+                )
+                .await
                 {
-                    run_result = Err(err);
-                    break;
-                }
-                for step in all_steps {
-                    if failed_executor_ids.contains(&step.executor_id) {
-                        continue;
-                    }
-                    if evict_ids.contains(&step.executor_id) {
-                        continue;
-                    }
-                    for request in step.actions {
-                        let dispatch = request.clone();
-                        if let Err(err) = self.worker_pool.queue(request) {
-                            run_result = Err(err.into());
-                            break;
-                        }
-                        *inflight_actions.entry(step.executor_id).or_insert(0) += 1;
-                        let deadline_at = if dispatch.timeout_seconds > 0 {
-                            Some(
-                                Utc::now()
-                                    + chrono::Duration::seconds(i64::from(
-                                        dispatch.timeout_seconds,
-                                    )),
-                            )
-                        } else {
-                            None
-                        };
-                        inflight_dispatches.insert(
-                            dispatch.execution_id,
-                            InflightActionDispatch {
-                                executor_id: dispatch.executor_id,
-                                attempt_number: dispatch.attempt_number,
-                                dispatch_token: dispatch.dispatch_token,
-                                timeout_seconds: dispatch.timeout_seconds,
-                                deadline_at,
-                            },
-                        );
-                    }
-                    if run_result.is_err() {
-                        break;
-                    }
-                    for mut sleep_request in step.sleep_requests {
-                        if self.skip_sleep {
-                            sleep_request.wake_at = Utc::now();
-                        }
-                        let existing = sleeping_nodes.get(&sleep_request.node_id);
-                        let should_update = match existing {
-                            Some(existing) => sleep_request.wake_at < existing.wake_at,
-                            None => true,
-                        };
-                        let wake_at = match existing {
-                            Some(existing) if !should_update => existing.wake_at,
-                            _ => sleep_request.wake_at,
-                        };
-                        sleeping_by_instance
-                            .entry(step.executor_id)
-                            .or_default()
-                            .insert(sleep_request.node_id);
-                        blocked_until_by_instance
-                            .entry(step.executor_id)
-                            .and_modify(|existing| {
-                                if wake_at < *existing {
-                                    *existing = wake_at;
-                                }
-                            })
-                            .or_insert(wake_at);
-
-                        if should_update {
-                            sleeping_nodes.insert(sleep_request.node_id, sleep_request.clone());
-                            let sleep_tx = sleep_tx.clone();
-                            let executor_id = step.executor_id;
-                            let node_id = sleep_request.node_id;
-                            let wake_at = sleep_request.wake_at;
-                            tokio::spawn(async move {
-                                if let Ok(wait) = wake_at.signed_duration_since(Utc::now()).to_std()
-                                    && wait > Duration::ZERO
-                                {
-                                    tokio::time::sleep(wait).await;
-                                }
-                                let _ = sleep_tx.send(SleepWake {
-                                    executor_id,
-                                    node_id,
-                                });
-                            });
+                    if let Some(batch) = commit_barrier.take_batch(batch_id) {
+                        for instance_id in batch.instance_ids {
+                            commit_barrier.remove_instance(instance_id);
                         }
                     }
-                    if let Some(instance_done) = step.instance_done {
-                        executor_shards.remove(&instance_done.executor_id);
-                        inflight_actions.remove(&instance_done.executor_id);
-                        inflight_dispatches.retain(|_, dispatch| {
-                            dispatch.executor_id != instance_done.executor_id
-                        });
-                        lock_tracker.remove_all([instance_done.executor_id]);
-                        if let Some(nodes) = sleeping_by_instance.remove(&instance_done.executor_id)
-                        {
-                            for node_id in nodes {
-                                sleeping_nodes.remove(&node_id);
-                            }
-                        }
-                        blocked_until_by_instance.remove(&instance_done.executor_id);
-                        instances_done_pending.push(instance_done);
-                    }
-                }
-                if run_result.is_err() {
+                    run_result = Err(RunLoopError::Message(
+                        "failed to submit persist batch to persistence task".to_string(),
+                    ));
                     break;
                 }
             }
@@ -1429,25 +1726,27 @@ impl RunLoop {
                         }
                     })
                     .collect();
-                if !evict_ids.is_empty()
-                    && let Err(err) = self
-                        .evict_instances(
-                            &evict_ids,
-                            &mut EvictionState {
-                                executor_shards: &mut executor_shards,
-                                shard_senders: &shard_senders,
-                                lock_tracker: &lock_tracker,
-                                inflight_actions: &mut inflight_actions,
-                                inflight_dispatches: &mut inflight_dispatches,
-                                sleeping_nodes: &mut sleeping_nodes,
-                                sleeping_by_instance: &mut sleeping_by_instance,
-                                blocked_until_by_instance: &mut blocked_until_by_instance,
-                            },
-                        )
-                        .await
-                {
-                    run_result = Err(err);
-                    break;
+                if !evict_ids.is_empty() {
+                    let mut state = CoordinatorState {
+                        executor_shards: &mut executor_shards,
+                        shard_senders: &shard_senders,
+                        lock_tracker: &lock_tracker,
+                        inflight_actions: &mut inflight_actions,
+                        inflight_dispatches: &mut inflight_dispatches,
+                        sleeping_nodes: &mut sleeping_nodes,
+                        sleeping_by_instance: &mut sleeping_by_instance,
+                        blocked_until_by_instance: &mut blocked_until_by_instance,
+                        commit_barrier: &mut commit_barrier,
+                        instances_done_pending: &mut instances_done_pending,
+                        sleep_tx: &sleep_tx,
+                    };
+                    if let Err(err) = self.evict_instances(&evict_ids, &mut state).await {
+                        run_result = Err(err);
+                        break;
+                    }
+                    for instance_id in evict_ids {
+                        state.commit_barrier.remove_instance(instance_id);
+                    }
                 }
             }
 
@@ -1472,6 +1771,14 @@ impl RunLoop {
         if let Err(err) = &run_result {
             error!(error = %err, "runloop stopping due to error");
         }
+        if commit_barrier.pending_batch_count() > 0 {
+            warn!(
+                pending = commit_barrier.pending_batch_count(),
+                "runloop stopping with unacked persist batches"
+            );
+        }
+        drop(persist_tx);
+        let _ = persist_handle.await;
         stop.store(true, Ordering::SeqCst);
         stop_notify.notify_waiters();
         let _ = completion_handle.await;
@@ -1683,14 +1990,21 @@ fn build_instance_done(
 mod tests {
     use super::*;
     use std::collections::{HashMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
+    };
     use std::time::Duration;
 
+    use chrono::Utc;
     use prost::Message;
     use sha2::{Digest, Sha256};
+    use tonic::async_trait;
 
     use crate::backends::{
-        ActionAttemptStatus, MemoryBackend, WorkflowRegistration, WorkflowRegistryBackend,
+        ActionAttemptStatus, BackendError, BackendResult, CoreBackend, GraphUpdate, InstanceDone,
+        InstanceLockStatus, LockClaim, MemoryBackend, QueuedInstanceBatch, WorkflowRegistration,
+        WorkflowRegistryBackend, WorkflowVersion,
     };
     use crate::messages::ast as ir;
     use crate::waymark_core::dag::convert_to_dag;
@@ -1698,6 +2012,136 @@ mod tests {
     use crate::waymark_core::runner::RunnerState;
     use crate::waymark_core::runner::state::NodeStatus;
     use crate::workers::ActionCallable;
+
+    #[derive(Clone)]
+    struct FaultInjectingBackend {
+        inner: MemoryBackend,
+        fail_get_queued_instances_with_depth_limit: Arc<AtomicBool>,
+        get_queued_instances_calls: Arc<AtomicUsize>,
+    }
+
+    impl FaultInjectingBackend {
+        fn with_depth_limit_poll_failures(inner: MemoryBackend) -> Self {
+            Self {
+                inner,
+                fail_get_queued_instances_with_depth_limit: Arc::new(AtomicBool::new(true)),
+                get_queued_instances_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn get_queued_instances_calls(&self) -> usize {
+            self.get_queued_instances_calls.load(AtomicOrdering::SeqCst)
+        }
+
+        fn queue_len(&self) -> usize {
+            self.inner
+                .instance_queue()
+                .as_ref()
+                .map(|queue| queue.lock().expect("queue poisoned").len())
+                .unwrap_or(0)
+        }
+
+        fn instances_done_len(&self) -> usize {
+            self.inner.instances_done().len()
+        }
+    }
+
+    #[async_trait]
+    impl CoreBackend for FaultInjectingBackend {
+        fn clone_box(&self) -> Box<dyn CoreBackend> {
+            Box::new(self.clone())
+        }
+
+        async fn save_graphs(
+            &self,
+            claim: LockClaim,
+            graphs: &[GraphUpdate],
+        ) -> BackendResult<Vec<InstanceLockStatus>> {
+            self.inner.save_graphs(claim, graphs).await
+        }
+
+        async fn save_actions_done(
+            &self,
+            actions: &[crate::backends::ActionDone],
+        ) -> BackendResult<()> {
+            self.inner.save_actions_done(actions).await
+        }
+
+        async fn save_instances_done(&self, instances: &[InstanceDone]) -> BackendResult<()> {
+            self.inner.save_instances_done(instances).await
+        }
+
+        async fn get_queued_instances(
+            &self,
+            size: usize,
+            claim: LockClaim,
+        ) -> BackendResult<QueuedInstanceBatch> {
+            self.get_queued_instances_calls
+                .fetch_add(1, AtomicOrdering::SeqCst);
+            if self
+                .fail_get_queued_instances_with_depth_limit
+                .load(AtomicOrdering::SeqCst)
+            {
+                return Err(BackendError::Message("depth limit exceeded".to_string()));
+            }
+            self.inner.get_queued_instances(size, claim).await
+        }
+
+        async fn queue_instances(
+            &self,
+            instances: &[crate::backends::QueuedInstance],
+        ) -> BackendResult<()> {
+            self.inner.queue_instances(instances).await
+        }
+
+        async fn refresh_instance_locks(
+            &self,
+            claim: LockClaim,
+            instance_ids: &[Uuid],
+        ) -> BackendResult<Vec<InstanceLockStatus>> {
+            self.inner.refresh_instance_locks(claim, instance_ids).await
+        }
+
+        async fn release_instance_locks(
+            &self,
+            lock_uuid: Uuid,
+            instance_ids: &[Uuid],
+        ) -> BackendResult<()> {
+            self.inner
+                .release_instance_locks(lock_uuid, instance_ids)
+                .await
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowRegistryBackend for FaultInjectingBackend {
+        async fn upsert_workflow_version(
+            &self,
+            registration: &WorkflowRegistration,
+        ) -> BackendResult<Uuid> {
+            self.inner.upsert_workflow_version(registration).await
+        }
+
+        async fn get_workflow_versions(&self, ids: &[Uuid]) -> BackendResult<Vec<WorkflowVersion>> {
+            self.inner.get_workflow_versions(ids).await
+        }
+    }
+
+    fn default_test_config(lock_uuid: Uuid) -> RunLoopSupervisorConfig {
+        RunLoopSupervisorConfig {
+            max_concurrent_instances: 25,
+            executor_shards: 1,
+            instance_done_batch_size: None,
+            poll_interval: Duration::from_millis(10),
+            persistence_interval: Duration::from_millis(10),
+            lock_uuid,
+            lock_ttl: Duration::from_secs(15),
+            lock_heartbeat: Duration::from_secs(5),
+            evict_sleep_threshold: Duration::from_secs(10),
+            skip_sleep: false,
+            active_instance_gauge: None,
+        }
+    }
 
     #[tokio::test]
     async fn test_runloop_executes_actions() {
@@ -2216,5 +2660,408 @@ fn main(input: [limit], output: [result]):
             InstanceMessage::Batch { instances } => assert!(instances.is_empty()),
             InstanceMessage::Error(err) => panic!("unexpected error message: {err}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_runloop_supervisor_restarts_on_depth_limit_backend_errors() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let backend =
+            FaultInjectingBackend::with_depth_limit_poll_failures(MemoryBackend::with_queue(queue));
+        let worker_pool = crate::workers::InlineWorkerPool::new(HashMap::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let supervisor = tokio::spawn(runloop_supervisor(
+            backend.clone(),
+            worker_pool,
+            default_test_config(Uuid::new_v4()),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        shutdown_tx.send(true).expect("send shutdown");
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+
+        assert!(
+            backend.get_queued_instances_calls() >= 2,
+            "expected multiple polling attempts while supervisor restarts"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runloop_supervisor_reproduces_no_progress_with_continued_queue_growth() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let backend =
+            FaultInjectingBackend::with_depth_limit_poll_failures(MemoryBackend::with_queue(queue));
+        let worker_pool = crate::workers::InlineWorkerPool::new(HashMap::new());
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let supervisor = tokio::spawn(runloop_supervisor(
+            backend.clone(),
+            worker_pool,
+            default_test_config(Uuid::new_v4()),
+            shutdown_rx,
+        ));
+
+        for _ in 0..20 {
+            backend
+                .queue_instances(&[QueuedInstance {
+                    workflow_version_id: Uuid::new_v4(),
+                    schedule_id: None,
+                    dag: None,
+                    entry_node: Uuid::new_v4(),
+                    state: None,
+                    action_results: HashMap::new(),
+                    instance_id: Uuid::new_v4(),
+                    scheduled_at: None,
+                }])
+                .await
+                .expect("queue synthetic instance");
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        shutdown_tx.send(true).expect("send shutdown");
+        tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("supervisor should stop")
+            .expect("supervisor task should not panic");
+
+        assert!(
+            backend.get_queued_instances_calls() >= 1,
+            "expected polling attempts during stall simulation"
+        );
+        assert!(
+            backend.queue_len() >= 20,
+            "queued work should continue to grow when poller cannot read instances"
+        );
+        assert_eq!(
+            backend.instances_done_len(),
+            0,
+            "no instances should complete while poller is failing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runloop_marks_instance_failed_when_rehydrated_state_is_missing_action_result() {
+        let source = r#"
+fn main(input: [x], output: [y]):
+    y = @tests.fixtures.test_actions.double(value=x)
+    return y
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let program_proto = program.encode_to_vec();
+        let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+        let dag = Arc::new(convert_to_dag(&program).expect("convert to dag"));
+
+        let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
+        let _ = state
+            .record_assignment(
+                vec!["x".to_string()],
+                &ir::Expr {
+                    kind: Some(ir::expr::Kind::Literal(ir::Literal {
+                        value: Some(ir::literal::Value::IntValue(4)),
+                    })),
+                    span: None,
+                },
+                None,
+                Some("input x = 4".to_string()),
+            )
+            .expect("record assignment");
+        let template_entry_node = dag
+            .entry_node
+            .as_ref()
+            .expect("DAG entry node not found")
+            .clone();
+        let entry_exec = state
+            .queue_template_node(&template_entry_node, None)
+            .expect("queue entry node");
+        let mut bootstrap_executor =
+            RunnerExecutor::new(Arc::clone(&dag), state, HashMap::new(), None);
+        let bootstrap_step = bootstrap_executor
+            .increment(&[entry_exec.node_id])
+            .expect("bootstrap increment should materialize action node");
+        let action_exec = bootstrap_step
+            .actions
+            .first()
+            .expect("bootstrap should queue one action call")
+            .clone();
+
+        // Simulate a reclaimed instance whose graph says the action execution node
+        // has finished, but action_results payload was lost.
+        bootstrap_executor
+            .state_mut()
+            .mark_completed(action_exec.node_id)
+            .expect("mark action completed");
+        bootstrap_executor.state_mut().ready_queue.clear();
+        assert!(
+            bootstrap_executor
+                .state()
+                .nodes
+                .get(&action_exec.node_id)
+                .is_some_and(|node| node.is_action_call() && node.status == NodeStatus::Completed),
+            "expected completed action execution node"
+        );
+        let state = bootstrap_executor.state().clone();
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let backend = MemoryBackend::with_queue(queue.clone());
+        let workflow_version_id = backend
+            .upsert_workflow_version(&WorkflowRegistration {
+                workflow_name: "test_missing_action_result".to_string(),
+                workflow_version: ir_hash.clone(),
+                ir_hash,
+                program_proto,
+                concurrent: false,
+            })
+            .await
+            .expect("register workflow version");
+
+        let worker_pool = crate::workers::InlineWorkerPool::new(HashMap::new());
+        let mut runloop = RunLoop::new(
+            worker_pool,
+            backend.clone(),
+            default_test_config(Uuid::new_v4()),
+        );
+        let instance_id = Uuid::new_v4();
+        queue.lock().expect("queue lock").push_back(QueuedInstance {
+            workflow_version_id,
+            schedule_id: None,
+            dag: None,
+            entry_node: action_exec.node_id,
+            state: Some(state),
+            action_results: HashMap::new(),
+            instance_id,
+            scheduled_at: None,
+        });
+
+        runloop
+            .run()
+            .await
+            .expect("runloop should continue after instance failure");
+        let instances_done = backend.instances_done();
+        assert_eq!(instances_done.len(), 1);
+        assert_eq!(instances_done[0].executor_id, instance_id);
+        let Value::Object(error_obj) = instances_done[0]
+            .error
+            .clone()
+            .expect("instance error payload")
+        else {
+            panic!("expected error payload object");
+        };
+        assert_eq!(
+            error_obj.get("type"),
+            Some(&Value::String("ExecutionError".to_string()))
+        );
+        let message = error_obj
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("error message");
+        assert!(
+            message.contains("missing action result for"),
+            "expected missing action result error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runloop_marks_instance_failed_with_dict_key_error() {
+        let source = r#"
+fn main(input: [], output: [result]):
+    payload = @tests.fixtures.test_actions.make_payload()
+    result = payload["missing"]
+    return result
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let program_proto = program.encode_to_vec();
+        let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+        let dag = Arc::new(convert_to_dag(&program).expect("convert to dag"));
+
+        let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
+        let entry_node = dag
+            .entry_node
+            .as_ref()
+            .expect("DAG entry node not found")
+            .clone();
+        let entry_exec = state
+            .queue_template_node(&entry_node, None)
+            .expect("queue entry node");
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let backend = MemoryBackend::with_queue(queue.clone());
+        let workflow_version_id = backend
+            .upsert_workflow_version(&WorkflowRegistration {
+                workflow_name: "test_dict_key_error".to_string(),
+                workflow_version: ir_hash.clone(),
+                ir_hash,
+                program_proto,
+                concurrent: false,
+            })
+            .await
+            .expect("register workflow version");
+
+        let mut actions: HashMap<String, ActionCallable> = HashMap::new();
+        actions.insert(
+            "make_payload".to_string(),
+            Arc::new(|_kwargs| {
+                Box::pin(async move {
+                    Ok(Value::Object(
+                        [("present".to_string(), Value::Number(1.into()))]
+                            .into_iter()
+                            .collect(),
+                    ))
+                })
+            }),
+        );
+        let worker_pool = crate::workers::InlineWorkerPool::new(actions);
+        let mut runloop = RunLoop::new(
+            worker_pool,
+            backend.clone(),
+            default_test_config(Uuid::new_v4()),
+        );
+        let instance_id = Uuid::new_v4();
+        queue.lock().expect("queue lock").push_back(QueuedInstance {
+            workflow_version_id,
+            schedule_id: None,
+            dag: None,
+            entry_node: entry_exec.node_id,
+            state: Some(state),
+            action_results: HashMap::new(),
+            instance_id,
+            scheduled_at: None,
+        });
+
+        runloop
+            .run()
+            .await
+            .expect("runloop should continue after instance failure");
+        let instances_done = backend.instances_done();
+        assert_eq!(instances_done.len(), 1);
+        assert_eq!(instances_done[0].executor_id, instance_id);
+        let Value::Object(error_obj) = instances_done[0]
+            .error
+            .clone()
+            .expect("instance error payload")
+        else {
+            panic!("expected error payload object");
+        };
+        let message = error_obj
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("error message");
+        assert!(
+            message.contains("dict has no key"),
+            "expected dict key error, got: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runloop_marks_instance_failed_with_attribute_error() {
+        let source = r#"
+fn main(input: [], output: [result]):
+    payload = @tests.fixtures.test_actions.make_number()
+    result = payload.missing
+    return result
+"#;
+        let program = parse_program(source.trim()).expect("parse program");
+        let program_proto = program.encode_to_vec();
+        let ir_hash = format!("{:x}", Sha256::digest(&program_proto));
+        let dag = Arc::new(convert_to_dag(&program).expect("convert to dag"));
+
+        let mut state = RunnerState::new(Some(Arc::clone(&dag)), None, None, false);
+        let entry_node = dag
+            .entry_node
+            .as_ref()
+            .expect("DAG entry node not found")
+            .clone();
+        let entry_exec = state
+            .queue_template_node(&entry_node, None)
+            .expect("queue entry node");
+
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let backend = MemoryBackend::with_queue(queue.clone());
+        let workflow_version_id = backend
+            .upsert_workflow_version(&WorkflowRegistration {
+                workflow_name: "test_attribute_error".to_string(),
+                workflow_version: ir_hash.clone(),
+                ir_hash,
+                program_proto,
+                concurrent: false,
+            })
+            .await
+            .expect("register workflow version");
+
+        let mut actions: HashMap<String, ActionCallable> = HashMap::new();
+        actions.insert(
+            "make_number".to_string(),
+            Arc::new(|_kwargs| Box::pin(async move { Ok(Value::Number(7.into())) })),
+        );
+        let worker_pool = crate::workers::InlineWorkerPool::new(actions);
+        let mut runloop = RunLoop::new(
+            worker_pool,
+            backend.clone(),
+            default_test_config(Uuid::new_v4()),
+        );
+        let instance_id = Uuid::new_v4();
+        queue.lock().expect("queue lock").push_back(QueuedInstance {
+            workflow_version_id,
+            schedule_id: None,
+            dag: None,
+            entry_node: entry_exec.node_id,
+            state: Some(state),
+            action_results: HashMap::new(),
+            instance_id,
+            scheduled_at: None,
+        });
+
+        runloop
+            .run()
+            .await
+            .expect("runloop should continue after instance failure");
+        let instances_done = backend.instances_done();
+        assert_eq!(instances_done.len(), 1);
+        assert_eq!(instances_done[0].executor_id, instance_id);
+        let Value::Object(error_obj) = instances_done[0]
+            .error
+            .clone()
+            .expect("instance error payload")
+        else {
+            panic!("expected error payload object");
+        };
+        let message = error_obj
+            .get("message")
+            .and_then(Value::as_str)
+            .expect("error message");
+        assert!(
+            message.contains("attribute not found"),
+            "expected attribute error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn test_lock_mismatches_ignores_expired_lock_with_matching_owner() {
+        let backend = MemoryBackend::new();
+        let worker_pool = crate::workers::InlineWorkerPool::new(HashMap::new());
+        let lock_uuid = Uuid::new_v4();
+        let runloop = RunLoop::new(worker_pool, backend, default_test_config(lock_uuid));
+
+        let instance_id = Uuid::new_v4();
+        let statuses = vec![InstanceLockStatus {
+            instance_id,
+            lock_uuid: Some(lock_uuid),
+            lock_expires_at: Some(Utc::now() - chrono::Duration::seconds(60)),
+        }];
+        assert!(
+            runloop.lock_mismatches(&statuses).is_empty(),
+            "matching lock UUID should not evict solely due to stale expiry"
+        );
+
+        let mismatched = vec![InstanceLockStatus {
+            instance_id,
+            lock_uuid: Some(Uuid::new_v4()),
+            lock_expires_at: Some(Utc::now() + chrono::Duration::seconds(60)),
+        }];
+        let evict_ids = runloop.lock_mismatches(&mismatched);
+        assert_eq!(evict_ids, HashSet::from([instance_id]));
     }
 }
