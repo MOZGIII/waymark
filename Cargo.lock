@@ -3390,6 +3390,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymark-dag"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "serde",
+ "thiserror 1.0.69",
+ "uuid",
+ "waymark",
+ "waymark-proto",
+]
+
+[[package]]
 name = "waymark-fuzzer"
 version = "0.1.0"
 dependencies = [
