@@ -910,6 +910,7 @@ impl RunnerExecutor {
                 &template.label(),
                 QueueNodeParams {
                     template_id: Some(template.id.clone()),
+                    iteration_index,
                     targets: Some(targets.clone()),
                     action: Some(spec.clone()),
                     ..QueueNodeParams::default()

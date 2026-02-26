@@ -233,6 +233,7 @@ impl ExecutionNode {
 pub struct QueueNodeParams {
     pub node_id: Option<Uuid>,
     pub template_id: Option<String>,
+    pub iteration_index: Option<i32>,
     pub targets: Option<Vec<String>>,
     pub action: Option<ActionCallSpec>,
     pub value_expr: Option<ValueExpr>,
@@ -430,12 +431,25 @@ impl RunnerState {
         let QueueNodeParams {
             node_id,
             template_id,
+            iteration_index,
             targets,
             action,
             value_expr,
             scheduled_at,
         } = params;
-        let node_id = node_id.unwrap_or_else(Uuid::new_v4);
+        let node_id = match (node_id, template_id.as_ref()) {
+            (Some(existing), _) => existing,
+            (None, Some(template_id)) => {
+                let occurrence = self
+                    .template_node_counts
+                    .get(template_id)
+                    .copied()
+                    .unwrap_or(0)
+                    + 1;
+                self.build_template_execution_id(template_id, iteration_index, occurrence)
+            }
+            (None, None) => Uuid::new_v4(),
+        };
         let action_attempt = if matches!(node_type_enum, ExecutionNodeType::ActionCall) {
             1
         } else {
@@ -481,6 +495,7 @@ impl RunnerState {
             ExecutionNodeType::ActionCall.as_str(),
             &format!("@{}()", spec.action_name),
             QueueNodeParams {
+                iteration_index,
                 targets: targets.clone(),
                 action: Some(spec.clone()),
                 ..QueueNodeParams::default()
@@ -1556,6 +1571,7 @@ impl RunnerState {
             ExecutionNodeType::ActionCall.as_str(),
             &format!("@{}()", spec.action_name),
             QueueNodeParams {
+                iteration_index,
                 targets: targets.clone(),
                 action: Some(spec.clone()),
                 ..QueueNodeParams::default()
@@ -2069,6 +2085,65 @@ mod tests {
 
         assert_eq!(first.node_id, first_fresh.node_id);
         assert_eq!(second_from_rehydrate.node_id, second_fresh.node_id);
+    }
+
+    #[test]
+    fn test_queue_node_with_template_id_is_deterministic() {
+        let instance_id = Uuid::new_v4();
+
+        let mut state_a = RunnerState::new(None, None, None, false);
+        state_a.set_execution_namespace(instance_id);
+        let first_a = state_a
+            .queue_node(
+                ExecutionNodeType::ActionCall.as_str(),
+                "@demo()",
+                QueueNodeParams {
+                    template_id: Some("action_1".to_string()),
+                    iteration_index: Some(0),
+                    ..QueueNodeParams::default()
+                },
+            )
+            .expect("queue first action in state_a");
+        let second_a = state_a
+            .queue_node(
+                ExecutionNodeType::ActionCall.as_str(),
+                "@demo()",
+                QueueNodeParams {
+                    template_id: Some("action_1".to_string()),
+                    iteration_index: Some(1),
+                    ..QueueNodeParams::default()
+                },
+            )
+            .expect("queue second action in state_a");
+
+        let mut state_b = RunnerState::new(None, None, None, false);
+        state_b.set_execution_namespace(instance_id);
+        let first_b = state_b
+            .queue_node(
+                ExecutionNodeType::ActionCall.as_str(),
+                "@demo()",
+                QueueNodeParams {
+                    template_id: Some("action_1".to_string()),
+                    iteration_index: Some(0),
+                    ..QueueNodeParams::default()
+                },
+            )
+            .expect("queue first action in state_b");
+        let second_b = state_b
+            .queue_node(
+                ExecutionNodeType::ActionCall.as_str(),
+                "@demo()",
+                QueueNodeParams {
+                    template_id: Some("action_1".to_string()),
+                    iteration_index: Some(1),
+                    ..QueueNodeParams::default()
+                },
+            )
+            .expect("queue second action in state_b");
+
+        assert_eq!(first_a.node_id, first_b.node_id);
+        assert_eq!(second_a.node_id, second_b.node_id);
+        assert_ne!(first_a.node_id, second_a.node_id);
     }
 
     #[test]
