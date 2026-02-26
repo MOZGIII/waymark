@@ -213,6 +213,7 @@ impl RunnerExecutor {
 
     pub fn set_instance_id(&mut self, instance_id: Uuid) {
         self.instance_id = Some(instance_id);
+        self.state.set_execution_namespace(instance_id);
     }
 
     pub fn terminal_error(&self) -> Option<&Value> {
