@@ -674,10 +674,7 @@ impl RunnerState {
         if let Some(iteration_index) = iteration_index {
             seed.push_str(&format!(";iteration={iteration_index}"));
         }
-        Ok(deterministic_uuid(
-            self.execution_namespace,
-            seed.as_bytes(),
-        ))
+        Ok(Uuid::new_v5(&self.execution_namespace, seed.as_bytes()))
     }
 
     /// Rebuild derived structures from persisted nodes and edges.
@@ -1950,31 +1947,6 @@ fn fold_literal_unary(op: i32, operand: &serde_json::Value) -> Option<serde_json
 
 fn default_execution_namespace() -> Uuid {
     Uuid::nil()
-}
-
-fn deterministic_uuid(namespace: Uuid, seed: &[u8]) -> Uuid {
-    fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
-        for byte in bytes {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
-    }
-
-    let namespace_bytes = namespace.as_bytes();
-    let high = fnv1a64(0xcbf29ce484222325, namespace_bytes);
-    let high = fnv1a64(high, seed);
-
-    let low = fnv1a64(0x84222325cbf29ce4, namespace_bytes);
-    let low = fnv1a64(low, b":waymark");
-    let low = fnv1a64(low, seed);
-
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&high.to_be_bytes());
-    bytes[8..].copy_from_slice(&low.to_be_bytes());
-    bytes[6] = (bytes[6] & 0x0f) | 0x50;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Uuid::from_bytes(bytes)
 }
 
 impl fmt::Display for NodeStatus {
