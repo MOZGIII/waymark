@@ -384,7 +384,7 @@ impl RunnerState {
             .copied()
             .unwrap_or(0)
             + 1;
-        let node_id = self.build_template_execution_id(template_id, iteration_index, occurrence);
+        let node_id = self.build_template_execution_id(template_id, iteration_index, occurrence)?;
         let node = ExecutionNode {
             node_id,
             node_type: template.node_type().to_string(),
@@ -446,7 +446,7 @@ impl RunnerState {
                     .copied()
                     .unwrap_or(0)
                     + 1;
-                self.build_template_execution_id(template_id, iteration_index, occurrence)
+                self.build_template_execution_id(template_id, iteration_index, occurrence)?
             }
             (None, None) => Uuid::new_v4(),
         };
@@ -664,15 +664,20 @@ impl RunnerState {
         template_id: &str,
         iteration_index: Option<i32>,
         occurrence: u64,
-    ) -> Uuid {
+    ) -> Result<Uuid, RunnerStateError> {
         if self.execution_namespace.is_nil() {
-            return Uuid::new_v4();
+            return Err(RunnerStateError(
+                "execution namespace must be set before queueing template-backed nodes".to_string(),
+            ));
         }
         let mut seed = format!("template={template_id};occurrence={occurrence}");
         if let Some(iteration_index) = iteration_index {
             seed.push_str(&format!(";iteration={iteration_index}"));
         }
-        deterministic_uuid(self.execution_namespace, seed.as_bytes())
+        Ok(deterministic_uuid(
+            self.execution_namespace,
+            seed.as_bytes(),
+        ))
     }
 
     /// Rebuild derived structures from persisted nodes and edges.
@@ -2144,6 +2149,21 @@ mod tests {
         assert_eq!(first_a.node_id, first_b.node_id);
         assert_eq!(second_a.node_id, second_b.node_id);
         assert_ne!(first_a.node_id, second_a.node_id);
+    }
+
+    #[test]
+    fn test_queue_template_node_requires_execution_namespace() {
+        let dag = single_action_dag("action_1");
+        let mut state = RunnerState::new(Some(dag), None, None, false);
+
+        let err = state
+            .queue_template_node("action_1", Some(0))
+            .expect_err("template-backed queueing should require execution namespace");
+        assert!(
+            err.0.contains("execution namespace must be set"),
+            "unexpected error: {}",
+            err.0
+        );
     }
 
     #[test]
