@@ -3806,6 +3806,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymark-replay-activity-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "tokio",
+ "waymark-replay-activity-core",
+]
+
+[[package]]
 name = "waymark-runner"
 version = "0.1.0"
 dependencies = [
@@ -3928,10 +3938,14 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "waymark",
+ "waymark-backend-activity-log",
  "waymark-backend-postgres",
  "waymark-backend-postgres-migrations",
+ "waymark-backend-replay",
  "waymark-dag",
  "waymark-proto",
+ "waymark-replay-activity-core",
+ "waymark-replay-activity-io",
 ]
 
 [[package]]

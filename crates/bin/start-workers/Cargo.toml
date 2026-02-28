@@ -5,9 +5,13 @@ edition = "2024"
 
 [dependencies]
 waymark-dag = { workspace = true }
+waymark-backend-activity-log = { workspace = true }
 waymark-backend-postgres = { workspace = true }
 waymark-backend-postgres-migrations = { workspace = true }
+waymark-backend-replay = { workspace = true }
 waymark-proto = { workspace = true }
+waymark-replay-activity-core = { workspace = true }
+waymark-replay-activity-io = { workspace = true }
 waymark = { workspace = true }
 
 anyhow = { workspace = true }

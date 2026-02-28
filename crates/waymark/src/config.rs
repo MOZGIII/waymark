@@ -2,6 +2,7 @@
 
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,30 @@ const DEFAULT_LOCK_TTL_MS: u64 = 15_000;
 const DEFAULT_EXPIRED_LOCK_RECLAIMER_INTERVAL_MS: u64 = 15_000;
 const DEFAULT_EXPIRED_LOCK_RECLAIMER_BATCH_SIZE: usize = 1_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendActivityMode {
+    Without,
+    Record,
+    Replay,
+}
+
+impl BackendActivityMode {
+    fn from_env_value(raw: Option<String>) -> Result<Self> {
+        let Some(raw) = raw else {
+            return Ok(Self::Without);
+        };
+        let mode = raw.trim().to_ascii_lowercase();
+        match mode.as_str() {
+            "without" => Ok(Self::Without),
+            "record" => Ok(Self::Record),
+            "replay" => Ok(Self::Replay),
+            _ => Err(anyhow::anyhow!(
+                "invalid WAYMARK_BACKEND_ACTIVITY_MODE '{raw}' (expected one of: without, record, replay)"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorkerConfig {
     pub database_url: String,
@@ -47,6 +72,8 @@ pub struct WorkerConfig {
     pub garbage_collector: GarbageCollectorConfig,
     pub webapp: WebappConfig,
     pub profile_interval: Duration,
+    pub backend_activity_mode: BackendActivityMode,
+    pub backend_activity_log: Option<PathBuf>,
 }
 
 impl WorkerConfig {
@@ -139,6 +166,14 @@ impl WorkerConfig {
             .max(1);
         let profile_interval = Duration::from_millis(profile_interval_ms);
 
+        let backend_activity_mode =
+            BackendActivityMode::from_env_value(env::var("WAYMARK_BACKEND_ACTIVITY_MODE").ok())?;
+        let backend_activity_log = env::var("WAYMARK_BACKEND_ACTIVITY_LOG")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+
         Ok(Self {
             database_url,
             worker_grpc_addr,
@@ -160,6 +195,8 @@ impl WorkerConfig {
             garbage_collector,
             webapp,
             profile_interval,
+            backend_activity_mode,
+            backend_activity_log,
         })
     }
 }

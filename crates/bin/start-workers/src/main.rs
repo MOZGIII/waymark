@@ -31,6 +31,8 @@
 //! - WAYMARK_GARBAGE_COLLECTOR_RETENTION_HOURS: Done-instance retention window (default: 24)
 //! - WAYMARK_WEBAPP_ENABLED / WAYMARK_WEBAPP_ADDR: Web dashboard configuration
 //! - WAYMARK_RUNNER_PROFILE_INTERVAL_MS: Status reporting interval (default: 5000)
+//! - WAYMARK_BACKEND_ACTIVITY_MODE: one of without|record|replay (default: without)
+//! - WAYMARK_BACKEND_ACTIVITY_LOG: JSON activity log path (required for record/replay)
 
 use std::sync::{Arc, atomic::AtomicUsize};
 use std::time::Duration;
@@ -43,13 +45,16 @@ use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use uuid::Uuid;
-use waymark::config::WorkerConfig;
+use waymark::config::{BackendActivityMode, WorkerConfig};
 use waymark::scheduler::{DagResolver, WorkflowDag};
 use waymark::waymark_core::runloop::{RunLoopSupervisorConfig, runloop_supervisor};
 use waymark::{PythonWorkerConfig, RemoteWorkerPool, WebappServer, spawn_status_reporter};
+use waymark_backend_activity_log::ActivityLoggingBackend;
 use waymark_backend_postgres::PostgresBackend;
+use waymark_backend_replay::ReplayBackend;
 use waymark_dag::convert_to_dag;
 use waymark_proto::ast as ir;
+use waymark_replay_activity_io::{load_activity_log, persist_activity_log};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,10 +89,44 @@ async fn main() -> Result<()> {
     // Wire shutdown coordination.
     let shutdown_token = tokio_util::sync::CancellationToken::new();
 
-    // Initialize the database and backend.
-    let pool = PgPool::connect(&config.database_url).await?;
-    waymark_backend_postgres_migrations::run(&pool).await?;
-    let backend = PostgresBackend::new(pool);
+    let activity_log_path = match config.backend_activity_mode {
+        BackendActivityMode::Without => config.backend_activity_log.clone(),
+        BackendActivityMode::Record | BackendActivityMode::Replay => {
+            Some(require_activity_log_path(
+                config.backend_activity_mode,
+                config.backend_activity_log.as_ref(),
+            )?)
+        }
+    };
+
+    let mut postgres_backend: Option<PostgresBackend> = None;
+    let mut recording_backend: Option<ActivityLoggingBackend> = None;
+    let mut replay_backend: Option<ReplayBackend> = None;
+
+    match config.backend_activity_mode {
+        BackendActivityMode::Without | BackendActivityMode::Record => {
+            let pool = PgPool::connect(&config.database_url).await?;
+            waymark_backend_postgres_migrations::run(&pool).await?;
+            let backend = PostgresBackend::new(pool);
+            if config.backend_activity_mode == BackendActivityMode::Record {
+                recording_backend = Some(ActivityLoggingBackend::new(Arc::new(backend.clone())));
+            }
+            postgres_backend = Some(backend);
+        }
+        BackendActivityMode::Replay => {
+            let activity = load_activity_log(
+                activity_log_path
+                    .as_ref()
+                    .expect("activity log path required for replay"),
+            )
+            .await?;
+            replay_backend = Some(ReplayBackend::new(activity));
+            info!(
+                mode = "replay",
+                "using replay backend activity log; scheduler/webapp/status/garbage-collector disabled"
+            );
+        }
+    }
 
     // Start the worker pool (bridge + python workers).
     let mut worker_config = PythonWorkerConfig::new();
@@ -109,60 +148,65 @@ async fn main() -> Result<()> {
         "python worker pool started"
     );
 
-    // Start the webapp server.
-    let webapp_backend = Arc::new(backend.clone());
-    let webapp_server = WebappServer::start(config.webapp.clone(), webapp_backend).await?;
-
-    // Start the scheduler loop.
-    let dag_resolver = build_dag_resolver(backend.pool().clone());
-    let scheduler_handle = {
-        let shutdown = shutdown_token.clone().cancelled_owned();
-        let task = waymark::SchedulerTask {
-            backend: backend.clone(),
-            config: config.scheduler.clone(),
-            dag_resolver,
-        };
-        tokio::spawn(task.run(shutdown))
-    };
-    info!(
-        poll_interval_ms = config.scheduler.poll_interval.as_millis(),
-        batch_size = config.scheduler.batch_size,
-        "scheduler task started"
-    );
-
-    let garbage_collector_handle = {
-        let shutdown = shutdown_token.clone().cancelled_owned();
-        let task = waymark::GarbageCollectorTask {
-            backend: backend.clone(),
-            config: config.garbage_collector.clone(),
-        };
-        tokio::spawn(task.run(shutdown))
-    };
-    info!(
-        interval_ms = config.garbage_collector.interval.as_millis(),
-        batch_size = config.garbage_collector.batch_size,
-        retention_secs = config.garbage_collector.retention.as_secs(),
-        "garbage collector task started"
-    );
+    let mut webapp_server = None;
+    let mut scheduler_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut garbage_collector_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut status_reporter_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let mut expired_lock_reclaimer_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     let active_instance_gauge = Arc::new(AtomicUsize::new(0));
 
-    // Start status reporting.
-    let pool_id = Uuid::new_v4();
-    let status_reporter_handle = spawn_status_reporter(
-        pool_id,
-        backend.clone(),
-        remote_pool.clone(),
-        active_instance_gauge.clone(),
-        config.profile_interval,
-        shutdown_token.clone().cancelled_owned(),
-    );
-    let expired_lock_reclaimer_handle = spawn_expired_lock_reclaimer(
-        backend.clone(),
-        config.expired_lock_reclaimer_interval,
-        config.expired_lock_reclaimer_batch_size,
-        shutdown_token.clone().cancelled_owned(),
-    );
+    if let Some(backend) = postgres_backend.as_ref() {
+        let webapp_backend = Arc::new(backend.clone());
+        webapp_server = WebappServer::start(config.webapp.clone(), webapp_backend).await?;
+
+        let dag_resolver = build_dag_resolver(backend.pool().clone());
+        scheduler_handle = Some({
+            let shutdown = shutdown_token.clone().cancelled_owned();
+            let task = waymark::SchedulerTask {
+                backend: backend.clone(),
+                config: config.scheduler.clone(),
+                dag_resolver,
+            };
+            tokio::spawn(task.run(shutdown))
+        });
+        info!(
+            poll_interval_ms = config.scheduler.poll_interval.as_millis(),
+            batch_size = config.scheduler.batch_size,
+            "scheduler task started"
+        );
+
+        garbage_collector_handle = Some({
+            let shutdown = shutdown_token.clone().cancelled_owned();
+            let task = waymark::GarbageCollectorTask {
+                backend: backend.clone(),
+                config: config.garbage_collector.clone(),
+            };
+            tokio::spawn(task.run(shutdown))
+        });
+        info!(
+            interval_ms = config.garbage_collector.interval.as_millis(),
+            batch_size = config.garbage_collector.batch_size,
+            retention_secs = config.garbage_collector.retention.as_secs(),
+            "garbage collector task started"
+        );
+
+        let pool_id = Uuid::new_v4();
+        status_reporter_handle = Some(spawn_status_reporter(
+            pool_id,
+            backend.clone(),
+            remote_pool.clone(),
+            active_instance_gauge.clone(),
+            config.profile_interval,
+            shutdown_token.clone().cancelled_owned(),
+        ));
+        expired_lock_reclaimer_handle = Some(spawn_expired_lock_reclaimer(
+            backend.clone(),
+            config.expired_lock_reclaimer_interval,
+            config.expired_lock_reclaimer_batch_size,
+            shutdown_token.clone().cancelled_owned(),
+        ));
+    }
 
     let shutdown_handle = tokio::spawn({
         let shutdown_token = shutdown_token.clone();
@@ -178,31 +222,84 @@ async fn main() -> Result<()> {
 
     // Run the runloop supervisor until shutdown.
     let lock_uuid = Uuid::new_v4();
-    runloop_supervisor(
-        backend.clone(),
-        remote_pool.clone(),
-        RunLoopSupervisorConfig {
-            max_concurrent_instances: config.max_concurrent_instances,
-            executor_shards: config.executor_shards,
-            instance_done_batch_size: config.instance_done_batch_size,
-            poll_interval: config.poll_interval,
-            persistence_interval: config.persistence_interval,
-            lock_uuid,
-            lock_ttl: config.lock_ttl,
-            lock_heartbeat: config.lock_heartbeat,
-            evict_sleep_threshold: config.evict_sleep_threshold,
-            skip_sleep: false,
-            active_instance_gauge: Some(active_instance_gauge),
-        },
-        shutdown_token,
-    )
-    .await;
+    let supervisor_config = RunLoopSupervisorConfig {
+        max_concurrent_instances: config.max_concurrent_instances,
+        executor_shards: config.executor_shards,
+        instance_done_batch_size: config.instance_done_batch_size,
+        poll_interval: config.poll_interval,
+        persistence_interval: config.persistence_interval,
+        lock_uuid,
+        lock_ttl: config.lock_ttl,
+        lock_heartbeat: config.lock_heartbeat,
+        evict_sleep_threshold: config.evict_sleep_threshold,
+        skip_sleep: false,
+        active_instance_gauge: Some(active_instance_gauge),
+    };
+
+    match config.backend_activity_mode {
+        BackendActivityMode::Without => {
+            runloop_supervisor(
+                postgres_backend
+                    .as_ref()
+                    .expect("postgres backend should exist")
+                    .clone(),
+                remote_pool.clone(),
+                supervisor_config,
+                shutdown_token,
+            )
+            .await;
+        }
+        BackendActivityMode::Record => {
+            runloop_supervisor(
+                recording_backend
+                    .as_ref()
+                    .expect("recording backend should exist")
+                    .clone(),
+                remote_pool.clone(),
+                supervisor_config,
+                shutdown_token,
+            )
+            .await;
+        }
+        BackendActivityMode::Replay => {
+            runloop_supervisor(
+                replay_backend
+                    .as_ref()
+                    .expect("replay backend should exist")
+                    .clone(),
+                remote_pool.clone(),
+                supervisor_config,
+                shutdown_token,
+            )
+            .await;
+        }
+    }
+
+    if let Some(recording_backend) = recording_backend.as_ref()
+        && let Some(path) = activity_log_path.as_ref()
+    {
+        let activity = recording_backend.activity();
+        persist_activity_log(path, &activity).await?;
+        info!(
+            path = %path.display(),
+            events = activity.len(),
+            "persisted backend activity recording"
+        );
+    }
 
     let _ = shutdown_handle.await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), scheduler_handle).await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), garbage_collector_handle).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), status_reporter_handle).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), expired_lock_reclaimer_handle).await;
+    if let Some(handle) = scheduler_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = garbage_collector_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+    if let Some(handle) = status_reporter_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+    if let Some(handle) = expired_lock_reclaimer_handle {
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
 
     if let Err(err) = remote_pool.shutdown().await {
         warn!(error = %err, "worker pool shutdown failed");
@@ -321,4 +418,15 @@ async fn wait_for_shutdown() -> Result<()> {
         info!("Ctrl+C received");
         Ok(())
     }
+}
+
+fn require_activity_log_path(
+    mode: BackendActivityMode,
+    path: Option<&std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    path.cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "WAYMARK_BACKEND_ACTIVITY_LOG is required when WAYMARK_BACKEND_ACTIVITY_MODE is {mode:?}"
+        )
+    })
 }

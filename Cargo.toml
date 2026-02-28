@@ -5,6 +5,7 @@ members = ["crates/lib/*", "crates/bin/*", "crates/waymark"]
 [workspace.dependencies]
 waymark = { path = "crates/waymark" }
 waymark-replay-activity-core = { path = "crates/lib/replay-activity-core" }
+waymark-replay-activity-io = { path = "crates/lib/replay-activity-io" }
 waymark-backend-fault-injection = { path = "crates/lib/backend-fault-injection" }
 waymark-backend-activity-log = { path = "crates/lib/backend-activity-log" }
 waymark-backend-memory = { path = "crates/lib/backend-memory" }
