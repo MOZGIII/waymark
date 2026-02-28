@@ -1,0 +1,15 @@
+[package]
+name = "waymark-backend-replay"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+uuid = { workspace = true }
+waymark-backend-activity-log = { workspace = true }
+waymark-backends-core = { workspace = true }
+waymark-core-backend = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

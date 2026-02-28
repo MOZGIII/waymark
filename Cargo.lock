@@ -3456,6 +3456,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "waymark-backend-activity-log"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "tokio",
+ "uuid",
+ "waymark-backend-memory",
+ "waymark-backends-core",
+ "waymark-core-backend",
+]
+
+[[package]]
 name = "waymark-backend-fault-injection"
 version = "0.1.0"
 dependencies = [
@@ -3526,6 +3540,19 @@ name = "waymark-backend-postgres-migrations"
 version = "0.1.0"
 dependencies = [
  "sqlx",
+]
+
+[[package]]
+name = "waymark-backend-replay"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "tokio",
+ "uuid",
+ "waymark-backend-activity-log",
+ "waymark-backends-core",
+ "waymark-core-backend",
 ]
 
 [[package]]

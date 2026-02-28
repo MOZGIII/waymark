@@ -5,9 +5,11 @@ members = ["crates/lib/*", "crates/bin/*", "crates/waymark"]
 [workspace.dependencies]
 waymark = { path = "crates/waymark" }
 waymark-backend-fault-injection = { path = "crates/lib/backend-fault-injection" }
+waymark-backend-activity-log = { path = "crates/lib/backend-activity-log" }
 waymark-backend-memory = { path = "crates/lib/backend-memory" }
 waymark-backend-postgres = { path = "crates/lib/backend-postgres" }
 waymark-backend-postgres-migrations = { path = "crates/lib/backend-postgres-migrations" }
+waymark-backend-replay = { path = "crates/lib/backend-replay" }
 waymark-backends-core = { path = "crates/lib/backends-core" }
 waymark-core-backend = { path = "crates/lib/core-backend" }
 waymark-dag = { path = "crates/lib/dag" }

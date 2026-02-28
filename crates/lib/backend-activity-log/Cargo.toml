@@ -1,0 +1,16 @@
+[package]
+name = "waymark-backend-activity-log"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+uuid = { workspace = true, features = ["serde"] }
+waymark-backends-core = { workspace = true }
+waymark-core-backend = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+waymark-backend-memory = { workspace = true }
