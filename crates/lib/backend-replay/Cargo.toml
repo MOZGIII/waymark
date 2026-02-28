@@ -6,9 +6,10 @@ edition = "2024"
 [dependencies]
 async-trait = { workspace = true }
 uuid = { workspace = true }
-waymark-backend-activity-log = { workspace = true }
+waymark-replay-activity-core = { workspace = true }
 waymark-backends-core = { workspace = true }
 waymark-core-backend = { workspace = true }
+waymark-workflow-registry-backend = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }

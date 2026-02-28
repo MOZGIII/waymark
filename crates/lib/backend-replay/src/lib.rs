@@ -2,22 +2,26 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
-use waymark_backend_activity_log::{
-    CoreBackendActivity, RecordedInstanceLockStatus, RecordedResult,
-};
 use waymark_backends_core::{BackendError, BackendResult};
 use waymark_core_backend::{
     ActionDone, CoreBackend, GraphUpdate, InstanceDone, InstanceLockStatus, LockClaim,
     QueuedInstance, QueuedInstanceBatch,
 };
+use waymark_replay_activity_core::{
+    BackendActivity, CoreBackendActivity, RecordedInstanceLockStatus, RecordedResult,
+    WorkflowRegistryActivity,
+};
+use waymark_workflow_registry_backend::{
+    WorkflowRegistration, WorkflowRegistryBackend, WorkflowVersion,
+};
 
 #[derive(Clone)]
 pub struct ReplayBackend {
-    activity: Arc<Mutex<VecDeque<CoreBackendActivity>>>,
+    activity: Arc<Mutex<VecDeque<BackendActivity>>>,
 }
 
 impl ReplayBackend {
-    pub fn new(activity: Vec<CoreBackendActivity>) -> Self {
+    pub fn new(activity: Vec<BackendActivity>) -> Self {
         Self {
             activity: Arc::new(Mutex::new(VecDeque::from(activity))),
         }
@@ -27,7 +31,7 @@ impl ReplayBackend {
         self.activity.lock().expect("activity queue poisoned").len()
     }
 
-    fn next_activity(&self, method: &str) -> BackendResult<CoreBackendActivity> {
+    fn next_activity(&self, method: &str) -> BackendResult<BackendActivity> {
         let mut guard = self.activity.lock().expect("activity queue poisoned");
         let Some(entry) = guard.pop_front() else {
             return Err(BackendError::Message(format!(
@@ -37,7 +41,7 @@ impl ReplayBackend {
         Ok(entry)
     }
 
-    fn unexpected(expected: &str, got: &CoreBackendActivity) -> BackendError {
+    fn unexpected(expected: &str, got: &BackendActivity) -> BackendError {
         BackendError::Message(format!(
             "replay activity mismatch: expected {expected}, got {got:?}",
         ))
@@ -65,7 +69,9 @@ impl CoreBackend for ReplayBackend {
     ) -> BackendResult<Vec<InstanceLockStatus>> {
         let entry = self.next_activity("save_graphs")?;
         match entry {
-            CoreBackendActivity::SaveGraphs { result, .. } => replay_statuses(result),
+            BackendActivity::Core(CoreBackendActivity::SaveGraphs { result, .. }) => {
+                replay_statuses(result)
+            }
             other => Err(Self::unexpected("SaveGraphs", &other)),
         }
     }
@@ -73,7 +79,9 @@ impl CoreBackend for ReplayBackend {
     async fn save_actions_done(&self, _actions: &[ActionDone]) -> BackendResult<()> {
         let entry = self.next_activity("save_actions_done")?;
         match entry {
-            CoreBackendActivity::SaveActionsDone { result, .. } => result.into_backend_result(),
+            BackendActivity::Core(CoreBackendActivity::SaveActionsDone { result, .. }) => {
+                result.into_backend_result()
+            }
             other => Err(Self::unexpected("SaveActionsDone", &other)),
         }
     }
@@ -85,7 +93,7 @@ impl CoreBackend for ReplayBackend {
     ) -> BackendResult<QueuedInstanceBatch> {
         let entry = self.next_activity("get_queued_instances")?;
         match entry {
-            CoreBackendActivity::GetQueuedInstances { result, .. } => {
+            BackendActivity::Core(CoreBackendActivity::GetQueuedInstances { result, .. }) => {
                 result.into_backend_result().map(QueuedInstanceBatch::from)
             }
             other => Err(Self::unexpected("GetQueuedInstances", &other)),
@@ -99,7 +107,9 @@ impl CoreBackend for ReplayBackend {
     ) -> BackendResult<Vec<InstanceLockStatus>> {
         let entry = self.next_activity("refresh_instance_locks")?;
         match entry {
-            CoreBackendActivity::RefreshInstanceLocks { result, .. } => replay_statuses(result),
+            BackendActivity::Core(CoreBackendActivity::RefreshInstanceLocks { result, .. }) => {
+                replay_statuses(result)
+            }
             other => Err(Self::unexpected("RefreshInstanceLocks", &other)),
         }
     }
@@ -111,7 +121,7 @@ impl CoreBackend for ReplayBackend {
     ) -> BackendResult<()> {
         let entry = self.next_activity("release_instance_locks")?;
         match entry {
-            CoreBackendActivity::ReleaseInstanceLocks { result, .. } => {
+            BackendActivity::Core(CoreBackendActivity::ReleaseInstanceLocks { result, .. }) => {
                 result.into_backend_result()
             }
             other => Err(Self::unexpected("ReleaseInstanceLocks", &other)),
@@ -121,7 +131,9 @@ impl CoreBackend for ReplayBackend {
     async fn save_instances_done(&self, _instances: &[InstanceDone]) -> BackendResult<()> {
         let entry = self.next_activity("save_instances_done")?;
         match entry {
-            CoreBackendActivity::SaveInstancesDone { result, .. } => result.into_backend_result(),
+            BackendActivity::Core(CoreBackendActivity::SaveInstancesDone { result, .. }) => {
+                result.into_backend_result()
+            }
             other => Err(Self::unexpected("SaveInstancesDone", &other)),
         }
     }
@@ -129,8 +141,42 @@ impl CoreBackend for ReplayBackend {
     async fn queue_instances(&self, _instances: &[QueuedInstance]) -> BackendResult<()> {
         let entry = self.next_activity("queue_instances")?;
         match entry {
-            CoreBackendActivity::QueueInstances { result, .. } => result.into_backend_result(),
+            BackendActivity::Core(CoreBackendActivity::QueueInstances { result, .. }) => {
+                result.into_backend_result()
+            }
             other => Err(Self::unexpected("QueueInstances", &other)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowRegistryBackend for ReplayBackend {
+    async fn upsert_workflow_version(
+        &self,
+        _registration: &WorkflowRegistration,
+    ) -> BackendResult<Uuid> {
+        let entry = self.next_activity("upsert_workflow_version")?;
+        match entry {
+            BackendActivity::WorkflowRegistry(
+                WorkflowRegistryActivity::UpsertWorkflowVersion { result, .. },
+            ) => result.into_backend_result(),
+            other => Err(Self::unexpected("UpsertWorkflowVersion", &other)),
+        }
+    }
+
+    async fn get_workflow_versions(&self, _ids: &[Uuid]) -> BackendResult<Vec<WorkflowVersion>> {
+        let entry = self.next_activity("get_workflow_versions")?;
+        match entry {
+            BackendActivity::WorkflowRegistry(WorkflowRegistryActivity::GetWorkflowVersions {
+                result,
+                ..
+            }) => result.into_backend_result().map(|versions| {
+                versions
+                    .into_iter()
+                    .map(WorkflowVersion::from)
+                    .collect::<Vec<_>>()
+            }),
+            other => Err(Self::unexpected("GetWorkflowVersions", &other)),
         }
     }
 }
@@ -141,10 +187,11 @@ mod tests {
 
     use chrono::{Duration, Utc};
     use uuid::Uuid;
-    use waymark_backend_activity_log::{
+    use waymark_core_backend::{CoreBackend, LockClaim, QueuedInstance};
+    use waymark_replay_activity_core::BackendActivity;
+    use waymark_replay_activity_core::{
         CoreBackendActivity, RecordedLockClaim, RecordedQueuedInstanceBatch, RecordedResult,
     };
-    use waymark_core_backend::{CoreBackend, LockClaim, QueuedInstance};
 
     use crate::ReplayBackend;
 
@@ -173,17 +220,17 @@ mod tests {
         let claim = sample_claim();
         let instance = sample_queued_instance();
         let activity = vec![
-            CoreBackendActivity::QueueInstances {
+            BackendActivity::Core(CoreBackendActivity::QueueInstances {
                 instances: vec![instance.clone()],
                 result: RecordedResult::Ok(()),
-            },
-            CoreBackendActivity::GetQueuedInstances {
+            }),
+            BackendActivity::Core(CoreBackendActivity::GetQueuedInstances {
                 size: 1,
                 claim: RecordedLockClaim::from(claim.clone()),
                 result: RecordedResult::Ok(RecordedQueuedInstanceBatch {
                     instances: vec![instance],
                 }),
-            },
+            }),
         ];
         let backend = ReplayBackend::new(activity);
 
@@ -203,10 +250,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_returns_error_on_activity_mismatch() {
-        let activity = vec![CoreBackendActivity::QueueInstances {
+        let activity = vec![BackendActivity::Core(CoreBackendActivity::QueueInstances {
             instances: vec![],
             result: RecordedResult::Ok(()),
-        }];
+        })];
         let backend = ReplayBackend::new(activity);
 
         let result = backend.save_actions_done(&[]).await;

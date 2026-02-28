@@ -3461,12 +3461,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
- "serde",
  "tokio",
  "uuid",
  "waymark-backend-memory",
  "waymark-backends-core",
  "waymark-core-backend",
+ "waymark-replay-activity-core",
+ "waymark-workflow-registry-backend",
 ]
 
 [[package]]
@@ -3550,9 +3551,10 @@ dependencies = [
  "chrono",
  "tokio",
  "uuid",
- "waymark-backend-activity-log",
  "waymark-backends-core",
  "waymark-core-backend",
+ "waymark-replay-activity-core",
+ "waymark-workflow-registry-backend",
 ]
 
 [[package]]
@@ -3789,6 +3791,18 @@ dependencies = [
  "serde",
  "tonic 0.11.0",
  "tonic-build",
+]
+
+[[package]]
+name = "waymark-replay-activity-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "uuid",
+ "waymark-backends-core",
+ "waymark-core-backend",
+ "waymark-workflow-registry-backend",
 ]
 
 [[package]]

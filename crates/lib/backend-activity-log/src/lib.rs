@@ -1,160 +1,50 @@
 use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
 use uuid::Uuid;
-use waymark_backends_core::{BackendError, BackendResult};
+use waymark_backends_core::BackendResult;
 use waymark_core_backend::{
     ActionDone, CoreBackend, GraphUpdate, InstanceDone, InstanceLockStatus, LockClaim,
     QueuedInstance, QueuedInstanceBatch,
 };
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RecordedLockClaim {
-    pub lock_uuid: Uuid,
-    pub lock_expires_at: DateTime<Utc>,
-}
-
-impl From<LockClaim> for RecordedLockClaim {
-    fn from(value: LockClaim) -> Self {
-        Self {
-            lock_uuid: value.lock_uuid,
-            lock_expires_at: value.lock_expires_at,
-        }
-    }
-}
-
-impl From<RecordedLockClaim> for LockClaim {
-    fn from(value: RecordedLockClaim) -> Self {
-        Self {
-            lock_uuid: value.lock_uuid,
-            lock_expires_at: value.lock_expires_at,
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RecordedInstanceLockStatus {
-    pub instance_id: Uuid,
-    pub lock_uuid: Option<Uuid>,
-    pub lock_expires_at: Option<DateTime<Utc>>,
-}
-
-impl From<InstanceLockStatus> for RecordedInstanceLockStatus {
-    fn from(value: InstanceLockStatus) -> Self {
-        Self {
-            instance_id: value.instance_id,
-            lock_uuid: value.lock_uuid,
-            lock_expires_at: value.lock_expires_at,
-        }
-    }
-}
-
-impl From<RecordedInstanceLockStatus> for InstanceLockStatus {
-    fn from(value: RecordedInstanceLockStatus) -> Self {
-        Self {
-            instance_id: value.instance_id,
-            lock_uuid: value.lock_uuid,
-            lock_expires_at: value.lock_expires_at,
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RecordedQueuedInstanceBatch {
-    pub instances: Vec<QueuedInstance>,
-}
-
-impl From<QueuedInstanceBatch> for RecordedQueuedInstanceBatch {
-    fn from(value: QueuedInstanceBatch) -> Self {
-        Self {
-            instances: value.instances,
-        }
-    }
-}
-
-impl From<RecordedQueuedInstanceBatch> for QueuedInstanceBatch {
-    fn from(value: RecordedQueuedInstanceBatch) -> Self {
-        Self {
-            instances: value.instances,
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum RecordedResult<T> {
-    Ok(T),
-    Err(String),
-}
-
-impl<T> RecordedResult<T> {
-    pub fn into_backend_result(self) -> BackendResult<T> {
-        match self {
-            Self::Ok(value) => Ok(value),
-            Self::Err(message) => Err(BackendError::Message(message)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub enum CoreBackendActivity {
-    SaveGraphs {
-        claim: RecordedLockClaim,
-        graphs: Vec<GraphUpdate>,
-        result: RecordedResult<Vec<RecordedInstanceLockStatus>>,
-    },
-    SaveActionsDone {
-        actions: Vec<ActionDone>,
-        result: RecordedResult<()>,
-    },
-    GetQueuedInstances {
-        size: usize,
-        claim: RecordedLockClaim,
-        result: RecordedResult<RecordedQueuedInstanceBatch>,
-    },
-    RefreshInstanceLocks {
-        claim: RecordedLockClaim,
-        instance_ids: Vec<Uuid>,
-        result: RecordedResult<Vec<RecordedInstanceLockStatus>>,
-    },
-    ReleaseInstanceLocks {
-        lock_uuid: Uuid,
-        instance_ids: Vec<Uuid>,
-        result: RecordedResult<()>,
-    },
-    SaveInstancesDone {
-        instances: Vec<InstanceDone>,
-        result: RecordedResult<()>,
-    },
-    QueueInstances {
-        instances: Vec<QueuedInstance>,
-        result: RecordedResult<()>,
-    },
-}
+use waymark_replay_activity_core::{
+    BackendActivity, CoreBackendActivity, RecordedInstanceLockStatus, RecordedResult,
+    RecordedWorkflowVersion, WorkflowRegistryActivity,
+};
+use waymark_workflow_registry_backend::{
+    WorkflowRegistration, WorkflowRegistryBackend, WorkflowVersion,
+};
 
 #[derive(Clone)]
 pub struct ActivityLoggingBackend {
-    inner: Arc<dyn CoreBackend>,
-    activity: Arc<Mutex<Vec<CoreBackendActivity>>>,
+    core_inner: Arc<dyn CoreBackend>,
+    registry_inner: Arc<dyn WorkflowRegistryBackend>,
+    activity: Arc<Mutex<Vec<BackendActivity>>>,
 }
 
 impl ActivityLoggingBackend {
-    pub fn new(inner: Arc<dyn CoreBackend>) -> Self {
+    pub fn new<B>(inner: Arc<B>) -> Self
+    where
+        B: CoreBackend + WorkflowRegistryBackend + 'static,
+    {
+        let core_inner: Arc<dyn CoreBackend> = inner.clone();
+        let registry_inner: Arc<dyn WorkflowRegistryBackend> = inner;
         Self {
-            inner,
+            core_inner,
+            registry_inner,
             activity: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    pub fn activity(&self) -> Vec<CoreBackendActivity> {
+    pub fn activity(&self) -> Vec<BackendActivity> {
         self.activity.lock().expect("activity poisoned").clone()
     }
 
-    pub fn drain_activity(&self) -> Vec<CoreBackendActivity> {
+    pub fn drain_activity(&self) -> Vec<BackendActivity> {
         let mut guard = self.activity.lock().expect("activity poisoned");
         std::mem::take(&mut *guard)
     }
 
-    fn record(&self, entry: CoreBackendActivity) {
+    fn record(&self, entry: BackendActivity) {
         self.activity.lock().expect("activity poisoned").push(entry);
     }
 }
@@ -170,7 +60,7 @@ impl CoreBackend for ActivityLoggingBackend {
         claim: LockClaim,
         graphs: &[GraphUpdate],
     ) -> BackendResult<Vec<InstanceLockStatus>> {
-        let result = self.inner.save_graphs(claim.clone(), graphs).await;
+        let result = self.core_inner.save_graphs(claim.clone(), graphs).await;
         let recorded_result = match &result {
             Ok(statuses) => RecordedResult::Ok(
                 statuses
@@ -181,24 +71,26 @@ impl CoreBackend for ActivityLoggingBackend {
             ),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::SaveGraphs {
+        self.record(BackendActivity::Core(CoreBackendActivity::SaveGraphs {
             claim: claim.into(),
             graphs: graphs.to_vec(),
             result: recorded_result,
-        });
+        }));
         result
     }
 
     async fn save_actions_done(&self, actions: &[ActionDone]) -> BackendResult<()> {
-        let result = self.inner.save_actions_done(actions).await;
+        let result = self.core_inner.save_actions_done(actions).await;
         let recorded_result = match &result {
             Ok(()) => RecordedResult::Ok(()),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::SaveActionsDone {
-            actions: actions.to_vec(),
-            result: recorded_result,
-        });
+        self.record(BackendActivity::Core(
+            CoreBackendActivity::SaveActionsDone {
+                actions: actions.to_vec(),
+                result: recorded_result,
+            },
+        ));
         result
     }
 
@@ -207,16 +99,21 @@ impl CoreBackend for ActivityLoggingBackend {
         size: usize,
         claim: LockClaim,
     ) -> BackendResult<QueuedInstanceBatch> {
-        let result = self.inner.get_queued_instances(size, claim.clone()).await;
+        let result = self
+            .core_inner
+            .get_queued_instances(size, claim.clone())
+            .await;
         let recorded_result = match &result {
             Ok(batch) => RecordedResult::Ok(batch.clone().into()),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::GetQueuedInstances {
-            size,
-            claim: claim.into(),
-            result: recorded_result,
-        });
+        self.record(BackendActivity::Core(
+            CoreBackendActivity::GetQueuedInstances {
+                size,
+                claim: claim.into(),
+                result: recorded_result,
+            },
+        ));
         result
     }
 
@@ -226,7 +123,7 @@ impl CoreBackend for ActivityLoggingBackend {
         instance_ids: &[Uuid],
     ) -> BackendResult<Vec<InstanceLockStatus>> {
         let result = self
-            .inner
+            .core_inner
             .refresh_instance_locks(claim.clone(), instance_ids)
             .await;
         let recorded_result = match &result {
@@ -239,11 +136,13 @@ impl CoreBackend for ActivityLoggingBackend {
             ),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::RefreshInstanceLocks {
-            claim: claim.into(),
-            instance_ids: instance_ids.to_vec(),
-            result: recorded_result,
-        });
+        self.record(BackendActivity::Core(
+            CoreBackendActivity::RefreshInstanceLocks {
+                claim: claim.into(),
+                instance_ids: instance_ids.to_vec(),
+                result: recorded_result,
+            },
+        ));
         result
     }
 
@@ -253,44 +152,93 @@ impl CoreBackend for ActivityLoggingBackend {
         instance_ids: &[Uuid],
     ) -> BackendResult<()> {
         let result = self
-            .inner
+            .core_inner
             .release_instance_locks(lock_uuid, instance_ids)
             .await;
         let recorded_result = match &result {
             Ok(()) => RecordedResult::Ok(()),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::ReleaseInstanceLocks {
-            lock_uuid,
-            instance_ids: instance_ids.to_vec(),
-            result: recorded_result,
-        });
+        self.record(BackendActivity::Core(
+            CoreBackendActivity::ReleaseInstanceLocks {
+                lock_uuid,
+                instance_ids: instance_ids.to_vec(),
+                result: recorded_result,
+            },
+        ));
         result
     }
 
     async fn save_instances_done(&self, instances: &[InstanceDone]) -> BackendResult<()> {
-        let result = self.inner.save_instances_done(instances).await;
+        let result = self.core_inner.save_instances_done(instances).await;
         let recorded_result = match &result {
             Ok(()) => RecordedResult::Ok(()),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::SaveInstancesDone {
-            instances: instances.to_vec(),
-            result: recorded_result,
-        });
+        self.record(BackendActivity::Core(
+            CoreBackendActivity::SaveInstancesDone {
+                instances: instances.to_vec(),
+                result: recorded_result,
+            },
+        ));
         result
     }
 
     async fn queue_instances(&self, instances: &[QueuedInstance]) -> BackendResult<()> {
-        let result = self.inner.queue_instances(instances).await;
+        let result = self.core_inner.queue_instances(instances).await;
         let recorded_result = match &result {
             Ok(()) => RecordedResult::Ok(()),
             Err(error) => RecordedResult::Err(error.to_string()),
         };
-        self.record(CoreBackendActivity::QueueInstances {
+        self.record(BackendActivity::Core(CoreBackendActivity::QueueInstances {
             instances: instances.to_vec(),
             result: recorded_result,
-        });
+        }));
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowRegistryBackend for ActivityLoggingBackend {
+    async fn upsert_workflow_version(
+        &self,
+        registration: &WorkflowRegistration,
+    ) -> BackendResult<Uuid> {
+        let result = self
+            .registry_inner
+            .upsert_workflow_version(registration)
+            .await;
+        let recorded_result = match &result {
+            Ok(id) => RecordedResult::Ok(*id),
+            Err(error) => RecordedResult::Err(error.to_string()),
+        };
+        self.record(BackendActivity::WorkflowRegistry(
+            WorkflowRegistryActivity::UpsertWorkflowVersion {
+                registration: registration.clone().into(),
+                result: recorded_result,
+            },
+        ));
+        result
+    }
+
+    async fn get_workflow_versions(&self, ids: &[Uuid]) -> BackendResult<Vec<WorkflowVersion>> {
+        let result = self.registry_inner.get_workflow_versions(ids).await;
+        let recorded_result = match &result {
+            Ok(versions) => RecordedResult::Ok(
+                versions
+                    .iter()
+                    .cloned()
+                    .map(RecordedWorkflowVersion::from)
+                    .collect(),
+            ),
+            Err(error) => RecordedResult::Err(error.to_string()),
+        };
+        self.record(BackendActivity::WorkflowRegistry(
+            WorkflowRegistryActivity::GetWorkflowVersions {
+                ids: ids.to_vec(),
+                result: recorded_result,
+            },
+        ));
         result
     }
 }
@@ -304,8 +252,9 @@ mod tests {
     use uuid::Uuid;
     use waymark_backend_memory::MemoryBackend;
     use waymark_core_backend::{CoreBackend, LockClaim, QueuedInstance};
+    use waymark_replay_activity_core::{BackendActivity, CoreBackendActivity, RecordedResult};
 
-    use crate::{ActivityLoggingBackend, CoreBackendActivity, RecordedResult};
+    use crate::ActivityLoggingBackend;
 
     fn sample_queued_instance() -> QueuedInstance {
         QueuedInstance {
@@ -349,18 +298,18 @@ mod tests {
 
         let activity = backend.activity();
         match &activity[0] {
-            CoreBackendActivity::QueueInstances {
+            BackendActivity::Core(CoreBackendActivity::QueueInstances {
                 result: RecordedResult::Ok(()),
                 ..
-            } => {}
+            }) => {}
             other => panic!("unexpected first activity: {other:?}"),
         }
 
         match &activity[1] {
-            CoreBackendActivity::GetQueuedInstances {
+            BackendActivity::Core(CoreBackendActivity::GetQueuedInstances {
                 result: RecordedResult::Ok(recorded_batch),
                 ..
-            } => {
+            }) => {
                 assert_eq!(recorded_batch.instances.len(), 1);
             }
             other => panic!("unexpected second activity: {other:?}"),
